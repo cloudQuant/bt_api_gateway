@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Tests (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install test dependencies
+        run: python -m pip install -e ".[dev]"
+      - name: Run offline unit tests
+        run: python -m pytest -q
+
+  lint:
+    name: Ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Ruff
+        run: python -m pip install ruff
+      - name: Check source and tests
+        run: ruff check src tests
+
+  package:
+    name: Build wheel and sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build frontend
+        run: python -m pip install build
+      - name: Build wheel and sdist
+        run: python -m build --sdist --wheel --outdir dist
+      - name: Verify LICENSE is included
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import tarfile
+          import zipfile
+
+          artifacts = Path("dist")
+          wheels = list(artifacts.glob("*.whl"))
+          sdists = list(artifacts.glob("*.tar.gz"))
+          assert len(wheels) == 1, f"expected one wheel, found {wheels}"
+          assert len(sdists) == 1, f"expected one sdist, found {sdists}"
+
+          with zipfile.ZipFile(wheels[0]) as wheel:
+              wheel_names = wheel.namelist()
+          assert any(name.rsplit("/", 1)[-1] == "LICENSE" for name in wheel_names), (
+              f"LICENSE missing from {wheels[0]}"
+          )
+
+          with tarfile.open(sdists[0], "r:gz") as sdist:
+              sdist_names = sdist.getnames()
+          assert any(name.rsplit("/", 1)[-1] == "LICENSE" for name in sdist_names), (
+              f"LICENSE missing from {sdists[0]}"
+          )
+          print(f"LICENSE included in {wheels[0].name} and {sdists[0].name}")
+          PY
