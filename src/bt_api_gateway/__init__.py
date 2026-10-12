@@ -7,6 +7,14 @@ from .event_journal import (
     GatewayEventJournalError,
     GatewayReadBatch,
 )
+from .resolution import (
+    GatewayActionResolution,
+    GatewayProviderBinding,
+    GatewayProviderQueryProof,
+    GatewayQueryVerifier,
+    GatewayResolutionCapability,
+    GatewayResolutionRequest,
+)
 from .router import (
     GatewayAdmission,
     GatewayCommand,
@@ -40,6 +48,7 @@ __all__ = [
     "GatewayAccountWriterAuthority",
     "GatewayActionClaim",
     "GatewayActionRecord",
+    "GatewayActionResolution",
     "GatewayActionStatus",
     "GatewayAdmission",
     "GatewayCommand",
@@ -52,6 +61,11 @@ __all__ = [
     "GatewayEventJournalError",
     "GatewayExecutor",
     "GatewayPrincipal",
+    "GatewayProviderBinding",
+    "GatewayProviderQueryProof",
+    "GatewayQueryVerifier",
+    "GatewayResolutionCapability",
+    "GatewayResolutionRequest",
     "GatewayReadBatch",
     "GatewayRoutingError",
     "GATEWAY_COMMAND_WIRE_SCHEMA",

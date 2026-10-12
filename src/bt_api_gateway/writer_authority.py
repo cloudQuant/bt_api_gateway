@@ -23,6 +23,7 @@ from threading import RLock
 from typing import TYPE_CHECKING, Any, Callable, Optional, Union
 
 from .database_identity import SQLiteFileIdentity
+from .resolution import GatewayResolutionCapability, GatewayResolutionMixin
 from .router import GatewayCommandKind, GatewayCommandStatus, _canonical_json, _validate_redacted
 
 if TYPE_CHECKING:
@@ -86,7 +87,7 @@ class GatewayActionRecord:
     rejection_code: Optional[str]  # noqa: UP045 -- Python 3.9 is supported.
 
 
-class GatewayAccountWriterAuthority:
+class GatewayAccountWriterAuthority(GatewayResolutionMixin):
     """SQLite account writer lease, monotonic epoch, and one-shot action ledger.
 
     An expired or revoked lease can be replaced only if the prior epoch has no
@@ -109,6 +110,9 @@ class GatewayAccountWriterAuthority:
         clock: Optional[Callable[[], float]] = None,  # noqa: UP045 -- Python 3.9 is supported.
         max_lease_seconds: float = 60.0,
         timeout_seconds: float = 5.0,
+        resolution_capability: Optional[  # noqa: UP045 -- Python 3.9 support.
+            GatewayResolutionCapability
+        ] = None,
     ) -> None:
         if not _finite_number(max_lease_seconds) or max_lease_seconds <= 0:
             raise ValueError("max_lease_seconds must be finite and positive")
@@ -121,6 +125,14 @@ class GatewayAccountWriterAuthority:
         self._timeout_seconds = float(timeout_seconds)
         self._leases: dict[str, GatewayWriterLease] = {}
         self._leases_lock = RLock()
+        if (
+            resolution_capability is not None
+            and type(resolution_capability) is not GatewayResolutionCapability
+        ):
+            raise TypeError(
+                "resolution_capability must be a server-owned GatewayResolutionCapability"
+            )
+        self._resolution_capability = resolution_capability
         self._initialize_schema()
 
     @property
@@ -324,8 +336,13 @@ class GatewayAccountWriterAuthority:
                 )
             unresolved = connection.execute(
                 """
-                SELECT action_id FROM gateway_action_claims
-                WHERE account_scope = ? AND status IN (?, ?, ?, ?) LIMIT 1
+                SELECT action_id FROM gateway_action_claims AS claims
+                WHERE account_scope = ? AND status IN (?, ?, ?, ?)
+                    AND NOT EXISTS (
+                        SELECT 1 FROM gateway_action_resolutions AS resolutions
+                        WHERE resolutions.account_scope = claims.account_scope
+                          AND resolutions.action_id = claims.action_id
+                    ) LIMIT 1
                 """,
                 (command.account_scope, *self.UNRESOLVED_ACTIONS),
             ).fetchone()
@@ -492,7 +509,9 @@ class GatewayAccountWriterAuthority:
             outcome_digest=digest,
         )
 
-    def get_action(self, account_scope: str, action_id: str) -> Optional[GatewayActionRecord]:  # noqa: UP045 -- Python 3.9 is supported.
+    def get_action(
+        self, account_scope: str, action_id: str
+    ) -> Optional[GatewayActionRecord]:  # noqa: UP045 -- Python 3.9 is supported.
         with self._connection() as connection:
             row = connection.execute(
                 """
@@ -650,6 +669,36 @@ class GatewayAccountWriterAuthority:
                 );
                 CREATE INDEX IF NOT EXISTS idx_gateway_action_claims_account_status
                     ON gateway_action_claims(account_scope, status, epoch);
+                CREATE TABLE IF NOT EXISTS gateway_provider_bindings (
+                    account_scope TEXT NOT NULL, action_id TEXT NOT NULL,
+                    source_id TEXT NOT NULL, provider_account_id TEXT,
+                    provider_session_id TEXT, request_reference TEXT NOT NULL,
+                    operation TEXT NOT NULL, binding_json TEXT NOT NULL,
+                    correlation_key TEXT NOT NULL UNIQUE,
+                    PRIMARY KEY(account_scope, action_id)
+                );
+                CREATE TABLE IF NOT EXISTS gateway_action_resolutions (
+                    account_scope TEXT NOT NULL, action_id TEXT NOT NULL,
+                    proof_reference TEXT NOT NULL, source_id TEXT NOT NULL, verifier_id TEXT NOT NULL,
+                    source_generation INTEGER NOT NULL, source_sequence INTEGER NOT NULL,
+                    provider_account_id TEXT, provider_session_id TEXT,
+                    snapshot_json TEXT NOT NULL, proof_json TEXT NOT NULL,
+                    provider_order_id TEXT NOT NULL, order_state TEXT NOT NULL,
+                    cancel_state TEXT, resolved_at REAL NOT NULL, source_frame_key TEXT NOT NULL,
+                    PRIMARY KEY(account_scope, action_id), UNIQUE(source_id, proof_reference)
+                );
+                CREATE TRIGGER IF NOT EXISTS gateway_resolution_no_update
+                BEFORE UPDATE ON gateway_action_resolutions BEGIN
+                    SELECT RAISE(ABORT, 'resolution records are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS gateway_resolution_no_delete
+                BEFORE DELETE ON gateway_action_resolutions BEGIN
+                    SELECT RAISE(ABORT, 'resolution records are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS gateway_provider_binding_no_update
+                BEFORE UPDATE ON gateway_provider_bindings BEGIN
+                    SELECT RAISE(ABORT, 'provider bindings are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS gateway_provider_binding_no_delete
+                BEFORE DELETE ON gateway_provider_bindings BEGIN
+                    SELECT RAISE(ABORT, 'provider bindings are immutable'); END;
                 """
                     )
                     self._database_identity.verify()
