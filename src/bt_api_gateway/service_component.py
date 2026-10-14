@@ -1,14 +1,16 @@
 """Read-only service adapter for the gateway's durable account journal.
 
 The component resolves wire scopes through server-owned account and principal
-maps, then delegates every data read to :meth:`GatewayEventJournal.read_after`.
-It does not query a provider or create a separate ledger.  A returned snapshot
+maps, then delegates reads and consumer positions to ``GatewayEventJournal``.
+It does not query a provider or create a separate ledger. A returned snapshot
 is the journal's persisted baseline, followed by events after that baseline;
 it is never a fresh provider snapshot.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
@@ -16,12 +18,13 @@ from types import MappingProxyType
 from typing import Optional
 
 from bt_api_base.account_protocol import AccountObservation
-from bt_api_base.service_protocol import MAX_REFERENCE_BYTES, WireScope
+from bt_api_base.service_protocol import MAX_REFERENCE_BYTES, WireIdentity, WireScope
 
 from .account_session_worker import GatewayAccountSessionWorker
 from .event_journal import (
     GatewayAccountEvent,
     GatewayAccountSnapshot,
+    GatewayConsumerProgress,
     GatewayEventJournal,
     GatewayEventJournalError,
     GatewayReadBatch,
@@ -35,7 +38,15 @@ _ACCOUNT_SESSION_WORKER_PORTS = frozenset(
 )
 _DEFAULT_READ_LIMIT = 100
 
-SUPPORTED_OPERATIONS = frozenset({"account.read_after", "account.snapshot", "account.head"})
+SUPPORTED_OPERATIONS = frozenset(
+    {
+        "account.ack",
+        "account.head",
+        "account.progress",
+        "account.read_after",
+        "account.snapshot",
+    }
+)
 
 
 class GatewayServiceError(RuntimeError):
@@ -162,7 +173,9 @@ class GatewayReadService:
 
     The journal is borrowed and remains owned by the caller. Account and
     principal mappings are copied at construction so later caller mutation
-    cannot widen this service's routing table.
+    cannot widen this service's routing table. Consumer operations also need
+    a ``WireIdentity`` supplied by the trusted service caller; this class
+    checks its shape and principal binding but does not authenticate claims.
     """
 
     def __init__(
@@ -207,8 +220,9 @@ class GatewayReadService:
         principal_ref: str,
         scope: WireScope,
         arguments: Mapping[str, object],
+        identity: Optional[WireIdentity] = None,  # noqa: UP045 -- Python 3.9 support.
     ) -> Mapping[str, object]:
-        """Read one bounded journal page using server-resolved ACL and scope."""
+        """Dispatch a bounded journal read or consumer-progress operation."""
 
         if type(operation) is not str or operation not in SUPPORTED_OPERATIONS:
             raise GatewayServiceError("UNSUPPORTED_OPERATION")
@@ -226,10 +240,42 @@ class GatewayReadService:
             raise GatewayServiceError("INVALID_ARGUMENTS")
 
         if operation == "account.read_after":
-            _reject_unknown_arguments(arguments, frozenset({"cursor", "limit"}))
+            _reject_unknown_arguments(
+                arguments, frozenset({"cursor", "limit", "track_delivery", "stream_epoch"})
+            )
             cursor = arguments.get("cursor")
             limit = arguments.get("limit", _DEFAULT_READ_LIMIT)
             _validate_read_arguments(cursor, limit, cursor_allowed=True)
+            track_delivery = arguments.get("track_delivery", False)
+            if type(track_delivery) is not bool:
+                raise GatewayServiceError("INVALID_ARGUMENTS")
+            if track_delivery:
+                consumer_ref = self._consumer_ref(
+                    identity,
+                    principal_ref=principal_ref,
+                    principal=principal,
+                    scope=scope,
+                    account=account,
+                    journal_strategy_scope=journal_strategy_scope,
+                )
+                batch, progress = self._journal.read_for_consumer(
+                    principal,
+                    account.journal_account_scope,
+                    journal_strategy_scope,
+                    consumer_ref,
+                    cursor=cursor,  # type: ignore[arg-type] -- validated above.
+                    limit=limit,  # type: ignore[arg-type] -- validated above.
+                    stream_epoch=arguments.get("stream_epoch"),
+                )
+                result = dict(_batch_result(batch, include_snapshot_source=False))
+                result["consumer_progress"] = _consumer_progress_result(progress)
+                return self._with_state_status(
+                    MappingProxyType(result),
+                    operation=operation,
+                    strategy_scope=journal_strategy_scope,
+                )
+            if "stream_epoch" in arguments:
+                raise GatewayServiceError("UNKNOWN_ARGUMENT")
             batch = self._journal.read_after(
                 principal,
                 account.journal_account_scope,
@@ -242,6 +288,46 @@ class GatewayReadService:
                 operation=operation,
                 strategy_scope=journal_strategy_scope,
             )
+
+        if operation == "account.progress":
+            _reject_unknown_arguments(arguments, frozenset())
+            consumer_ref = self._consumer_ref(
+                identity,
+                principal_ref=principal_ref,
+                principal=principal,
+                scope=scope,
+                account=account,
+                journal_strategy_scope=journal_strategy_scope,
+            )
+            progress = self._journal.consumer_progress(
+                principal,
+                account.journal_account_scope,
+                journal_strategy_scope,
+                consumer_ref,
+            )
+            return MappingProxyType({"consumer_progress": _consumer_progress_result(progress)})
+
+        if operation == "account.ack":
+            _reject_unknown_arguments(arguments, frozenset({"stream_epoch", "cursor"}))
+            if set(arguments) != {"stream_epoch", "cursor"}:
+                raise GatewayServiceError("INVALID_ARGUMENTS")
+            consumer_ref = self._consumer_ref(
+                identity,
+                principal_ref=principal_ref,
+                principal=principal,
+                scope=scope,
+                account=account,
+                journal_strategy_scope=journal_strategy_scope,
+            )
+            progress = self._journal.acknowledge(
+                principal,
+                account.journal_account_scope,
+                journal_strategy_scope,
+                consumer_ref,
+                stream_epoch=arguments["stream_epoch"],
+                cursor=arguments["cursor"],
+            )
+            return MappingProxyType({"consumer_progress": _consumer_progress_result(progress)})
 
         if operation == "account.snapshot":
             _reject_unknown_arguments(arguments, frozenset({"limit"}))
@@ -276,6 +362,51 @@ class GatewayReadService:
                 strategy_scope=journal_strategy_scope,
             )
         return MappingProxyType(result)
+
+    def _consumer_ref(
+        self,
+        identity: Optional[WireIdentity],  # noqa: UP045 -- Python 3.9 support.
+        *,
+        principal_ref: str,
+        principal: GatewayPrincipal,
+        scope: WireScope,
+        account: GatewayServiceAccountScope,
+        journal_strategy_scope: str,
+    ) -> str:
+        if type(identity) is not WireIdentity or identity.principal_ref != principal_ref:
+            # A missing or mismatched claim must not bypass normal journal ACL
+            # checks. This read is side-effect free and never creates progress.
+            self._journal.read_after(
+                principal,
+                account.journal_account_scope,
+                journal_strategy_scope,
+                cursor=None,
+                limit=1,
+            )
+            if identity is None:
+                raise GatewayServiceError("CONSUMER_IDENTITY_REQUIRED")
+            if type(identity) is not WireIdentity:
+                raise GatewayServiceError("CONSUMER_IDENTITY_INVALID")
+            raise GatewayServiceError("CONSUMER_PRINCIPAL_MISMATCH")
+        identity_scope = {
+            "execution_domain_ref": scope.execution_domain_ref,
+            "account_ref": scope.account_ref,
+            "strategy_ref": scope.strategy_ref,
+        }
+        identity_claim = {
+            "role": identity.role.value,
+            "principal_ref": identity.principal_ref,
+            "actor_ref": identity.actor_ref,
+            "delegate_ref": identity.delegate_ref,
+        }
+        canonical = json.dumps(
+            {"identity": identity_claim, "scope": identity_scope},
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8", errors="strict")
+        return hashlib.sha256(canonical).hexdigest()
 
     def _with_state_status(
         self,
@@ -412,6 +543,30 @@ def _batch_result(
             "persisted_journal_baseline" if batch.snapshot is not None else None
         )
     return MappingProxyType(result)
+
+
+def _consumer_progress_result(
+    progress: GatewayConsumerProgress,
+) -> Mapping[str, object]:
+    if type(progress) is not GatewayConsumerProgress:
+        raise GatewayServiceError("CONSUMER_PROGRESS_INVALID")
+    if (
+        type(progress.stream_epoch) is not str
+        or not progress.stream_epoch
+        or type(progress.offered_cursor) is not int
+        or progress.offered_cursor < 0
+        or type(progress.acknowledged_cursor) is not int
+        or progress.acknowledged_cursor < 0
+        or progress.acknowledged_cursor > progress.offered_cursor
+    ):
+        raise GatewayServiceError("CONSUMER_PROGRESS_INVALID")
+    return MappingProxyType(
+        {
+            "stream_epoch": progress.stream_epoch,
+            "offered_cursor": progress.offered_cursor,
+            "acknowledged_cursor": progress.acknowledged_cursor,
+        }
+    )
 
 
 def _snapshot_result(

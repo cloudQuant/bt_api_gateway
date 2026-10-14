@@ -42,8 +42,54 @@ from that same read-model version. This local contract does not implement
 remote authentication, a provider session/writer fence, upstream subscription
 sharing, or proof of a coherent provider account snapshot.
 
-The network transport (including the planned ZMQ adapter) remains a separate
+The network transport (including the ZMQ adapter) remains a separate
 package and must authenticate clients before it creates a `GatewayPrincipal`.
+
+## Durable consumer progress
+
+`GatewayEventJournal.read_for_consumer` returns a bounded snapshot/replay page
+and a `GatewayConsumerProgress` from one SQLite transaction. Progress contains
+the persistent `stream_epoch`, `offered_cursor`, and `acknowledged_cursor`.
+The epoch identifies this journal stream, independently of a provider session
+generation or a service process epoch. Reopening the same database preserves
+it; rebuilding a stream requires a new journal identity rather than resetting
+sequence numbers under an old epoch.
+
+Progress is isolated by principal, trusted consumer reference, account, and
+view. A read cannot skip beyond the range previously offered to that consumer;
+resuming from a positive cursor requires the matching epoch. An initial read
+from zero replays the stream, while `cursor=None` explicitly requests the
+current snapshot baseline. Compaction may also replace a lagging cursor with
+a newer snapshot, which the receiver must apply before later events.
+`offered_cursor` records a response prepared by the journal, not proof that a
+network peer received it. A lost reply can be requested again.
+
+`acknowledge` requires the matching epoch and a cursor no higher than the
+consumer's offered range. Repeating an older or equal ACK never lowers its
+progress. ACK only records the consumer's assertion of durable processing: it
+does not confirm a provider order, remove replay/audit history, release risk,
+or establish account freshness. The receiver must atomically save its own
+projection and cursor before ACK, then deduplicate redelivery. The journal
+does not perform that receiver transaction. Progress queries do not create a
+consumer. New stream/progress record counts are bounded; reaching a bound
+does not prevent an existing consumer from continuing.
+
+The `GatewayReadService` exposes this through `account.read_after` with
+`track_delivery=True`, `account.progress`, and `account.ack`. These calls use
+the SDK registry's authenticated `WireIdentity` and authorized view, never a
+client-supplied consumer ID. Identity includes the actor and delegation; the
+run/registration ID is deliberately excluded so the same logical consumer
+can resume after restart. Different actors and strategy views stay separate.
+The service is not an authentication layer when called directly in Python.
+
+SDK clients explicitly request the new operations and their server grants;
+the default account-read operation set remains snapshot/head/read_after.
+Ordinary reads without tracking keep their previous behavior. Journal errors
+currently use the registry's existing `HANDLER_FAILED` response; direct Python
+calls retain the finite `GatewayEventJournalError.code`. Server checkpoints
+do not replace a receiver's local recovery point. These APIs provide progress
+for already-authorized journal views; producing filtered views from provider
+events and assigning strategy ownership remain separate responsibilities.
 
 ## Local provider-query resolution candidate
 

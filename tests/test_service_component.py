@@ -15,7 +15,7 @@ from bt_api_base.account_protocol import (
     AccountResourceKey,
 )
 from bt_api_base.market_protocol import MarketInstrumentKey
-from bt_api_base.service_protocol import WireScope
+from bt_api_base.service_protocol import WireIdentity, WireRole, WireScope
 
 from bt_api_gateway import GatewayCommandKind, GatewayEventJournal, GatewayPrincipal
 from bt_api_gateway.account_session_worker import GatewayAccountSessionWorker
@@ -61,6 +61,21 @@ def _scope(
     )
 
 
+def _identity(
+    actor_ref: str = "actor-a",
+    *,
+    principal_ref: str = "principal-a",
+    role: WireRole = WireRole.STRATEGY_CLIENT,
+    delegate_ref: Optional[str] = None,  # noqa: UP045 -- Python 3.9 support.
+) -> WireIdentity:
+    return WireIdentity(
+        role=role,
+        principal_ref=principal_ref,
+        actor_ref=actor_ref,
+        delegate_ref=delegate_ref,
+    )
+
+
 def _service(journal: GatewayEventJournal) -> GatewayReadService:
     return GatewayReadService(
         journal,
@@ -74,6 +89,28 @@ def _service(journal: GatewayEventJournal) -> GatewayReadService:
             )
         },
         principals={"principal-a": _principal("principal-a")},
+    )
+
+
+def _shared_view_service(journal: GatewayEventJournal) -> GatewayReadService:
+    return GatewayReadService(
+        journal,
+        accounts={
+            "account-a": GatewayServiceAccountScope(
+                account_ref="account-a",
+                execution_domain_ref="paper-a",
+                journal_account_scope="account:journal",
+                shared_account_facts_scope="strategy:shared-facts",
+                shared_fact_strategy_refs=frozenset({"strategy-a", "strategy-b"}),
+                account_read_strategy_scope="strategy:account_read",
+            )
+        },
+        principals={
+            "principal-a": _principal(
+                "principal-a",
+                strategies=frozenset({"strategy:shared-facts", "strategy:account_read"}),
+            )
+        },
     )
 
 
@@ -469,7 +506,7 @@ def test_strategy_run_scope_reads_the_same_durable_strategy_stream(tmp_path) -> 
             "account.read_after",
             "UNKNOWN_ARGUMENT",
         ),
-        (_scope(), "principal-a", {}, "account.ack", "UNSUPPORTED_OPERATION"),
+        (_scope(), "principal-a", {}, "account.unknown", "UNSUPPORTED_OPERATION"),
     ],
 )
 def test_handle_rejects_untrusted_identity_scope_arguments_and_unsupported_ops(
@@ -553,12 +590,319 @@ def test_read_cursor_and_limit_are_bounded_by_real_journal_contract(tmp_path) ->
     assert too_large.value.code == "BATCH_SIZE_INVALID"
 
 
+def test_untracked_read_keeps_legacy_shape_and_does_not_open_consumer(tmp_path) -> None:
+    journal = GatewayEventJournal(tmp_path / "gateway.db")
+    journal.append("account:journal", "strategy:alpha", "event-1", "balance_update", {"USD": "1"})
+    service = _service(journal)
+
+    result = service.handle(
+        "account.read_after",
+        principal_ref="principal-a",
+        scope=_scope(),
+        arguments={"cursor": 0, "track_delivery": False},
+    )
+
+    assert set(result) == {
+        "requested_cursor",
+        "snapshot",
+        "events",
+        "next_cursor",
+        "latest_cursor",
+        "recovered_from_snapshot",
+    }
+    assert result["latest_cursor"] == 1
+    with pytest.raises(GatewayEventJournalError) as missing:
+        service.handle(
+            "account.progress",
+            principal_ref="principal-a",
+            scope=_scope(),
+            arguments={},
+            identity=_identity(),
+        )
+    assert missing.value.code == "CONSUMER_NOT_FOUND"
+    with pytest.raises(GatewayEventJournalError) as missing_ack:
+        service.handle(
+            "account.ack",
+            principal_ref="principal-a",
+            scope=_scope(),
+            arguments={"stream_epoch": "epoch-a", "cursor": 0},
+            identity=_identity(),
+        )
+    assert missing_ack.value.code == "CONSUMER_NOT_FOUND"
+
+    with pytest.raises(GatewayServiceError) as epoch_without_tracking:
+        service.handle(
+            "account.read_after",
+            principal_ref="principal-a",
+            scope=_scope(),
+            arguments={"stream_epoch": "epoch-a"},
+        )
+    assert epoch_without_tracking.value.code == "UNKNOWN_ARGUMENT"
+
+
+@pytest.mark.parametrize(
+    "operation,arguments",
+    [
+        ("account.read_after", {"track_delivery": True}),
+        ("account.progress", {}),
+        ("account.ack", {"stream_epoch": "epoch-a", "cursor": 0}),
+    ],
+)
+def test_consumer_requests_require_identity_bound_to_principal(
+    tmp_path, operation, arguments
+) -> None:
+    service = _service(GatewayEventJournal(tmp_path / "gateway.db"))
+
+    with pytest.raises(GatewayServiceError) as missing:
+        service.handle(
+            operation,
+            principal_ref="principal-a",
+            scope=_scope(),
+            arguments=arguments,
+        )
+    assert missing.value.code == "CONSUMER_IDENTITY_REQUIRED"
+
+    with pytest.raises(GatewayServiceError) as mismatch:
+        service.handle(
+            operation,
+            principal_ref="principal-a",
+            scope=_scope(),
+            arguments=arguments,
+            identity=_identity(principal_ref="principal-b"),
+        )
+    assert mismatch.value.code == "CONSUMER_PRINCIPAL_MISMATCH"
+
+
+@pytest.mark.parametrize(
+    "operation,arguments",
+    [
+        (
+            "account.read_after",
+            {"track_delivery": True, "consumer_ref": "client-chosen"},
+        ),
+        ("account.progress", {"consumer_ref": "client-chosen"}),
+        (
+            "account.ack",
+            {"stream_epoch": "epoch-a", "cursor": 0, "consumer_id": "client-chosen"},
+        ),
+    ],
+)
+def test_consumer_reference_cannot_be_supplied_by_client(tmp_path, operation, arguments) -> None:
+    service = _service(GatewayEventJournal(tmp_path / "gateway.db"))
+    with pytest.raises(GatewayServiceError) as raised:
+        service.handle(
+            operation,
+            principal_ref="principal-a",
+            scope=_scope(),
+            arguments=arguments,
+            identity=_identity(),
+        )
+    assert raised.value.code == "UNKNOWN_ARGUMENT"
+
+
+def test_ack_rejects_wrong_epoch_and_unoffered_cursor_without_advancing(tmp_path) -> None:
+    journal = GatewayEventJournal(tmp_path / "gateway.db")
+    journal.append("account:journal", "strategy:alpha", "event-1", "balance_update", {"USD": "1"})
+    service = _service(journal)
+    identity = _identity()
+    offered = service.handle(
+        "account.read_after",
+        principal_ref="principal-a",
+        scope=_scope(),
+        arguments={"track_delivery": True},
+        identity=identity,
+    )
+    progress = offered["consumer_progress"]
+    assert progress["offered_cursor"] == 1  # type: ignore[index]
+    assert progress["acknowledged_cursor"] == 0  # type: ignore[index]
+    epoch = progress["stream_epoch"]  # type: ignore[index]
+
+    with pytest.raises(GatewayEventJournalError) as wrong_epoch:
+        service.handle(
+            "account.ack",
+            principal_ref="principal-a",
+            scope=_scope(),
+            arguments={"stream_epoch": "wrong-epoch", "cursor": 1},
+            identity=identity,
+        )
+    assert wrong_epoch.value.code == "STREAM_EPOCH_MISMATCH"
+
+    with pytest.raises(GatewayEventJournalError) as resume_epoch:
+        service.handle(
+            "account.read_after",
+            principal_ref="principal-a",
+            scope=_scope(),
+            arguments={"track_delivery": True, "cursor": 1, "stream_epoch": "wrong-epoch"},
+            identity=identity,
+        )
+    assert resume_epoch.value.code == "STREAM_EPOCH_MISMATCH"
+
+    with pytest.raises(GatewayEventJournalError) as missing_resume_epoch:
+        service.handle(
+            "account.read_after",
+            principal_ref="principal-a",
+            scope=_scope(),
+            arguments={"track_delivery": True, "cursor": 1},
+            identity=identity,
+        )
+    assert missing_resume_epoch.value.code == "STREAM_EPOCH_REQUIRED"
+
+    with pytest.raises(GatewayEventJournalError) as future:
+        service.handle(
+            "account.ack",
+            principal_ref="principal-a",
+            scope=_scope(),
+            arguments={"stream_epoch": epoch, "cursor": 2},
+            identity=identity,
+        )
+    assert future.value.code == "ACK_CURSOR_AHEAD"
+
+    current = service.handle(
+        "account.progress",
+        principal_ref="principal-a",
+        scope=_scope(),
+        arguments={},
+        identity=identity,
+    )
+    assert current == {"consumer_progress": progress}
+
+
+def test_consumer_identity_and_strategy_scope_are_stable_and_isolated(tmp_path) -> None:
+    journal = GatewayEventJournal(tmp_path / "gateway.db")
+    journal.append(
+        "account:journal", "strategy:shared-facts", "event-1", "balance_update", {"USD": "1"}
+    )
+    service = _shared_view_service(journal)
+    actor = _identity()
+    first_scope = _scope(strategy_ref="strategy-a", run_id="run-1")
+    first_read = service.handle(
+        "account.read_after",
+        principal_ref="principal-a",
+        scope=first_scope,
+        arguments={"track_delivery": True},
+        identity=actor,
+    )
+    first_progress = first_read["consumer_progress"]
+    epoch = first_progress["stream_epoch"]  # type: ignore[index]
+    assert first_progress["offered_cursor"] == 1  # type: ignore[index]
+
+    acknowledged = service.handle(
+        "account.ack",
+        principal_ref="principal-a",
+        scope=_scope(strategy_ref="strategy-a", run_id="run-2"),
+        arguments={"stream_epoch": epoch, "cursor": 1},
+        identity=actor,
+    )
+    assert acknowledged["consumer_progress"]["acknowledged_cursor"] == 1  # type: ignore[index]
+    repeated = service.handle(
+        "account.ack",
+        principal_ref="principal-a",
+        scope=_scope(strategy_ref="strategy-a", run_id="run-2"),
+        arguments={"stream_epoch": epoch, "cursor": 0},
+        identity=actor,
+    )
+    assert repeated["consumer_progress"]["acknowledged_cursor"] == 1  # type: ignore[index]
+    resumed_read = service.handle(
+        "account.read_after",
+        principal_ref="principal-a",
+        scope=_scope(strategy_ref="strategy-a", run_id="run-2"),
+        arguments={"track_delivery": True, "cursor": 1, "stream_epoch": epoch},
+        identity=actor,
+    )
+    assert resumed_read["requested_cursor"] == 1
+    assert resumed_read["events"] == ()
+    assert resumed_read["consumer_progress"]["acknowledged_cursor"] == 1  # type: ignore[index]
+    resumed = service.handle(
+        "account.progress",
+        principal_ref="principal-a",
+        scope=_scope(strategy_ref="strategy-a", run_id="run-3"),
+        arguments={},
+        identity=actor,
+    )
+    assert resumed["consumer_progress"] == acknowledged["consumer_progress"]
+    assert set(resumed) == {"consumer_progress"}
+
+    independent_identities = (
+        (_identity(actor_ref="actor-b"), "strategy-a"),
+        (_identity(delegate_ref="delegate-a"), "strategy-a"),
+        (
+            _identity(role=WireRole.APPLICATION_CLIENT),
+            "strategy-a",
+        ),
+        (_identity(), "strategy-b"),
+    )
+    for distinct_identity, strategy_ref in independent_identities:
+        view = service.handle(
+            "account.read_after",
+            principal_ref="principal-a",
+            scope=_scope(strategy_ref=strategy_ref),
+            arguments={"track_delivery": True},
+            identity=distinct_identity,
+        )
+        distinct_progress = view["consumer_progress"]
+        assert distinct_progress["offered_cursor"] == 1  # type: ignore[index]
+        assert distinct_progress["acknowledged_cursor"] == 0  # type: ignore[index]
+
+    actor_progress = service.handle(
+        "account.progress",
+        principal_ref="principal-a",
+        scope=first_scope,
+        arguments={},
+        identity=actor,
+    )
+    assert actor_progress["consumer_progress"]["acknowledged_cursor"] == 1  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    "operation,arguments",
+    [
+        ("account.read_after", {"track_delivery": True}),
+        ("account.progress", {}),
+        ("account.ack", {"stream_epoch": "epoch-a", "cursor": 0}),
+    ],
+)
+def test_consumer_operations_still_enforce_journal_acl(tmp_path, operation, arguments) -> None:
+    journal = GatewayEventJournal(tmp_path / "gateway.db")
+    service = GatewayReadService(
+        journal,
+        accounts={
+            "account-a": GatewayServiceAccountScope(
+                account_ref="account-a",
+                execution_domain_ref="paper-a",
+                journal_account_scope="account:journal",
+                strategy_scope_map={"strategy-a": "strategy:alpha"},
+            )
+        },
+        principals={
+            "principal-a": _principal("principal-a", strategies=frozenset({"strategy:elsewhere"}))
+        },
+    )
+
+    with pytest.raises(GatewayEventJournalError) as denied:
+        service.handle(
+            operation,
+            principal_ref="principal-a",
+            scope=_scope(),
+            arguments=arguments,
+            identity=_identity(),
+        )
+    assert denied.value.code == "STRATEGY_SCOPE_DENIED"
+
+
 def test_supported_operations_are_finite_and_service_borrows_journal(tmp_path) -> None:
     journal = GatewayEventJournal(tmp_path / "gateway.db")
     service = _service(journal)
 
     assert (
-        frozenset({"account.read_after", "account.snapshot", "account.head"})
+        frozenset(
+            {
+                "account.ack",
+                "account.head",
+                "account.progress",
+                "account.read_after",
+                "account.snapshot",
+            }
+        )
         == SUPPORTED_OPERATIONS
     )
     result = service.handle(
@@ -598,6 +942,24 @@ def test_state_worker_v2_orders_are_read_after_complete_empty_replacement(tmp_pa
         assert with_order["state_status"]["ready"] is True  # type: ignore[index]
         assert first_state["schema_version"] == 2
         assert len(first_state["observation"]["open_orders"]) == 1
+
+        tracked = service.handle(
+            "account.read_after",
+            principal_ref="principal-a",
+            scope=_scope(strategy_ref=None),
+            arguments={"track_delivery": True},
+            identity=_identity(),
+        )
+        assert tracked["state_status"]["ready"] is True  # type: ignore[index]
+        assert tracked["consumer_progress"]["offered_cursor"] == tracked["latest_cursor"]  # type: ignore[index]
+        progress = service.handle(
+            "account.progress",
+            principal_ref="principal-a",
+            scope=_scope(strategy_ref=None),
+            arguments={},
+            identity=_identity(),
+        )
+        assert set(progress) == {"consumer_progress"}
 
         worker.refresh()
         empty = service.handle(

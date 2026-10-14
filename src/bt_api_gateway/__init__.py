@@ -3,6 +3,7 @@
 from .event_journal import (
     GatewayAccountEvent,
     GatewayAccountSnapshot,
+    GatewayConsumerProgress,
     GatewayEventJournal,
     GatewayEventJournalError,
     GatewayReadBatch,
@@ -55,6 +56,7 @@ __all__ = [
     "GatewayCommandKind",
     "GatewayCommandRouter",
     "GatewayCommandStatus",
+    "GatewayConsumerProgress",
     "GatewayDispatchError",
     "GatewayDispatchResult",
     "GatewayEventJournal",
