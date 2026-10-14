@@ -116,6 +116,7 @@ class GatewayEventJournal:
     """
 
     MAX_BATCH_SIZE = 1000
+    MAX_STATE_SNAPSHOT_BYTES = 512 * 1024
 
     def __init__(
         self,
@@ -152,6 +153,7 @@ class GatewayEventJournal:
         )
         fingerprint = _event_fingerprint(candidate)
         with self._transaction() as connection:
+            self._reject_state_stream(connection, account_scope, strategy_scope)
             existing = connection.execute(
                 """
                 SELECT * FROM gateway_event_dedupe
@@ -255,6 +257,7 @@ class GatewayEventJournal:
         )
         digest = _snapshot_fingerprint(candidate)
         with self._transaction() as connection:
+            self._reject_state_stream(connection, account_scope, strategy_scope)
             latest = self._latest_cursor(connection, account_scope, strategy_scope)
             if expected_cursor != latest:
                 raise GatewayEventJournalError(
@@ -315,6 +318,134 @@ class GatewayEventJournal:
                 WHERE account_scope = ? AND strategy_scope = ? AND sequence <= ?
                 """,
                 (account_scope, strategy_scope, expected_cursor),
+            )
+        return candidate
+
+    def replace_state_snapshot(
+        self,
+        account_scope: str,
+        strategy_scope: str,
+        snapshot_id: str,
+        payload: Mapping[str, Any],
+        *,
+        expected_cursor: int,
+        captured_at: Optional[float] = None,  # noqa: UP045 -- Python 3.9 is supported.
+    ) -> GatewayAccountSnapshot:
+        """Atomically replace a bounded account-state snapshot and advance its cursor.
+
+        State streams retain only the latest replacement snapshot and sequence.
+        They do not create event or deduplication rows. The first replacement can
+        claim only an unused stream pair; state and event/snapshot APIs cannot be
+        mixed for the same pair.
+
+        Retrying the latest replacement with the same id, canonical payload,
+        capture time, and original expected cursor returns the stored snapshot.
+        """
+        if type(expected_cursor) is not int or expected_cursor < 0:
+            raise ValueError("expected_cursor must be a non-negative integer")
+        snapshot_time_value = self._clock() if captured_at is None else captured_at
+        _require_time(snapshot_time_value, "captured_at")
+        snapshot_time = float(snapshot_time_value)
+        candidate = GatewayAccountSnapshot(
+            account_scope=account_scope,
+            strategy_scope=strategy_scope,
+            snapshot_id=snapshot_id,
+            cursor=expected_cursor + 1,
+            payload=payload,
+            captured_at=snapshot_time,
+        )
+        payload_json = candidate.payload_json
+        if len(payload_json.encode("utf-8")) > self.MAX_STATE_SNAPSHOT_BYTES:
+            raise GatewayEventJournalError(
+                "STATE_SNAPSHOT_TOO_LARGE",
+                "state snapshot exceeds the maximum canonical JSON size",
+            )
+        fingerprint = _snapshot_fingerprint(candidate)
+
+        with self._transaction() as connection:
+            mode_row = connection.execute(
+                """
+                SELECT mode FROM gateway_event_stream_modes
+                WHERE account_scope = ? AND strategy_scope = ?
+                """,
+                (account_scope, strategy_scope),
+            ).fetchone()
+            if mode_row is not None and str(mode_row["mode"]) != "state":
+                raise self._stream_mode_conflict()
+
+            existing = connection.execute(
+                """
+                SELECT * FROM gateway_event_snapshots
+                WHERE account_scope = ? AND strategy_scope = ?
+                """,
+                (account_scope, strategy_scope),
+            ).fetchone()
+            if (
+                mode_row is not None
+                and existing is not None
+                and str(existing["snapshot_id"]) == snapshot_id
+            ):
+                if (
+                    int(existing["cursor"]) == expected_cursor + 1
+                    and str(existing["fingerprint"]) == fingerprint
+                ):
+                    return self._snapshot_from_row(existing)
+                raise GatewayEventJournalError(
+                    "SNAPSHOT_ID_REUSED",
+                    "snapshot id was reused with different content",
+                )
+
+            latest = self._latest_cursor(connection, account_scope, strategy_scope)
+            if expected_cursor != latest:
+                raise GatewayEventJournalError(
+                    "SNAPSHOT_CURSOR_STALE", "snapshot cursor does not match current stream"
+                )
+
+            if mode_row is None:
+                if self._has_stream_rows(connection, account_scope, strategy_scope):
+                    raise self._stream_mode_conflict()
+                connection.execute(
+                    """
+                    INSERT INTO gateway_event_stream_modes
+                        (account_scope, strategy_scope, mode)
+                    VALUES (?, ?, 'state')
+                    """,
+                    (account_scope, strategy_scope),
+                )
+
+            next_cursor = latest + 1
+            connection.execute(
+                """
+                INSERT INTO gateway_event_sequences
+                    (account_scope, strategy_scope, latest_sequence)
+                VALUES (?, ?, ?)
+                ON CONFLICT(account_scope, strategy_scope)
+                DO UPDATE SET latest_sequence = excluded.latest_sequence
+                """,
+                (account_scope, strategy_scope, next_cursor),
+            )
+            connection.execute(
+                """
+                INSERT INTO gateway_event_snapshots (
+                    account_scope, strategy_scope, snapshot_id, cursor,
+                    payload_json, captured_at, fingerprint
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_scope, strategy_scope) DO UPDATE SET
+                    snapshot_id = excluded.snapshot_id,
+                    cursor = excluded.cursor,
+                    payload_json = excluded.payload_json,
+                    captured_at = excluded.captured_at,
+                    fingerprint = excluded.fingerprint
+                """,
+                (
+                    account_scope,
+                    strategy_scope,
+                    snapshot_id,
+                    next_cursor,
+                    payload_json,
+                    snapshot_time,
+                    fingerprint,
+                ),
             )
         return candidate
 
@@ -434,6 +565,48 @@ class GatewayEventJournal:
         ).fetchone()
         return int(row["latest_sequence"]) if row else 0
 
+    def _reject_state_stream(
+        self, connection: sqlite3.Connection, account_scope: str, strategy_scope: str
+    ) -> None:
+        row = connection.execute(
+            """
+            SELECT mode FROM gateway_event_stream_modes
+            WHERE account_scope = ? AND strategy_scope = ?
+            """,
+            (account_scope, strategy_scope),
+        ).fetchone()
+        if row is not None and str(row["mode"]) == "state":
+            raise self._stream_mode_conflict()
+
+    def _has_stream_rows(
+        self, connection: sqlite3.Connection, account_scope: str, strategy_scope: str
+    ) -> bool:
+        row = connection.execute(
+            """
+            SELECT
+                EXISTS (
+                    SELECT 1 FROM gateway_events
+                    WHERE account_scope = ? AND strategy_scope = ?
+                ) AS has_events,
+                EXISTS (
+                    SELECT 1 FROM gateway_event_snapshots
+                    WHERE account_scope = ? AND strategy_scope = ?
+                ) AS has_snapshots,
+                EXISTS (
+                    SELECT 1 FROM gateway_event_sequences
+                    WHERE account_scope = ? AND strategy_scope = ?
+                ) AS has_sequences
+            """,
+            (account_scope, strategy_scope) * 3,
+        ).fetchone()
+        return bool(row["has_events"] or row["has_snapshots"] or row["has_sequences"])
+
+    def _stream_mode_conflict(self) -> GatewayEventJournalError:
+        return GatewayEventJournalError(
+            "STREAM_MODE_CONFLICT",
+            "state replacement and event snapshot streams cannot be mixed",
+        )
+
     def _initialize_schema(self) -> None:
         with self._connection() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
@@ -474,6 +647,12 @@ class GatewayEventJournal:
                     payload_json TEXT NOT NULL,
                     captured_at REAL NOT NULL,
                     fingerprint TEXT NOT NULL,
+                    PRIMARY KEY (account_scope, strategy_scope)
+                );
+                CREATE TABLE IF NOT EXISTS gateway_event_stream_modes (
+                    account_scope TEXT NOT NULL,
+                    strategy_scope TEXT NOT NULL,
+                    mode TEXT NOT NULL CHECK (mode = 'state'),
                     PRIMARY KEY (account_scope, strategy_scope)
                 );
                 """
