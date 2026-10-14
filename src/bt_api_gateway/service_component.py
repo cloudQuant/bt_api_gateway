@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Optional
 
+from bt_api_base.account_protocol import AccountObservation
 from bt_api_base.service_protocol import MAX_REFERENCE_BYTES, WireScope
 
 from .account_session_worker import GatewayAccountSessionWorker
@@ -439,14 +440,25 @@ def _state_result_matches_worker(
     generation: object,
 ) -> bool:
     latest = worker.latest_snapshot
+    if latest is None:
+        return False
+    observation_value = latest.payload.get("observation")
+    if not isinstance(observation_value, Mapping):
+        return False
+    try:
+        observation = AccountObservation.from_dict(observation_value)
+    except (KeyError, TypeError, ValueError):
+        return False
+    expected_schema_version = 2 if observation.open_orders is not None else 1
+    schema_version = latest.payload.get("schema_version")
     if (
         strategy_scope != worker.state_scope
-        or latest is None
         or latest.account_scope != worker.journal_account_scope
         or latest.strategy_scope != worker.state_scope
         or latest.cursor != result.get("latest_cursor")
         or latest.payload.get("schema_id") != "sdk.account.state"
-        or latest.payload.get("schema_version") != 1
+        or type(schema_version) is not int
+        or schema_version != expected_schema_version
         or latest.payload.get("session_generation") != generation
     ):
         return False

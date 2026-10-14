@@ -7,17 +7,28 @@ from types import MappingProxyType
 from typing import Optional
 
 import pytest
+from bt_api_base.account_protocol import (
+    AccountBalance,
+    AccountKey,
+    AccountObservation,
+    AccountOpenOrder,
+    AccountResourceKey,
+)
+from bt_api_base.market_protocol import MarketInstrumentKey
 from bt_api_base.service_protocol import WireScope
 
 from bt_api_gateway import GatewayCommandKind, GatewayEventJournal, GatewayPrincipal
-from bt_api_gateway.event_journal import GatewayEventJournalError
+from bt_api_gateway.account_session_worker import GatewayAccountSessionWorker
+from bt_api_gateway.event_journal import GatewayAccountSnapshot, GatewayEventJournalError
 from bt_api_gateway.service_component import (
     SUPPORTED_OPERATIONS,
     GatewayReadService,
     GatewayServiceAccountScope,
     GatewayServiceError,
+    _state_result_matches_worker,
     validate_service_options,
 )
+from bt_api_gateway.session_guard import LocalAccountSessionGuard
 
 
 def _principal(
@@ -64,6 +75,129 @@ def _service(journal: GatewayEventJournal) -> GatewayReadService:
         },
         principals={"principal-a": _principal("principal-a")},
     )
+
+
+class _StateProvider:
+    def __init__(self, observations: tuple[AccountObservation, ...]) -> None:
+        self._observations = list(observations)
+
+    def connect(self, *, account_key: AccountKey, generation: str, timeout: float) -> None:
+        assert account_key.account_id == "acct-state"
+        assert generation
+        assert timeout > 0
+
+    def read_account(self, *, generation: str, timeout: float) -> AccountObservation:
+        assert generation
+        assert timeout > 0
+        return self._observations.pop(0)
+
+    def close(self) -> None:
+        return None
+
+
+def _state_observation(
+    observation_id: str,
+    *,
+    open_orders: Optional[tuple[AccountOpenOrder, ...]] = None,  # noqa: UP045
+    open_orders_complete: bool = False,
+) -> AccountObservation:
+    completed_at = "2023-11-14T22:13:20Z"
+    resource = AccountResourceKey(product_type="spot", margin_pool="cross")
+    account_key = AccountKey(
+        provider="synthetic",
+        venue="paper-exchange",
+        environment="paper",
+        account_id="acct-state",
+    )
+    balance = AccountBalance(
+        resource=resource,
+        currency="USD",
+        total="100",
+        available="90",
+        locked="10",
+        observed_at_utc=completed_at,
+    )
+    return AccountObservation(
+        account_key=account_key,
+        observation_id=observation_id,
+        coverage=(resource,),
+        balances=(balance,),
+        positions=(),
+        valuation=None,
+        started_at_utc=completed_at,
+        completed_at_utc=completed_at,
+        consistency="provider_atomic",
+        balances_complete=True,
+        positions_complete=True,
+        open_orders=open_orders,
+        open_orders_complete=open_orders_complete,
+    )
+
+
+def _state_order() -> AccountOpenOrder:
+    resource = AccountResourceKey(product_type="spot", margin_pool="cross")
+    instrument = MarketInstrumentKey(
+        provider="synthetic",
+        venue="paper-exchange",
+        environment="paper",
+        product_type="spot",
+        instrument_id="BTC-USD",
+        native_symbol="BTCUSD",
+    )
+    return AccountOpenOrder(
+        resource=resource,
+        instrument=instrument,
+        order_id="order-1",
+        side="buy",
+        position_side="net",
+        order_type="limit",
+        status="open",
+        quantity="1",
+        filled_quantity="0",
+        qty_unit="base",
+        created_at_utc="2023-11-14T22:13:19Z",
+        observed_at_utc="2023-11-14T22:13:20Z",
+    )
+
+
+def _state_service(tmp_path, observations: tuple[AccountObservation, ...]):
+    (tmp_path / "guards").mkdir()
+    account_key = AccountKey(
+        provider="synthetic",
+        venue="paper-exchange",
+        environment="paper",
+        account_id="acct-state",
+    )
+    journal = GatewayEventJournal(tmp_path / "state.db", clock=lambda: 1_700_000_000.0)
+    worker = GatewayAccountSessionWorker(
+        _StateProvider(observations),
+        journal,
+        account_key=account_key,
+        journal_account_scope="account:journal",
+        state_scope="strategy:account_read",
+        guard=LocalAccountSessionGuard(tmp_path / "guards", account_key.account_key_id, "worker-a"),
+        required_coverage=(AccountResourceKey(product_type="spot", margin_pool="cross"),),
+        clock=lambda: 1_700_000_000.0,
+        monotonic_clock=lambda: 10.0,
+    )
+    service = GatewayReadService(
+        journal,
+        accounts={
+            "account-a": GatewayServiceAccountScope(
+                account_ref="account-a",
+                execution_domain_ref="paper-a",
+                journal_account_scope="account:journal",
+                account_read_strategy_scope="strategy:account_read",
+            )
+        },
+        principals={
+            "principal-a": _principal(
+                "principal-a", strategies=frozenset({"strategy:account_read"})
+            )
+        },
+        state_worker=worker,
+    )
+    return worker, service
 
 
 def test_service_options_match_sdk_gateway_roles_and_return_immutable_mapping() -> None:
@@ -440,3 +574,99 @@ def test_supported_operations_are_finite_and_service_borrows_journal(tmp_path) -
         ).latest_cursor
         == 0
     )
+
+
+def test_state_worker_v2_orders_are_read_after_complete_empty_replacement(tmp_path) -> None:
+    worker, service = _state_service(
+        tmp_path,
+        (
+            _state_observation(
+                "with-order", open_orders=(_state_order(),), open_orders_complete=True
+            ),
+            _state_observation("without-orders", open_orders=(), open_orders_complete=True),
+        ),
+    )
+    worker.start()
+    try:
+        with_order = service.handle(
+            "account.snapshot",
+            principal_ref="principal-a",
+            scope=_scope(strategy_ref=None),
+            arguments={},
+        )
+        first_state = with_order["snapshot"]["payload"]  # type: ignore[index]
+        assert with_order["state_status"]["ready"] is True  # type: ignore[index]
+        assert first_state["schema_version"] == 2
+        assert len(first_state["observation"]["open_orders"]) == 1
+
+        worker.refresh()
+        empty = service.handle(
+            "account.snapshot",
+            principal_ref="principal-a",
+            scope=_scope(strategy_ref=None),
+            arguments={},
+        )
+        empty_state = empty["snapshot"]["payload"]  # type: ignore[index]
+        assert empty["state_status"]["ready"] is True  # type: ignore[index]
+        assert empty_state["schema_version"] == 2
+        assert empty_state["observation"]["open_orders"] == ()
+        assert empty_state["observation"]["open_orders_complete"] is True
+    finally:
+        worker.close()
+
+
+def test_state_worker_legacy_observation_keeps_schema_v1_readable(tmp_path) -> None:
+    worker, service = _state_service(tmp_path, (_state_observation("legacy"),))
+    worker.start()
+    try:
+        result = service.handle(
+            "account.snapshot",
+            principal_ref="principal-a",
+            scope=_scope(strategy_ref=None),
+            arguments={},
+        )
+        state = result["snapshot"]["payload"]  # type: ignore[index]
+        assert result["state_status"]["ready"] is True  # type: ignore[index]
+        assert state["schema_version"] == 1
+        assert "open_orders" not in state["observation"]
+    finally:
+        worker.close()
+
+
+def test_state_worker_rejects_schema_version_inconsistent_with_observation(tmp_path) -> None:
+    worker, _service_with_state = _state_service(
+        tmp_path,
+        (
+            _state_observation(
+                "with-order", open_orders=(_state_order(),), open_orders_complete=True
+            ),
+        ),
+    )
+    worker.start()
+    try:
+        latest = worker.latest_snapshot
+        assert latest is not None
+        wrong_payload = dict(latest.payload)
+        wrong_payload["schema_version"] = 1
+        wrong_snapshot = GatewayAccountSnapshot(
+            account_scope=latest.account_scope,
+            strategy_scope=latest.strategy_scope,
+            snapshot_id=latest.snapshot_id,
+            cursor=latest.cursor,
+            payload=wrong_payload,
+            captured_at=latest.captured_at,
+        )
+        worker._latest_snapshot = wrong_snapshot
+
+        assert (
+            _state_result_matches_worker(
+                {"latest_cursor": wrong_snapshot.cursor},
+                operation="account.head",
+                strategy_scope=worker.state_scope,
+                worker=worker,
+                generation=worker.session_generation,
+            )
+            is False
+        )
+    finally:
+        worker.close()
