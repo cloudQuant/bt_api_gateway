@@ -21,6 +21,7 @@ from bt_api_base.account_protocol import AccountObservation
 from bt_api_base.service_protocol import MAX_REFERENCE_BYTES, WireIdentity, WireScope
 
 from .account_session_worker import GatewayAccountSessionWorker
+from .account_view_projection import validate_policy_set
 from .event_journal import (
     GatewayAccountEvent,
     GatewayAccountSnapshot,
@@ -37,6 +38,7 @@ _ACCOUNT_SESSION_WORKER_PORTS = frozenset(
     {"service.account_read", "service.provider_session", "service.owner_control"}
 )
 _DEFAULT_READ_LIMIT = 100
+_UNSAMPLED_SOURCE_CURSOR = object()
 
 SUPPORTED_OPERATIONS = frozenset(
     {
@@ -201,16 +203,32 @@ class GatewayReadService:
             account = next(iter(self._accounts.values()))
             if account.journal_account_scope != state_worker.journal_account_scope:
                 raise GatewayServiceError("STATE_WORKER_JOURNAL_SCOPE_MISMATCH")
+            try:
+                view_policies = validate_policy_set(state_worker.view_policies)
+            except Exception:
+                raise GatewayServiceError("STATE_VIEW_POLICIES_INVALID") from None
+            self._view_policies = MappingProxyType(
+                {policy.view_scope: policy for policy in view_policies}
+            )
+            view_scopes = frozenset(self._view_policies)
+            if view_policies:
+                if not set(account.strategy_scope_map.values()) <= view_scopes:
+                    raise GatewayServiceError("STATE_VIEW_SCOPE_MAPPING_INVALID")
+                if account.account_read_strategy_scope in view_scopes:
+                    raise GatewayServiceError("STATE_VIEW_CANONICAL_SCOPE_CONFLICT")
             shared_scope = account.shared_account_facts_scope
             account_read_scope = account.account_read_strategy_scope
             if (shared_scope is not None and shared_scope != state_worker.state_scope) or (
                 account_read_scope is not None and account_read_scope != state_worker.state_scope
             ):
                 raise GatewayServiceError("STATE_WORKER_STATE_SCOPE_MISMATCH")
-            if (shared_scope is None and account_read_scope is None) or (
+            canonical_scope_unbound = (shared_scope is None and account_read_scope is None) or (
                 not account.shared_fact_strategy_refs and account_read_scope is None
-            ):
+            )
+            if canonical_scope_unbound and not (view_policies and account.strategy_scope_map):
                 raise GatewayServiceError("STATE_WORKER_STATE_SCOPE_UNBOUND")
+        else:
+            self._view_policies = MappingProxyType({})
         self._state_worker = state_worker
 
     def handle(
@@ -290,6 +308,7 @@ class GatewayReadService:
                 selected_result: Optional[Mapping[str, object]] = None  # noqa: UP045
                 selected_fits = False
                 state_status_snapshot: Optional[Mapping[str, object]] = None  # noqa: UP045
+                source_cursor_snapshot: object = _UNSAMPLED_SOURCE_CURSOR
                 state_status_captured = False
 
                 def page_fits(
@@ -298,11 +317,18 @@ class GatewayReadService:
                 ) -> bool:
                     nonlocal selected_batch, selected_progress, selected_result
                     nonlocal selected_fits, state_status_snapshot, state_status_captured
+                    nonlocal source_cursor_snapshot
                     if self._state_worker is not None and not state_status_captured:
                         candidate_status = self._state_worker.read_status()
                         if not isinstance(candidate_status, Mapping):
                             raise GatewayServiceError("STATE_STATUS_INVALID")
                         state_status_snapshot = candidate_status
+                        source_snapshot = self._state_worker.latest_snapshot
+                        source_cursor_snapshot = (
+                            source_snapshot.cursor
+                            if type(source_snapshot) is GatewayAccountSnapshot
+                            else None
+                        )
                         state_status_captured = True
                     candidate_result = self._consumer_read_result(
                         candidate_batch,
@@ -310,6 +336,7 @@ class GatewayReadService:
                         operation=operation,
                         strategy_scope=journal_strategy_scope,
                         state_status=state_status_snapshot,
+                        source_cursor=source_cursor_snapshot,
                     )
                     fits = result_fits(candidate_result)
                     if type(fits) is not bool:
@@ -479,17 +506,58 @@ class GatewayReadService:
         operation: str,
         strategy_scope: str,
         state_status: Optional[Mapping[str, object]] = None,  # noqa: UP045
+        source_cursor: object = _UNSAMPLED_SOURCE_CURSOR,
     ) -> Mapping[str, object]:
         if self._state_worker is None:
             return result
         copied = dict(result)
-        status = dict(self._state_worker.read_status() if state_status is None else state_status)
-        if status["ready"] and not _state_result_matches_worker(
+        status_sample = self._state_worker.read_status() if state_status is None else state_status
+        if not isinstance(status_sample, Mapping):
+            raise GatewayServiceError("STATE_STATUS_INVALID")
+        status = dict(status_sample)
+        if source_cursor is _UNSAMPLED_SOURCE_CURSOR:
+            latest_snapshot = self._state_worker.latest_snapshot
+            source_cursor = (
+                latest_snapshot.cursor if type(latest_snapshot) is GatewayAccountSnapshot else None
+            )
+        policy = self._view_policies.get(strategy_scope)
+        if policy is not None:
+            view_cursor = result.get("latest_cursor")
+            page_complete = operation == "account.head"
+            if operation in {"account.read_after", "account.snapshot"}:
+                next_cursor = result.get("next_cursor")
+                page_complete = (
+                    type(next_cursor) is int
+                    and type(view_cursor) is int
+                    and next_cursor == view_cursor
+                )
+            view_current = False
+            if (
+                status.get("ready") is True
+                and page_complete
+                and type(source_cursor) is int
+                and source_cursor >= 0
+                and type(view_cursor) is int
+                and view_cursor >= 0
+            ):
+                current = self._journal.account_view_is_current(
+                    self._state_worker.journal_account_scope,
+                    self._state_worker.state_scope,
+                    policy.view_scope,
+                    policy.digest,
+                    source_cursor,
+                    view_cursor,
+                )
+                view_current = type(current) is bool and current
+            if not view_current:
+                status["ready"] = False
+                status["fresh_for_seconds"] = 0.0
+        elif status.get("ready") is True and not _state_result_matches_worker(
             result,
             operation=operation,
             strategy_scope=strategy_scope,
             worker=self._state_worker,
-            generation=status["session_generation"],
+            generation=status.get("session_generation"),
         ):
             status["ready"] = False
             status["fresh_for_seconds"] = 0.0
@@ -504,6 +572,7 @@ class GatewayReadService:
         operation: str,
         strategy_scope: str,
         state_status: Optional[Mapping[str, object]] = None,  # noqa: UP045
+        source_cursor: object = _UNSAMPLED_SOURCE_CURSOR,
     ) -> Mapping[str, object]:
         result = dict(_batch_result(batch, include_snapshot_source=False))
         result["consumer_progress"] = _consumer_progress_result(progress)
@@ -512,6 +581,7 @@ class GatewayReadService:
             operation=operation,
             strategy_scope=strategy_scope,
             state_status=state_status,
+            source_cursor=source_cursor,
         )
 
     def _resolve_scope(self, scope: WireScope) -> tuple[GatewayServiceAccountScope, str]:

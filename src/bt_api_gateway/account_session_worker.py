@@ -25,6 +25,12 @@ from bt_api_base.account_protocol import (
     AccountResourceKey,
 )
 
+from .account_view_projection import (
+    AccountViewProjectionError,
+    GatewayAccountViewPolicy,
+    project_account_view,
+    validate_policy_set,
+)
 from .event_journal import (
     GatewayAccountSnapshot,
     GatewayEventJournal,
@@ -83,6 +89,7 @@ class GatewayAccountSessionWorker:
         state_scope: str,
         guard: LocalAccountSessionGuard,
         required_coverage: tuple[AccountResourceKey, ...],
+        view_policies: tuple[GatewayAccountViewPolicy, ...] = (),
         require_open_orders: bool = False,
         refresh_interval_seconds: float = 1.0,
         max_staleness_seconds: float = 5.0,
@@ -111,6 +118,18 @@ class GatewayAccountSessionWorker:
             raise GatewayAccountSessionWorkerError("INVALID_REQUIRED_COVERAGE")
         if len(set(required_coverage)) != len(required_coverage):
             raise GatewayAccountSessionWorkerError("INVALID_REQUIRED_COVERAGE")
+        if type(view_policies) is not tuple:
+            raise GatewayAccountSessionWorkerError("INVALID_VIEW_POLICIES")
+        try:
+            canonical_view_policies = validate_policy_set(view_policies)
+        except Exception:
+            raise GatewayAccountSessionWorkerError("INVALID_VIEW_POLICIES") from None
+        required_resources = frozenset(required_coverage)
+        for policy in canonical_view_policies:
+            if policy.view_scope == state_scope:
+                raise GatewayAccountSessionWorkerError("VIEW_SCOPE_CONFLICT")
+            if not frozenset(policy.resources) <= required_resources:
+                raise GatewayAccountSessionWorkerError("VIEW_POLICY_COVERAGE_MISMATCH")
         if type(require_open_orders) is not bool:
             raise GatewayAccountSessionWorkerError("INVALID_OPEN_ORDERS_REQUIREMENT")
         if not callable(clock) or not callable(monotonic_clock):
@@ -130,6 +149,7 @@ class GatewayAccountSessionWorker:
         self._state_scope = state_scope
         self._guard = guard
         self._required_coverage = tuple(required_coverage)
+        self._view_policies = canonical_view_policies
         self._require_open_orders = require_open_orders
         self._clock = clock
         self._monotonic_clock = monotonic_clock
@@ -191,6 +211,12 @@ class GatewayAccountSessionWorker:
     @property
     def required_coverage(self) -> tuple[AccountResourceKey, ...]:
         return self._required_coverage
+
+    @property
+    def view_policies(self) -> tuple[GatewayAccountViewPolicy, ...]:
+        """Canonical trusted projections published with each full snapshot."""
+
+        return self._view_policies
 
     @property
     def state(self) -> str:
@@ -398,6 +424,15 @@ class GatewayAccountSessionWorker:
                 raise GatewayAccountSessionWorkerError("MONOTONIC_CLOCK_REGRESSED")
             phase = "observation_validation"
             row_times, completed_at = self._validate_observation(observation, now=logical_wall)
+            if any("open_orders" in policy.fact_kinds for policy in self._view_policies) and (
+                observation.open_orders is None or not observation.open_orders_complete
+            ):
+                raise GatewayAccountSessionWorkerError("OBSERVATION_OPEN_ORDERS_INCOMPLETE")
+            for policy in self._view_policies:
+                try:
+                    project_account_view(observation, policy)
+                except AccountViewProjectionError as exc:
+                    raise GatewayAccountSessionWorkerError(exc.code) from None
             serialized_observation = _canonical_json(observation.to_dict())
             digest = hashlib.sha256(serialized_observation.encode("utf-8")).hexdigest()
             if observation.observation_id == self._last_observation_id:
@@ -446,6 +481,7 @@ class GatewayAccountSessionWorker:
                 payload,
                 expected_cursor=self._cursor,
                 captured_at=captured_at,
+                view_policies=self._view_policies,
             )
             self._cursor = snapshot.cursor
             self._latest_snapshot = snapshot
@@ -483,6 +519,14 @@ class GatewayAccountSessionWorker:
             raise
 
     def _load_existing_state(self) -> None:
+        try:
+            self._journal.validate_state_view_policies(
+                self._journal_account_scope,
+                self._state_scope,
+                self._view_policies,
+            )
+        except GatewayEventJournalError as exc:
+            raise GatewayAccountSessionWorkerError(exc.code) from None
         batch = self._journal.read_after(
             self._journal_principal,
             self._journal_account_scope,

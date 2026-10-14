@@ -85,11 +85,80 @@ The service is not an authentication layer when called directly in Python.
 SDK clients explicitly request the new operations and their server grants;
 the default account-read operation set remains snapshot/head/read_after.
 Ordinary reads without tracking keep their previous behavior. Journal errors
-currently use the registry's existing `HANDLER_FAILED` response; direct Python
-calls retain the finite `GatewayEventJournalError.code`. Server checkpoints
-do not replace a receiver's local recovery point. These APIs provide progress
-for already-authorized journal views; producing filtered views from provider
-events and assigning strategy ownership remain separate responsibilities.
+use the registry's existing `HANDLER_FAILED` response, except a tracked read
+that cannot fit its first event or required snapshot: that transaction rolls
+back and the SDK reports `REPLY_TOO_LARGE`. Trusted service context supplies
+the complete reply-size check before the journal persists an offer. The page
+contains a contiguous event prefix; it never skips an oversized event. Direct
+Python calls retain the finite `GatewayEventJournalError.code`. Server
+checkpoints do not replace a receiver's local recovery point.
+
+## Permission-filtered provider views
+
+The optional `GatewayAccountSessionWorker(view_policies=...)` publishes
+resource-filtered account views in the same SQLite transaction as its canonical
+account snapshot. An empty tuple preserves the existing single-snapshot path.
+Policies belong to trusted server resource assembly; client requests cannot
+choose resources, fact kinds, or a projection function.
+
+```python
+from bt_api_base.account_protocol import AccountResourceKey
+from bt_api_gateway.account_view_projection import GatewayAccountViewPolicy
+
+view_policy = GatewayAccountViewPolicy(
+    view_scope="view:strategy-a",
+    resources=(AccountResourceKey("spot", "cross"),),
+    fact_kinds=frozenset({"balances", "positions", "open_orders"}),
+    include_valuation=False,
+)
+# Pass view_policies=(view_policy,) to the account worker, then route the
+# authenticated strategy through GatewayServiceAccountScope with
+# strategy_scope_map={"strategy-a": "view:strategy-a"} and explicit grants.
+```
+
+Resource permission exposes every requested fact kind in that resource; it
+does not filter by strategy order ownership or allocate virtual positions.
+Provider account-wide valuation requires its own explicit permission. Missing
+requested coverage, incomplete balances/positions/orders, absent open-order
+facts, or absent requested valuation reject the entire update. They cannot
+delete previously known facts. All views and the canonical snapshot either
+commit together or remain unchanged, including when a later view write fails.
+
+A view starts with a complete `sdk.account.view` version 1 snapshot at cursor
+1. Later `account.view_delta` events carry `sdk.account.view.delta` version 1
+payloads with row `upsert`/`delete` operations and an explicitly authorized
+valuation replacement when changed. Balances use resource/currency identity;
+positions use resource/instrument/side; orders use resource/instrument/order
+ID. The `view_scope` binds the payload to its journal view. Baselines explicitly
+report conservative `multi_query` consistency and preserve visible row times.
+They do not claim a provider-atomic observation. Apply the baseline and later
+events through the receiver's local projection/cursor transaction before ACK.
+
+Each view has an independent continuous cursor. Hidden-only changes update
+private source bindings without producing a visible event, new snapshot ID,
+or sequence gap. Source account identity, observation ID, source revision and
+policy digest remain outside public view payloads and IDs. The journal retains
+bounded replay and compacts to a complete view snapshot; lagging consumers use
+the existing snapshot recovery path. Consumer ACK never controls compaction.
+
+The first publication fixes the source account and policy set. Restart checks
+the same binding before connecting the provider; omission, policy changes,
+scope collisions, and manual appends/snapshot writes to managed views are
+rejected. Adding policies to an already-used legacy source requires an explicit
+migration into fresh stream identities; there is no silent rewrite/reset.
+Changing permissions likewise requires a deliberate migration and corresponding
+grant changes, not reuse of an old view cursor under a different policy.
+The `sdk.account.view` schemas, `account.view_delta` kind and `account-view:`
+snapshot IDs are reserved for managed views. Reads reject missing bindings or
+corrupt retained baselines/deltas instead of treating them as legacy streams.
+
+The service may expose a subset of configured views through exact strategy
+mappings. Full-account reads still require their separate canonical mapping
+and grant. A filtered page is ready only when it reaches the current view head
+and its private source binding matches the worker's fresh accepted observation.
+Persisted views after restart remain diagnostic until that new observation.
+These view payloads are for a generic schema-aware consumer, not the existing
+full-account Backtrader facade. No provider SDK is embedded on the strategy side.
 
 ## Local provider-query resolution candidate
 
