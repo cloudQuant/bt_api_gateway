@@ -13,9 +13,11 @@ latest event is a complete order-book or ticker snapshot.
 from __future__ import annotations
 
 import json
+import math
 import re
 import secrets
 import threading
+import time
 import uuid
 from collections import deque
 from collections.abc import Callable, Collection, Mapping
@@ -24,6 +26,11 @@ from datetime import datetime
 from types import MappingProxyType
 from typing import Any, Optional, Protocol
 
+from bt_api_base.market_history_protocol import (
+    MAX_MARKET_HISTORY_PAGE_BYTES,
+    MarketHistoryPage,
+    MarketHistoryRequest,
+)
 from bt_api_base.market_protocol import (
     MARKET_EVENT_OPERATION,
     MARKET_EVENT_SCHEMA,
@@ -52,6 +59,10 @@ MARKET_OPERATIONS = frozenset(
         "market.read_after",
     }
 )
+# Potential operations for trusted capability discovery. ``SUPPORTED_OPERATIONS``
+# remains the five-operation default for callers that have not configured history.
+MARKET_HISTORY_OPERATION = "market.history"
+ALL_MARKET_OPERATIONS = MARKET_OPERATIONS | frozenset({MARKET_HISTORY_OPERATION})
 SUPPORTED_OPERATIONS = MARKET_OPERATIONS
 DEFAULT_MARKET_READ_LIMIT = 100
 MAX_MARKET_READ_LIMIT = 1_000
@@ -63,6 +74,7 @@ MAX_TOTAL_MARKET_REPLAY_BYTES = 64 * 1024 * 1024
 MAX_MARKET_EVENT_BYTES = 256 * 1024
 MAX_MARKET_READ_PAGE_BYTES = 896 * 1024
 MAX_MARKET_REPLAY_EVENTS = 10_000
+MAX_MARKET_HISTORY_TIMEOUT_SECONDS = 300.0
 
 _UTC_TIMESTAMP_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$")
 _MAPPING_PROXY_TYPE = type(MappingProxyType({}))
@@ -106,6 +118,19 @@ class MarketProvider(Protocol):
         retries it later. The provider must accept that same handle again even
         if the previous call already stopped its upstream subscription.
         """
+
+
+class MarketHistoryProvider(Protocol):
+    """Synchronous read-only history edge with a provider-enforced timeout.
+
+    ``fetch`` must bound its own blocking work by ``timeout_seconds``. The hub
+    checks elapsed time when the call returns and rejects a late page, but it
+    cannot preempt a provider that ignores the timeout. Calls are never retried
+    or cached by the hub.
+    """
+
+    def fetch(self, request: MarketHistoryRequest, timeout_seconds: float) -> MarketHistoryPage:
+        """Fetch one bounded page for the exact immutable request."""
 
 
 @dataclass(frozen=True)
@@ -183,6 +208,8 @@ class GatewayMarketHub:
         max_replay_bytes: int = 256 * 1024,
         publisher: Optional[Callable[[WireEnvelope], object]] = None,  # noqa: UP045
         epoch_factory: Optional[Callable[[], str]] = None,  # noqa: UP045 -- Python 3.9 support.
+        history_provider: Optional[MarketHistoryProvider] = None,  # noqa: UP045
+        history_timeout_seconds: Optional[float] = None,  # noqa: UP045
     ) -> None:
         if not callable(getattr(provider, "subscribe", None)) or not callable(
             getattr(provider, "unsubscribe", None)
@@ -198,6 +225,9 @@ class GatewayMarketHub:
             raise GatewayMarketHubError("INVALID_PUBLISHER")
         if epoch_factory is not None and not callable(epoch_factory):
             raise GatewayMarketHubError("INVALID_EPOCH_FACTORY")
+        normalized_history_timeout = _validate_history_configuration(
+            history_provider, history_timeout_seconds
+        )
 
         copied_keys = _copy_key_universe(key_universe)
         if len(copied_keys) > MAX_MARKET_KEY_UNIVERSE:
@@ -216,6 +246,8 @@ class GatewayMarketHub:
         self._max_replay_bytes = max_replay_bytes
         self._publisher = publisher
         self._epoch_factory = epoch_factory or (lambda: uuid.uuid4().hex)
+        self._history_provider = history_provider
+        self._history_timeout_seconds = normalized_history_timeout
         self._owner_thread_id = threading.get_ident()
         self._closing = False
         self._streams: dict[MarketSubscriptionKey, _MarketStream] = {}
@@ -263,6 +295,16 @@ class GatewayMarketHub:
     ) -> Mapping[str, frozenset[MarketSubscriptionKey]]:
         """The copied trusted principal/key ACL supplied at construction."""
         return self._principal_allowed_keys
+
+    @property
+    def supported_operations(self) -> frozenset[str]:
+        """Operations available from this configured hub instance."""
+        return ALL_MARKET_OPERATIONS if self._history_provider is not None else MARKET_OPERATIONS
+
+    @property
+    def history_enabled(self) -> bool:
+        """Whether a trusted historical data provider was configured."""
+        return self._history_provider is not None
 
     @property
     def ready(self) -> bool:
@@ -649,6 +691,55 @@ class GatewayMarketHub:
             }
         )
 
+    def fetch_history(
+        self, principal_ref: str, request: MarketHistoryRequest
+    ) -> Mapping[str, object]:
+        """Fetch one authorized, bounded history page without changing hub state.
+
+        History access is independently authorized by the trusted public
+        registration and full-key ACL; a live subscription is not required.
+        The provider receives the exact request and explicit timeout once.
+        """
+        self._check_owner()
+        self._ensure_open()
+        if self._history_provider is None or self._history_timeout_seconds is None:
+            raise GatewayMarketHubError("HISTORY_NOT_CONFIGURED")
+        if type(request) is not MarketHistoryRequest:
+            raise GatewayMarketHubError("INVALID_HISTORY_REQUEST")
+        self._authorize_key(principal_ref, request.key)
+
+        started = time.monotonic()
+        try:
+            page = self._history_provider.fetch(request, self._history_timeout_seconds)
+        except Exception:
+            raise GatewayMarketHubError("HISTORY_PROVIDER_FAILED") from None
+        elapsed = time.monotonic() - started
+        if not math.isfinite(elapsed) or elapsed > self._history_timeout_seconds:
+            raise GatewayMarketHubError("HISTORY_PROVIDER_TIMEOUT")
+        if type(page) is not MarketHistoryPage:
+            raise GatewayMarketHubError("INVALID_HISTORY_PAGE")
+        if page.request != request:
+            raise GatewayMarketHubError("HISTORY_REQUEST_MISMATCH")
+
+        try:
+            result = page.to_dict()
+            encoded = json.dumps(
+                result,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8", errors="strict")
+        except Exception:
+            raise GatewayMarketHubError("INVALID_HISTORY_PAGE") from None
+        if len(encoded) > MAX_MARKET_HISTORY_PAGE_BYTES:
+            raise GatewayMarketHubError("HISTORY_PAGE_TOO_LARGE")
+        try:
+            MarketHistoryPage.from_dict(json.loads(encoded.decode("utf-8")))
+        except Exception:
+            raise GatewayMarketHubError("INVALID_HISTORY_PAGE") from None
+        return MappingProxyType(result)
+
     def reset_stream_epoch(self, key: MarketSubscriptionKey) -> str:
         """Rotate the public cursor after a provider-confirmed source reconnect.
 
@@ -801,6 +892,11 @@ class GatewayMarketService:
         """The hub's finite readiness projection."""
         return self._hub.readiness
 
+    @property
+    def supported_operations(self) -> frozenset[str]:
+        """Configured operation set for resource and capability advertisement."""
+        return self._hub.supported_operations
+
     def register_registration(
         self, registration_id: str, registration: GatewayMarketRegistration
     ) -> None:
@@ -837,14 +933,24 @@ class GatewayMarketService:
     ) -> Mapping[str, object]:
         """Handle one exact market RPC under a trusted strategy-run mapping."""
         self._hub._check_owner()
-        if type(operation) is not str or operation not in MARKET_OPERATIONS:
+        if type(operation) is not str or operation not in self.supported_operations:
             raise GatewayMarketServiceError("UNSUPPORTED_OPERATION")
         self._resolve_registration(principal_ref, scope, registration_id)
         raw = _require_arguments(arguments)
-        expected = (
-            {"key", "epoch", "after", "limit"} if operation == "market.read_after" else {"key"}
-        )
+        if operation == MARKET_HISTORY_OPERATION:
+            expected = {"key", "start_time_utc", "end_time_utc", "limit"}
+        elif operation == "market.read_after":
+            expected = {"key", "epoch", "after", "limit"}
+        else:
+            expected = {"key"}
         _require_exact_arguments(raw, expected)
+        if operation == MARKET_HISTORY_OPERATION:
+            request = _parse_history_request(raw)
+            try:
+                return self._hub.fetch_history(principal_ref, request)
+            except GatewayMarketHubError as exc:
+                raise GatewayMarketServiceError(exc.code, retryable=exc.retryable) from None
+
         key = _parse_key(raw["key"])
         self._hub._authorize_key(principal_ref, key)
 
@@ -1021,6 +1127,29 @@ def _require_reference(value: object, code: str) -> str:
     return value
 
 
+def _validate_history_configuration(
+    provider: Optional[MarketHistoryProvider],  # noqa: UP045 -- Python 3.9 support.
+    timeout_seconds: Optional[float],  # noqa: UP045 -- Python 3.9 support.
+) -> Optional[float]:  # noqa: UP045 -- Python 3.9 support.
+    if provider is None:
+        if timeout_seconds is not None:
+            raise GatewayMarketHubError("HISTORY_TIMEOUT_WITHOUT_PROVIDER")
+        return None
+    if not callable(getattr(provider, "fetch", None)):
+        raise GatewayMarketHubError("INVALID_HISTORY_PROVIDER")
+    if timeout_seconds is None:
+        raise GatewayMarketHubError("HISTORY_TIMEOUT_REQUIRED")
+    if type(timeout_seconds) not in (int, float):
+        raise GatewayMarketHubError("INVALID_HISTORY_TIMEOUT")
+    try:
+        normalized = float(timeout_seconds)
+    except (OverflowError, ValueError):
+        raise GatewayMarketHubError("INVALID_HISTORY_TIMEOUT") from None
+    if not math.isfinite(normalized) or not 0 < normalized <= MAX_MARKET_HISTORY_TIMEOUT_SECONDS:
+        raise GatewayMarketHubError("INVALID_HISTORY_TIMEOUT")
+    return normalized
+
+
 def _validate_utc_timestamp(value: object, code: str) -> str:
     if type(value) is not str or _UTC_TIMESTAMP_PATTERN.fullmatch(value) is None:
         raise GatewayMarketHubError(code)
@@ -1083,6 +1212,16 @@ def _parse_key(value: object) -> MarketSubscriptionKey:
         raise GatewayMarketServiceError("INVALID_MARKET_KEY") from None
 
 
+def _parse_history_request(value: Mapping[str, object]) -> MarketHistoryRequest:
+    try:
+        request = MarketHistoryRequest.from_dict(value)
+    except (TypeError, ValueError):
+        raise GatewayMarketServiceError("INVALID_HISTORY_REQUEST") from None
+    if type(request) is not MarketHistoryRequest:
+        raise GatewayMarketServiceError("INVALID_HISTORY_REQUEST")
+    return request
+
+
 def _envelope_mapping(envelope: WireEnvelope) -> Mapping[str, object]:
     try:
         value = json.loads(encode_envelope(envelope, max_bytes=MAX_WIRE_MESSAGE_BYTES))
@@ -1092,15 +1231,18 @@ def _envelope_mapping(envelope: WireEnvelope) -> Mapping[str, object]:
 
 
 __all__ = [
+    "ALL_MARKET_OPERATIONS",
     "DEFAULT_MARKET_READ_LIMIT",
     "GatewayMarketHub",
     "GatewayMarketHubError",
     "GatewayMarketRegistration",
     "GatewayMarketService",
     "GatewayMarketServiceError",
+    "MARKET_HISTORY_OPERATION",
     "MARKET_OPERATIONS",
     "SUPPORTED_OPERATIONS",
     "MAX_MARKET_EVENT_BYTES",
+    "MAX_MARKET_HISTORY_TIMEOUT_SECONDS",
     "MAX_MARKET_KEY_UNIVERSE",
     "MAX_MARKET_PRINCIPALS",
     "MAX_MARKET_REGISTRATIONS",
@@ -1110,4 +1252,5 @@ __all__ = [
     "MAX_MARKET_REPLAY_EVENTS",
     "MAX_TOTAL_MARKET_REPLAY_BYTES",
     "MarketProvider",
+    "MarketHistoryProvider",
 ]

@@ -19,6 +19,7 @@ from types import MappingProxyType
 from typing import Callable, Optional, Protocol
 
 from bt_api_base.account_protocol import (
+    MAX_ACCOUNT_ROWS,
     AccountKey,
     AccountObservation,
     AccountResourceKey,
@@ -33,8 +34,9 @@ from .router import GatewayCommandKind, GatewayPrincipal
 from .session_guard import LocalAccountSessionGuard, LocalAccountSessionGuardError
 
 _STATE_SCHEMA_ID = "sdk.account.state"
-_STATE_SCHEMA_VERSION = 1
-_MAX_TRACKED_ROWS = 4096
+_STATE_SCHEMA_VERSION_LEGACY = 1
+_STATE_SCHEMA_VERSION_OPEN_ORDERS = 2
+_MAX_TRACKED_ROWS = 3 * MAX_ACCOUNT_ROWS + 1
 _STATE_METADATA_RESERVE_BYTES = 4096
 
 
@@ -79,6 +81,7 @@ class GatewayAccountSessionWorker:
         state_scope: str,
         guard: LocalAccountSessionGuard,
         required_coverage: tuple[AccountResourceKey, ...],
+        require_open_orders: bool = False,
         refresh_interval_seconds: float = 1.0,
         max_staleness_seconds: float = 5.0,
         request_timeout_seconds: float = 2.0,
@@ -105,6 +108,8 @@ class GatewayAccountSessionWorker:
             raise GatewayAccountSessionWorkerError("INVALID_REQUIRED_COVERAGE")
         if len(set(required_coverage)) != len(required_coverage):
             raise GatewayAccountSessionWorkerError("INVALID_REQUIRED_COVERAGE")
+        if type(require_open_orders) is not bool:
+            raise GatewayAccountSessionWorkerError("INVALID_OPEN_ORDERS_REQUIREMENT")
         if not callable(clock) or not callable(monotonic_clock):
             raise GatewayAccountSessionWorkerError("INVALID_CLOCK")
         self._refresh_interval = _positive_seconds(refresh_interval_seconds)
@@ -119,6 +124,7 @@ class GatewayAccountSessionWorker:
         self._state_scope = state_scope
         self._guard = guard
         self._required_coverage = tuple(required_coverage)
+        self._require_open_orders = require_open_orders
         self._clock = clock
         self._monotonic_clock = monotonic_clock
         principal_digest = hashlib.sha256(account_key.account_key_id.encode("ascii")).hexdigest()
@@ -216,7 +222,8 @@ class GatewayAccountSessionWorker:
                     and self._latest_snapshot.strategy_scope == self._state_scope
                     and self._latest_snapshot.cursor == self._cursor
                     and self._latest_snapshot.payload.get("schema_id") == _STATE_SCHEMA_ID
-                    and self._latest_snapshot.payload.get("schema_version") == _STATE_SCHEMA_VERSION
+                    and self._latest_snapshot.payload.get("schema_version")
+                    == _observation_schema_version(self._latest_observation)
                     and _snapshot_generation(self._latest_snapshot) == generation
                     and _canonical_json(
                         _plain_json(self._latest_snapshot.payload.get("observation"))
@@ -395,7 +402,7 @@ class GatewayAccountSessionWorker:
             snapshot_id = f"{generation}:{self._snapshot_counter}"
             payload = {
                 "schema_id": _STATE_SCHEMA_ID,
-                "schema_version": _STATE_SCHEMA_VERSION,
+                "schema_version": _observation_schema_version(observation),
                 "session_generation": generation,
                 "observation": observation.to_dict(),
             }
@@ -477,9 +484,12 @@ class GatewayAccountSessionWorker:
         if batch.events:
             raise GatewayAccountSessionWorkerError("STATE_STREAM_HAS_EVENTS")
         snapshot = batch.snapshot
+        if snapshot is not None and snapshot.payload.get("schema_id") != _STATE_SCHEMA_ID:
+            raise GatewayAccountSessionWorkerError("STATE_STREAM_SCHEMA_MISMATCH")
         if snapshot is not None and (
-            snapshot.payload.get("schema_id") != _STATE_SCHEMA_ID
-            or snapshot.payload.get("schema_version") != _STATE_SCHEMA_VERSION
+            type(snapshot.payload.get("schema_version")) is not int
+            or snapshot.payload.get("schema_version")
+            not in {_STATE_SCHEMA_VERSION_LEGACY, _STATE_SCHEMA_VERSION_OPEN_ORDERS}
         ):
             raise GatewayAccountSessionWorkerError("STATE_STREAM_SCHEMA_MISMATCH")
         persisted_observation: Optional[AccountObservation] = None  # noqa: UP045
@@ -513,6 +523,8 @@ class GatewayAccountSessionWorker:
                 or not persisted_observation.positions_complete
             ):
                 raise GatewayAccountSessionWorkerError("STATE_STREAM_OBSERVATION_INCOMPLETE")
+            if payload["schema_version"] != _observation_schema_version(persisted_observation):
+                raise GatewayAccountSessionWorkerError("STATE_STREAM_SCHEMA_MISMATCH")
         self._cursor = batch.latest_cursor
         self._latest_snapshot = snapshot
         if persisted_observation is not None and snapshot is not None:
@@ -539,6 +551,10 @@ class GatewayAccountSessionWorker:
             raise GatewayAccountSessionWorkerError("OBSERVATION_COVERAGE_MISMATCH")
         if not observation.balances_complete or not observation.positions_complete:
             raise GatewayAccountSessionWorkerError("OBSERVATION_INCOMPLETE")
+        if self._require_open_orders and (
+            observation.open_orders is None or not observation.open_orders_complete
+        ):
+            raise GatewayAccountSessionWorkerError("OBSERVATION_OPEN_ORDERS_INCOMPLETE")
 
         now = self._wall_clock()
         completed_at = _parse_utc(observation.completed_at_utc)
@@ -643,6 +659,8 @@ def _observation_times(observation: AccountObservation) -> tuple[datetime, ...]:
     ]
     if observation.valuation is not None:
         values.append(observation.valuation.observed_at_utc)
+    if observation.open_orders is not None:
+        values.extend(order.observed_at_utc for order in observation.open_orders)
     return tuple(_parse_utc(value) for value in values)
 
 
@@ -665,7 +683,24 @@ def _row_times(observation: AccountObservation) -> dict[str, datetime]:
         rows[_canonical_json(identity)] = _parse_utc(position.observed_at_utc)
     if observation.valuation is not None:
         rows["valuation"] = _parse_utc(observation.valuation.observed_at_utc)
+    if observation.open_orders is not None:
+        for order in observation.open_orders:
+            identity = {
+                "kind": "open_order",
+                "resource": order.resource.to_dict(),
+                "instrument": order.instrument.to_dict(),
+                "order_id": order.order_id,
+            }
+            rows[_canonical_json(identity)] = _parse_utc(order.observed_at_utc)
     return rows
+
+
+def _observation_schema_version(observation: AccountObservation) -> int:
+    return (
+        _STATE_SCHEMA_VERSION_LEGACY
+        if observation.open_orders is None
+        else _STATE_SCHEMA_VERSION_OPEN_ORDERS
+    )
 
 
 def _snapshot_generation(snapshot: GatewayAccountSnapshot) -> Optional[str]:  # noqa: UP045

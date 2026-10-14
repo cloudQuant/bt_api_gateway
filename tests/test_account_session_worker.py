@@ -14,6 +14,7 @@ from bt_api_base.account_protocol import (
     AccountBalance,
     AccountKey,
     AccountObservation,
+    AccountOpenOrder,
     AccountPosition,
     AccountResourceKey,
 )
@@ -129,6 +130,8 @@ def _observation(
     positions: tuple[AccountPosition, ...] = (),
     balances_complete: bool = True,
     positions_complete: bool = True,
+    open_orders: Optional[tuple[AccountOpenOrder, ...]] = None,  # noqa: UP045
+    open_orders_complete: bool = False,
     row_timestamp: Optional[str] = None,  # noqa: UP045
     started_at_utc: Optional[str] = None,  # noqa: UP045
     completed_at_utc: Optional[str] = None,  # noqa: UP045
@@ -156,6 +159,8 @@ def _observation(
         consistency="multi_query",
         balances_complete=balances_complete,
         positions_complete=positions_complete,
+        open_orders=open_orders,
+        open_orders_complete=open_orders_complete,
     )
 
 
@@ -172,6 +177,36 @@ def _position(clocks: Clocks, quantity: str = "2") -> AccountPosition:
     )
 
 
+def _open_order(
+    clocks: Clocks,
+    *,
+    order_id: str = "order-1",
+    observed_at_utc: Optional[str] = None,  # noqa: UP045
+    created_at_utc: Optional[str] = None,  # noqa: UP045
+) -> AccountOpenOrder:
+    observed_at = observed_at_utc or clocks.timestamp()
+    created_at = created_at_utc or clocks.timestamp(-1.0)
+    return AccountOpenOrder(
+        resource=_resource(),
+        instrument=_instrument(),
+        order_id=order_id,
+        side="buy",
+        position_side="net",
+        order_type="limit",
+        status="partially_filled",
+        quantity="4",
+        filled_quantity="1",
+        qty_unit="contract",
+        created_at_utc=created_at,
+        observed_at_utc=observed_at,
+        client_order_id="client-order-1",
+        limit_price="100",
+        stop_price=None,
+        price_currency="USD",
+        reduce_only=False,
+    )
+
+
 def _worker(
     tmp_path: Path,
     provider: FakeProvider,
@@ -179,6 +214,7 @@ def _worker(
     *,
     account_key: Optional[AccountKey] = None,  # noqa: UP045
     required_coverage: Optional[tuple[AccountResourceKey, ...]] = None,  # noqa: UP045
+    require_open_orders: bool = False,
     max_staleness_seconds: float = 5.0,
     request_timeout_seconds: float = 2.0,
     guard: Optional[LocalAccountSessionGuard] = None,  # noqa: UP045
@@ -198,6 +234,7 @@ def _worker(
         state_scope="strategy:account-facts",
         guard=session_guard,
         required_coverage=required_coverage or (_resource(),),
+        require_open_orders=require_open_orders,
         refresh_interval_seconds=1.0,
         max_staleness_seconds=max_staleness_seconds,
         request_timeout_seconds=request_timeout_seconds,
@@ -244,6 +281,192 @@ def test_worker_publishes_complete_replacements_without_event_or_dedupe_growth(t
 
     worker.close()
     assert worker.state == "closed"
+
+
+def test_complete_open_orders_snapshot_replaces_orders_with_complete_empty_state(tmp_path) -> None:
+    clocks = Clocks()
+    with_order = _observation(
+        clocks,
+        observation_id="open-order-present",
+        open_orders=(_open_order(clocks),),
+        open_orders_complete=True,
+    )
+    empty_orders = _observation(
+        clocks,
+        observation_id="open-order-empty",
+        open_orders=(),
+        open_orders_complete=True,
+    )
+    provider = FakeProvider([with_order, empty_orders])
+    worker, _ = _worker(tmp_path, provider, clocks, require_open_orders=True)
+
+    worker.start()
+    first = worker.latest_snapshot
+    assert first is not None
+    assert first.payload["schema_version"] == 2
+    assert len(first.payload["observation"]["open_orders"]) == 1  # type: ignore[index]
+    assert first.payload["observation"]["open_orders_complete"] is True  # type: ignore[index]
+    assert worker.ready is True
+
+    clocks.advance(1.1)
+    snapshot = worker.refresh()
+
+    assert snapshot.cursor == 2
+    assert snapshot.payload["schema_version"] == 2
+    assert snapshot.payload["observation"]["open_orders"] == ()  # type: ignore[index]
+    assert snapshot.payload["observation"]["open_orders_complete"] is True  # type: ignore[index]
+    assert worker.ready is True
+    assert provider.connect_generations == [worker.session_generation]
+    assert provider.read_calls == 2
+    worker.close()
+
+
+@pytest.mark.parametrize("include_orders", [False, True])
+def test_required_open_orders_rejects_missing_or_incomplete_observation(
+    tmp_path, include_orders
+) -> None:
+    clocks = Clocks()
+    observation = _observation(
+        clocks,
+        observation_id=f"orders-incomplete-{include_orders}",
+        open_orders=(_open_order(clocks),) if include_orders else None,
+        open_orders_complete=False,
+    )
+    provider = FakeProvider([observation])
+    worker, _ = _worker(tmp_path, provider, clocks, require_open_orders=True)
+
+    with pytest.raises(GatewayAccountSessionWorkerError) as raised:
+        worker.start()
+
+    assert raised.value.code == "OBSERVATION_OPEN_ORDERS_INCOMPLETE"
+    assert worker.ready is False
+    assert worker.latest_snapshot is None
+    assert provider.connect_generations == [worker.session_generation]
+    assert provider.read_calls == 1
+    worker.close()
+
+
+def test_stale_open_order_row_prevents_ready_snapshot(tmp_path) -> None:
+    clocks = Clocks()
+    stale_order = _open_order(
+        clocks,
+        observed_at_utc=clocks.timestamp(-10.0),
+        created_at_utc=clocks.timestamp(-11.0),
+    )
+    provider = FakeProvider(
+        [
+            _observation(
+                clocks,
+                observation_id="stale-open-order",
+                open_orders=(stale_order,),
+                open_orders_complete=True,
+            )
+        ]
+    )
+    worker, _ = _worker(tmp_path, provider, clocks, require_open_orders=True)
+
+    with pytest.raises(GatewayAccountSessionWorkerError) as raised:
+        worker.start()
+
+    assert raised.value.code == "OBSERVATION_STALE"
+    assert worker.ready is False
+    assert worker.latest_snapshot is None
+    worker.close()
+
+
+def test_new_observation_id_does_not_extend_freshness_of_unchanged_open_order(tmp_path) -> None:
+    clocks = Clocks()
+    old_order = _open_order(clocks)
+    first = _observation(
+        clocks,
+        observation_id="open-order-original-time",
+        open_orders=(old_order,),
+        open_orders_complete=True,
+    )
+    repeated_order = _observation(
+        clocks,
+        observation_id="open-order-new-observation-id",
+        open_orders=(old_order,),
+        open_orders_complete=True,
+    )
+    provider = FakeProvider([first, repeated_order])
+    worker, _ = _worker(tmp_path, provider, clocks, require_open_orders=True)
+    worker.start()
+
+    clocks.advance(4.0)
+    worker.refresh()
+    status = worker.read_status()
+    assert status["ready"] is True
+    assert status["fresh_for_seconds"] == pytest.approx(1.0)
+
+    clocks.advance(1.1)
+    status = worker.read_status()
+    assert status["ready"] is False
+    assert status["fresh_for_seconds"] == 0.0
+    assert worker.latest_snapshot is not None
+    assert worker.latest_snapshot.cursor == 2
+    worker.close()
+
+
+def test_order_row_timestamps_cannot_regress_on_a_new_observation_id(tmp_path) -> None:
+    clocks = Clocks()
+    first = _observation(
+        clocks,
+        observation_id="order-row-time-1",
+        open_orders=(_open_order(clocks),),
+        open_orders_complete=True,
+    )
+    provider = FakeProvider([first])
+    worker, _ = _worker(tmp_path, provider, clocks, require_open_orders=True)
+    worker.start()
+
+    clocks.advance(2.0)
+    regressed_order = _open_order(
+        clocks,
+        observed_at_utc=clocks.timestamp(-3.0),
+        created_at_utc=clocks.timestamp(-4.0),
+    )
+    provider.observations.append(
+        _observation(
+            clocks,
+            observation_id="order-row-time-2",
+            open_orders=(regressed_order,),
+            open_orders_complete=True,
+        )
+    )
+    with pytest.raises(GatewayAccountSessionWorkerError) as raised:
+        worker.refresh()
+
+    assert raised.value.code == "ROW_OBSERVATION_TIME_REGRESSED"
+    assert worker.latest_snapshot is not None
+    assert worker.latest_snapshot.cursor == 1
+    assert worker.latest_snapshot.payload["schema_version"] == 2
+    assert worker.ready is False
+    worker.close()
+
+
+def test_legacy_observation_roundtrips_as_schema_v1_after_restart(tmp_path) -> None:
+    clocks = Clocks()
+    sample = _observation(clocks, observation_id="legacy-v1")
+    assert "open_orders" not in sample.to_dict()
+    assert "open_orders_complete" not in sample.to_dict()
+    first, _ = _worker(tmp_path, FakeProvider([sample]), clocks)
+    first.start()
+    old_snapshot = first.latest_snapshot
+    assert old_snapshot is not None
+    assert old_snapshot.payload["schema_version"] == 1
+    first.close()
+
+    second, _ = _worker(tmp_path, FakeProvider([sample]), clocks)
+    second.start()
+    new_snapshot = second.latest_snapshot
+    assert new_snapshot is not None
+    assert new_snapshot.cursor == 2
+    assert new_snapshot.payload["schema_version"] == 1
+    assert "open_orders" not in new_snapshot.payload["observation"]
+    assert "open_orders_complete" not in new_snapshot.payload["observation"]
+    assert second.ready is True
+    second.close()
 
 
 def test_recovery_reentry_during_provider_connect_is_rejected(tmp_path) -> None:
@@ -546,6 +769,54 @@ def test_restart_rejects_older_complete_empty_snapshot_against_persisted_floor(t
     assert batch.latest_cursor == 1
     assert batch.snapshot == old_snapshot
     assert len(batch.snapshot.payload["observation"]["positions"]) == 1  # type: ignore[index]
+
+
+def test_restart_restores_open_order_row_timestamp_floor(tmp_path) -> None:
+    clocks = Clocks()
+    initial = replace(
+        _observation(
+            clocks,
+            observation_id="persisted-open-order",
+            open_orders=(_open_order(clocks),),
+            open_orders_complete=True,
+        ),
+        balances=(),
+        positions=(),
+    )
+    first, _ = _worker(tmp_path, FakeProvider([initial]), clocks, require_open_orders=True)
+    first.start()
+    old_snapshot = first.latest_snapshot
+    assert old_snapshot is not None
+    first.close()
+
+    clocks.advance(2.0)
+    regressed_order = _open_order(
+        clocks,
+        observed_at_utc=clocks.timestamp(-3.0),
+        created_at_utc=clocks.timestamp(-4.0),
+    )
+    newer_completion = replace(
+        _observation(
+            clocks,
+            observation_id="regressed-open-order-after-restart",
+            open_orders=(regressed_order,),
+            open_orders_complete=True,
+        ),
+        balances=(),
+        positions=(),
+    )
+    second_provider = FakeProvider([newer_completion])
+    second, _ = _worker(tmp_path, second_provider, clocks, require_open_orders=True)
+
+    with pytest.raises(GatewayAccountSessionWorkerError) as raised:
+        second.start()
+
+    assert raised.value.code == "ROW_OBSERVATION_TIME_REGRESSED"
+    assert second.latest_snapshot == old_snapshot
+    assert second.latest_snapshot is not None
+    assert second.latest_snapshot.payload["schema_version"] == 2
+    assert second.ready is False
+    second.close()
 
 
 def test_old_generation_reply_returning_after_explicit_recovery_is_rejected(tmp_path) -> None:
