@@ -75,6 +75,11 @@ class LocalAccountSessionGuard:
         """Return the deterministic local lock path for diagnostics."""
         return self._lock_path
 
+    @property
+    def account_key_digest(self) -> str:
+        """Return the stable account-key digest without exposing the raw key."""
+        return self._account_digest
+
     def acquire(self) -> str:
         """Acquire local ownership and return its fresh opaque generation.
 

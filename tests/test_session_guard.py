@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 import sys
@@ -120,6 +121,23 @@ def test_guard_claims_one_consumer_identity_before_io_and_after_release(tmp_path
         guard.bind_consumer(second_consumer)
     assert retained_conflict.value.code == "SESSION_CONSUMER_CONFLICT"
     assert guard.lock_path.read_bytes() == closed_record
+
+
+def test_account_key_digest_is_stable_read_only_and_requires_no_lock_file_io(
+    tmp_path: Path,
+) -> None:
+    account_key = "canonical-account:one"
+    guard = LocalAccountSessionGuard(tmp_path, account_key, "owner:first")
+
+    expected = hashlib.sha256(account_key.encode("utf-8")).hexdigest()
+    assert guard.account_key_digest == expected
+    assert account_key not in guard.account_key_digest
+    with pytest.raises(AttributeError):
+        guard.account_key_digest = "different-account"
+    assert guard.account_key_digest == expected
+    assert not guard.lock_path.exists()
+    assert guard._fd is None
+    assert guard._phase == "idle"
 
 
 def test_independent_process_cannot_acquire_active_session(tmp_path: Path) -> None:
