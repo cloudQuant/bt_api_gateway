@@ -10,13 +10,14 @@ it is never a fresh provider snapshot.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Optional
 
 from bt_api_base.service_protocol import MAX_REFERENCE_BYTES, WireScope
 
+from .account_session_worker import GatewayAccountSessionWorker
 from .event_journal import (
     GatewayAccountEvent,
     GatewayAccountSnapshot,
@@ -110,6 +111,8 @@ class GatewayServiceAccountScope:
     journal_account_scope: str
     strategy_scope_map: Mapping[str, str] = field(default_factory=dict)
     account_read_strategy_scope: Optional[str] = None  # noqa: UP045 -- Python 3.9 support.
+    shared_account_facts_scope: Optional[str] = None  # noqa: UP045 -- Python 3.9 support.
+    shared_fact_strategy_refs: Iterable[str] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
         _require_wire_text(self.account_ref, "INVALID_ACCOUNT_SCOPE")
@@ -125,6 +128,24 @@ class GatewayServiceAccountScope:
         if len(set(copied.values())) != len(copied):
             raise GatewayServiceError("AMBIGUOUS_STRATEGY_SCOPE_MAP")
 
+        shared_scope = self.shared_account_facts_scope
+        if shared_scope is not None:
+            _require_wire_text(shared_scope, "INVALID_SHARED_ACCOUNT_FACTS_SCOPE")
+            if shared_scope in copied.values():
+                raise GatewayServiceError("AMBIGUOUS_SHARED_ACCOUNT_FACTS_SCOPE")
+        try:
+            shared_refs = frozenset(self.shared_fact_strategy_refs)
+        except (TypeError, ValueError) as exc:
+            raise GatewayServiceError("INVALID_SHARED_FACT_STRATEGY_REFS") from exc
+        if isinstance(self.shared_fact_strategy_refs, (str, bytes)):
+            raise GatewayServiceError("INVALID_SHARED_FACT_STRATEGY_REFS")
+        if shared_refs and shared_scope is None:
+            raise GatewayServiceError("SHARED_FACT_SCOPE_REQUIRED")
+        for strategy_ref in shared_refs:
+            _require_wire_text(strategy_ref, "INVALID_SHARED_FACT_STRATEGY_REFS")
+            if strategy_ref in copied:
+                raise GatewayServiceError("AMBIGUOUS_SHARED_FACT_STRATEGY")
+
         account_strategy_scope = self.account_read_strategy_scope
         if account_strategy_scope is not None:
             _require_wire_text(account_strategy_scope, "INVALID_ACCOUNT_READ_SCOPE")
@@ -132,6 +153,7 @@ class GatewayServiceAccountScope:
                 raise GatewayServiceError("AMBIGUOUS_ACCOUNT_READ_SCOPE")
 
         object.__setattr__(self, "strategy_scope_map", MappingProxyType(copied))
+        object.__setattr__(self, "shared_fact_strategy_refs", shared_refs)
 
 
 class GatewayReadService:
@@ -148,12 +170,34 @@ class GatewayReadService:
         *,
         accounts: Mapping[str, GatewayServiceAccountScope],
         principals: Mapping[str, GatewayPrincipal],
+        state_worker: Optional[GatewayAccountSessionWorker] = None,  # noqa: UP045
     ) -> None:
         if not isinstance(journal, GatewayEventJournal):
             raise GatewayServiceError("INVALID_JOURNAL")
         self._journal = journal
         self._accounts = MappingProxyType(_copy_accounts(accounts))
         self._principals = MappingProxyType(_copy_principals(principals))
+        if state_worker is not None:
+            if type(state_worker) is not GatewayAccountSessionWorker:
+                raise GatewayServiceError("INVALID_STATE_WORKER")
+            if state_worker.journal is not journal:
+                raise GatewayServiceError("STATE_WORKER_JOURNAL_MISMATCH")
+            if len(self._accounts) != 1:
+                raise GatewayServiceError("STATE_WORKER_ACCOUNT_MAPPING_INVALID")
+            account = next(iter(self._accounts.values()))
+            if account.journal_account_scope != state_worker.journal_account_scope:
+                raise GatewayServiceError("STATE_WORKER_JOURNAL_SCOPE_MISMATCH")
+            shared_scope = account.shared_account_facts_scope
+            account_read_scope = account.account_read_strategy_scope
+            if (shared_scope is not None and shared_scope != state_worker.state_scope) or (
+                account_read_scope is not None and account_read_scope != state_worker.state_scope
+            ):
+                raise GatewayServiceError("STATE_WORKER_STATE_SCOPE_MISMATCH")
+            if (shared_scope is None and account_read_scope is None) or (
+                not account.shared_fact_strategy_refs and account_read_scope is None
+            ):
+                raise GatewayServiceError("STATE_WORKER_STATE_SCOPE_UNBOUND")
+        self._state_worker = state_worker
 
     def handle(
         self,
@@ -192,7 +236,11 @@ class GatewayReadService:
                 cursor=cursor,  # type: ignore[arg-type] -- validated above.
                 limit=limit,  # type: ignore[arg-type] -- validated above.
             )
-            return _batch_result(batch, include_snapshot_source=False)
+            return self._with_state_status(
+                _batch_result(batch, include_snapshot_source=False),
+                operation=operation,
+                strategy_scope=journal_strategy_scope,
+            )
 
         if operation == "account.snapshot":
             _reject_unknown_arguments(arguments, frozenset({"limit"}))
@@ -205,7 +253,11 @@ class GatewayReadService:
                 cursor=None,
                 limit=limit,  # type: ignore[arg-type] -- validated above.
             )
-            return _batch_result(batch, include_snapshot_source=True)
+            return self._with_state_status(
+                _batch_result(batch, include_snapshot_source=True),
+                operation=operation,
+                strategy_scope=journal_strategy_scope,
+            )
 
         _reject_unknown_arguments(arguments, frozenset())
         batch = self._journal.read_after(
@@ -215,7 +267,37 @@ class GatewayReadService:
             cursor=None,
             limit=1,
         )
-        return MappingProxyType({"latest_cursor": batch.latest_cursor})
+        result: dict[str, object] = {"latest_cursor": batch.latest_cursor}
+        if self._state_worker is not None:
+            return self._with_state_status(
+                MappingProxyType(result),
+                operation=operation,
+                strategy_scope=journal_strategy_scope,
+            )
+        return MappingProxyType(result)
+
+    def _with_state_status(
+        self,
+        result: Mapping[str, object],
+        *,
+        operation: str,
+        strategy_scope: str,
+    ) -> Mapping[str, object]:
+        if self._state_worker is None:
+            return result
+        copied = dict(result)
+        status = dict(self._state_worker.read_status())
+        if status["ready"] and not _state_result_matches_worker(
+            result,
+            operation=operation,
+            strategy_scope=strategy_scope,
+            worker=self._state_worker,
+            generation=status["session_generation"],
+        ):
+            status["ready"] = False
+            status["fresh_for_seconds"] = 0.0
+        copied["state_status"] = MappingProxyType(status)
+        return MappingProxyType(copied)
 
     def _resolve_scope(self, scope: WireScope) -> tuple[GatewayServiceAccountScope, str]:
         if (
@@ -238,7 +320,10 @@ class GatewayReadService:
             if journal_strategy_scope is None:
                 raise GatewayServiceError("ACCOUNT_WIDE_READ_NOT_CONFIGURED")
         else:
-            journal_strategy_scope = account.strategy_scope_map.get(scope.strategy_ref)
+            if scope.strategy_ref in account.shared_fact_strategy_refs:
+                journal_strategy_scope = account.shared_account_facts_scope
+            else:
+                journal_strategy_scope = account.strategy_scope_map.get(scope.strategy_ref)
             if journal_strategy_scope is None:
                 raise GatewayServiceError("STRATEGY_SCOPE_DENIED")
         return account, journal_strategy_scope
@@ -342,6 +427,53 @@ def _snapshot_result(
             "payload": snapshot.payload,
             "captured_at": snapshot.captured_at,
         }
+    )
+
+
+def _state_result_matches_worker(
+    result: Mapping[str, object],
+    *,
+    operation: str,
+    strategy_scope: str,
+    worker: GatewayAccountSessionWorker,
+    generation: object,
+) -> bool:
+    latest = worker.latest_snapshot
+    if (
+        strategy_scope != worker.state_scope
+        or latest is None
+        or latest.account_scope != worker.journal_account_scope
+        or latest.strategy_scope != worker.state_scope
+        or latest.cursor != result.get("latest_cursor")
+        or latest.payload.get("schema_id") != "sdk.account.state"
+        or latest.payload.get("schema_version") != 1
+        or latest.payload.get("session_generation") != generation
+    ):
+        return False
+    if operation == "account.head":
+        return True
+    if operation == "account.read_after":
+        events = result.get("events")
+        returned_snapshot = result.get("snapshot")
+        return not events and (
+            returned_snapshot is None
+            or _snapshot_result_matches(returned_snapshot, latest, generation)
+        )
+    return _snapshot_result_matches(result.get("snapshot"), latest, generation)
+
+
+def _snapshot_result_matches(
+    value: object, latest: GatewayAccountSnapshot, generation: object
+) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and value.get("account_scope") == latest.account_scope
+        and value.get("strategy_scope") == latest.strategy_scope
+        and value.get("snapshot_id") == latest.snapshot_id
+        and value.get("cursor") == latest.cursor
+        and isinstance(value.get("payload"), Mapping)
+        and value.get("payload") == latest.payload
+        and value["payload"].get("session_generation") == generation  # type: ignore[index]
     )
 
 

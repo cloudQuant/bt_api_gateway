@@ -1,0 +1,747 @@
+"""One owner-thread, read-only provider session that publishes full account state.
+
+The worker is deliberately not a provider SDK adapter. It accepts a trusted
+provider object with only connect, read_account, and close operations, and
+persists complete replacements through GatewayEventJournal's state-only
+stream. It never writes account commands or strategy-attributed positions.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import threading
+import time
+from collections.abc import Mapping
+from datetime import datetime
+from types import MappingProxyType
+from typing import Callable, Optional, Protocol
+
+from bt_api_base.account_protocol import (
+    AccountKey,
+    AccountObservation,
+    AccountResourceKey,
+)
+
+from .event_journal import (
+    GatewayAccountSnapshot,
+    GatewayEventJournal,
+    GatewayEventJournalError,
+)
+from .router import GatewayCommandKind, GatewayPrincipal
+from .session_guard import LocalAccountSessionGuard, LocalAccountSessionGuardError
+
+_STATE_SCHEMA_ID = "sdk.account.state"
+_STATE_SCHEMA_VERSION = 1
+_MAX_TRACKED_ROWS = 4096
+_STATE_METADATA_RESERVE_BYTES = 4096
+
+
+class GatewayAccountSessionWorkerError(RuntimeError):
+    """A finite, value-free account-session worker failure."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
+class GatewayAccountSessionProvider(Protocol):
+    """Trusted provider boundary exposing account reads and lifecycle only."""
+
+    def connect(self, *, account_key: AccountKey, generation: str, timeout: float) -> None:
+        """Open the selected account read session within the adapter timeout."""
+
+    def read_account(self, *, generation: str, timeout: float) -> AccountObservation:
+        """Return one complete, bounded observation for the exact account."""
+
+    def close(self) -> Optional[bool]:  # noqa: UP045 -- Python 3.9 support.
+        """Close idempotently; only None or literal True confirms success."""
+
+
+class GatewayAccountSessionWorker:
+    """Share one read-only provider session and publish replaceable account facts.
+
+    Construction is pure. The owning ServiceHost calls start after it has
+    registered the resource's retryable close callback. All lifecycle and
+    provider calls belong to the creating thread. Refresh is synchronous and
+    occurs only on explicit refresh or a later maintain call; client reads do
+    not trigger provider queries.
+    """
+
+    def __init__(
+        self,
+        provider: GatewayAccountSessionProvider,
+        journal: GatewayEventJournal,
+        *,
+        account_key: AccountKey,
+        journal_account_scope: str,
+        state_scope: str,
+        guard: LocalAccountSessionGuard,
+        required_coverage: tuple[AccountResourceKey, ...],
+        refresh_interval_seconds: float = 1.0,
+        max_staleness_seconds: float = 5.0,
+        request_timeout_seconds: float = 2.0,
+        clock: Callable[[], float] = time.time,
+        monotonic_clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if type(account_key) is not AccountKey:
+            raise GatewayAccountSessionWorkerError("INVALID_ACCOUNT_KEY")
+        if type(journal) is not GatewayEventJournal:
+            raise GatewayAccountSessionWorkerError("INVALID_JOURNAL")
+        if type(guard) is not LocalAccountSessionGuard:
+            raise GatewayAccountSessionWorkerError("INVALID_SESSION_GUARD")
+        if (
+            not callable(getattr(provider, "connect", None))
+            or not callable(getattr(provider, "read_account", None))
+            or not callable(getattr(provider, "close", None))
+        ):
+            raise GatewayAccountSessionWorkerError("INVALID_PROVIDER")
+        _require_scope_text(journal_account_scope, "INVALID_JOURNAL_SCOPE")
+        _require_scope_text(state_scope, "INVALID_STATE_SCOPE")
+        if type(required_coverage) is not tuple or not required_coverage:
+            raise GatewayAccountSessionWorkerError("INVALID_REQUIRED_COVERAGE")
+        if any(type(item) is not AccountResourceKey for item in required_coverage):
+            raise GatewayAccountSessionWorkerError("INVALID_REQUIRED_COVERAGE")
+        if len(set(required_coverage)) != len(required_coverage):
+            raise GatewayAccountSessionWorkerError("INVALID_REQUIRED_COVERAGE")
+        if not callable(clock) or not callable(monotonic_clock):
+            raise GatewayAccountSessionWorkerError("INVALID_CLOCK")
+        self._refresh_interval = _positive_seconds(refresh_interval_seconds)
+        self._max_staleness = _positive_seconds(max_staleness_seconds)
+        self._request_timeout = _positive_seconds(request_timeout_seconds)
+
+        self._owner_thread_id = threading.get_ident()
+        self._provider = provider
+        self._journal = journal
+        self._account_key = account_key
+        self._journal_account_scope = journal_account_scope
+        self._state_scope = state_scope
+        self._guard = guard
+        self._required_coverage = tuple(required_coverage)
+        self._clock = clock
+        self._monotonic_clock = monotonic_clock
+        principal_digest = hashlib.sha256(account_key.account_key_id.encode("ascii")).hexdigest()
+        self._journal_principal = GatewayPrincipal(
+            principal_id="gateway-account-session-" + principal_digest,
+            account_scopes=frozenset({journal_account_scope}),
+            strategy_scopes=frozenset({state_scope}),
+            allowed_kinds=frozenset({GatewayCommandKind.READ}),
+        )
+        if guard.account_key_digest != principal_digest:
+            raise GatewayAccountSessionWorkerError("SESSION_GUARD_ACCOUNT_MISMATCH")
+
+        self._state = "new"
+        self._generation: Optional[str] = None  # noqa: UP045 -- Python 3.9 support.
+        self._cursor = 0
+        self._latest_snapshot: Optional[GatewayAccountSnapshot] = None  # noqa: UP045
+        self._latest_observation: Optional[AccountObservation] = None  # noqa: UP045
+        self._last_observation_id: Optional[str] = None  # noqa: UP045
+        self._last_observation_digest: Optional[str] = None  # noqa: UP045
+        self._last_completed_at: Optional[datetime] = None  # noqa: UP045
+        self._last_row_times: dict[str, datetime] = {}
+        self._last_captured_at: Optional[float] = None  # noqa: UP045
+        self._wall_monotonic_anchor: Optional[tuple[float, float]] = None  # noqa: UP045
+        self._snapshot_counter = 0
+        self._last_success_monotonic: Optional[float] = None  # noqa: UP045
+        self._provider_expiry_monotonic: Optional[float] = None  # noqa: UP045
+        self._next_refresh_monotonic: Optional[float] = None  # noqa: UP045
+        self._freshness_invalidated = True
+        self._guard_attempted = False
+        self._guard_acquired = False
+        self._connect_attempted = False
+        self._provider_connect_active = False
+        self._provider_close_confirmed = False
+        self._guard.bind_consumer(self)
+
+    @property
+    def journal(self) -> GatewayEventJournal:
+        """Return the borrowed journal this worker publishes into."""
+
+        return self._journal
+
+    @property
+    def account_key(self) -> AccountKey:
+        return self._account_key
+
+    @property
+    def journal_account_scope(self) -> str:
+        return self._journal_account_scope
+
+    @property
+    def state_scope(self) -> str:
+        return self._state_scope
+
+    @property
+    def required_coverage(self) -> tuple[AccountResourceKey, ...]:
+        return self._required_coverage
+
+    @property
+    def state(self) -> str:
+        if self._state == "ready" and not self.ready:
+            return "stale"
+        return self._state
+
+    @property
+    def session_generation(self) -> Optional[str]:  # noqa: UP045 -- Python 3.9 support.
+        return self._generation
+
+    @property
+    def latest_snapshot(self) -> Optional[GatewayAccountSnapshot]:  # noqa: UP045
+        """Return the latest persisted state, including an older diagnostic generation."""
+
+        return self._latest_snapshot
+
+    @property
+    def ready(self) -> bool:
+        return bool(self.read_status()["ready"])
+
+    def read_status(self) -> Mapping[str, object]:
+        """Return provider-generation readiness and conservative freshness only."""
+
+        generation = self._generation
+        fresh_for = 0.0
+        if (
+            generation is not None
+            and self._guard_acquired
+            and not self._freshness_invalidated
+            and self._latest_snapshot is not None
+            and self._latest_observation is not None
+            and self._last_success_monotonic is not None
+        ):
+            try:
+                self._guard.assert_owned()
+                if (
+                    self._latest_snapshot.account_scope == self._journal_account_scope
+                    and self._latest_snapshot.strategy_scope == self._state_scope
+                    and self._latest_snapshot.cursor == self._cursor
+                    and self._latest_snapshot.payload.get("schema_id") == _STATE_SCHEMA_ID
+                    and self._latest_snapshot.payload.get("schema_version") == _STATE_SCHEMA_VERSION
+                    and _snapshot_generation(self._latest_snapshot) == generation
+                    and _canonical_json(
+                        _plain_json(self._latest_snapshot.payload.get("observation"))
+                    )
+                    == _canonical_json(self._latest_observation.to_dict())
+                ):
+                    fresh_for = self._freshness_seconds(
+                        self._latest_observation, self._last_success_monotonic
+                    )
+            except (LocalAccountSessionGuardError, GatewayAccountSessionWorkerError):
+                fresh_for = 0.0
+        is_ready = self._state == "ready" and fresh_for > 0.0
+        return MappingProxyType(
+            {
+                "session_generation": generation,
+                "ready": is_ready,
+                "fresh_for_seconds": max(0.0, float(fresh_for)),
+            }
+        )
+
+    def start(self) -> None:
+        """Acquire one local owner, connect once, and require a first full baseline."""
+
+        self._check_owner()
+        if self._state != "new":
+            raise GatewayAccountSessionWorkerError("WORKER_ALREADY_STARTED")
+        self._state = "starting"
+        generation: Optional[str] = None  # noqa: UP045 -- Python 3.9 support.
+        try:
+            self._guard_attempted = True
+            generation = self._guard.acquire()
+            if type(generation) is not str or not generation:
+                raise GatewayAccountSessionWorkerError("INVALID_SESSION_GENERATION")
+            self._generation = generation
+            self._guard_acquired = True
+            self._assert_current_generation_owned(generation)
+            self._load_existing_state()
+            self._connect_attempted = True
+            self._provider_connect_active = True
+            try:
+                result = self._provider.connect(
+                    account_key=self._account_key,
+                    generation=generation,
+                    timeout=self._request_timeout,
+                )
+            finally:
+                self._provider_connect_active = False
+            self._assert_current_generation_owned(generation)
+            if result is not None:
+                raise GatewayAccountSessionWorkerError("PROVIDER_CONNECT_RESULT_INVALID")
+            self._provider_close_confirmed = False
+            self._state = "connected"
+            self._refresh_impl()
+        except BaseException as exc:
+            if self._generation == generation and self._state not in {
+                "refresh_failed",
+                "failed",
+                "ownership_lost",
+            }:
+                self._state = "failed"
+            if isinstance(exc, GatewayAccountSessionWorkerError):
+                raise
+            code = "PROVIDER_CONNECT_FAILED" if self._connect_attempted else "START_FAILED"
+            if isinstance(exc, Exception):
+                raise GatewayAccountSessionWorkerError(code) from None
+            raise
+
+    def refresh(self) -> GatewayAccountSnapshot:
+        """Perform one shared full account read and atomically replace its state."""
+
+        self._check_owner()
+        if self._state not in {"connected", "ready", "refresh_failed"}:
+            raise GatewayAccountSessionWorkerError("SESSION_NOT_ACTIVE")
+        try:
+            self._guard.assert_owned()
+        except LocalAccountSessionGuardError:
+            self._freshness_invalidated = True
+            self._state = "ownership_lost"
+            raise GatewayAccountSessionWorkerError("SESSION_OWNERSHIP_LOST") from None
+        return self._refresh_impl()
+
+    def maintain(self) -> None:
+        """Refresh once when due; this is the sole periodic query path."""
+
+        self._check_owner()
+        if self._state not in {"connected", "ready", "refresh_failed"}:
+            return
+        now = self._monotonic_now()
+        due = self._next_refresh_monotonic
+        if due is None or now >= due:
+            self.refresh()
+
+    def recover(self) -> None:
+        """Explicitly close and release before connecting under a fresh generation."""
+
+        self._check_owner()
+        if self._state == "new":
+            self.start()
+            return
+        if self._provider_connect_active:
+            raise GatewayAccountSessionWorkerError("RECOVERY_DURING_CONNECT")
+        self.close()
+        self._reset_for_restart()
+        self.start()
+
+    def close(self) -> None:
+        """Retry provider close and guard release without dropping uncertain ownership."""
+
+        self._check_owner()
+        if self._state == "closed":
+            return
+        if self._provider_connect_active:
+            raise GatewayAccountSessionWorkerError("CLOSE_DURING_CONNECT")
+        self._state = "closing"
+        if self._connect_attempted and not self._provider_close_confirmed:
+            try:
+                result = self._provider.close()
+            except BaseException as exc:
+                self._state = "close_failed"
+                if isinstance(exc, Exception):
+                    raise GatewayAccountSessionWorkerError("PROVIDER_CLOSE_FAILED") from None
+                raise
+            if result is not None and result is not True:
+                self._state = "close_failed"
+                raise GatewayAccountSessionWorkerError("PROVIDER_CLOSE_UNCONFIRMED")
+            self._provider_close_confirmed = True
+        if self._guard_attempted:
+            try:
+                self._guard.release()
+            except BaseException as exc:
+                self._state = "close_failed"
+                if isinstance(exc, Exception):
+                    raise GatewayAccountSessionWorkerError("SESSION_GUARD_RELEASE_FAILED") from None
+                raise
+        self._guard_acquired = False
+        self._generation = None
+        self._freshness_invalidated = True
+        self._state = "closed"
+
+    def _refresh_impl(self) -> GatewayAccountSnapshot:
+        self._freshness_invalidated = True
+        self._state = "refreshing"
+        phase = "provider_read"
+        start_monotonic = self._monotonic_now()
+        generation = self._generation
+        try:
+            if generation is None or not self._connect_attempted:
+                raise GatewayAccountSessionWorkerError("SESSION_NOT_ACTIVE")
+            self._assert_current_generation_owned(generation)
+            observation = self._provider.read_account(
+                generation=generation,
+                timeout=self._request_timeout,
+            )
+            end_monotonic = self._monotonic_now()
+            self._assert_current_generation_owned(generation)
+            if end_monotonic < start_monotonic:
+                raise GatewayAccountSessionWorkerError("MONOTONIC_CLOCK_REGRESSED")
+            if end_monotonic - start_monotonic > self._request_timeout:
+                raise GatewayAccountSessionWorkerError("PROVIDER_RESPONSE_LATE")
+            phase = "observation_validation"
+            row_times, completed_at = self._validate_observation(observation)
+            serialized_observation = _canonical_json(observation.to_dict())
+            digest = hashlib.sha256(serialized_observation.encode("utf-8")).hexdigest()
+            if observation.observation_id == self._last_observation_id:
+                if digest != self._last_observation_digest:
+                    raise GatewayAccountSessionWorkerError("OBSERVATION_ID_REUSED")
+                if self._latest_snapshot is None:
+                    raise GatewayAccountSessionWorkerError("CURRENT_BASELINE_MISSING")
+                self._next_refresh_monotonic = end_monotonic + self._refresh_interval
+                self._freshness_invalidated = False
+                self._state = "ready"
+                return self._latest_snapshot
+
+            phase = "journal_replace"
+            self._snapshot_counter += 1
+            snapshot_id = f"{generation}:{self._snapshot_counter}"
+            payload = {
+                "schema_id": _STATE_SCHEMA_ID,
+                "schema_version": _STATE_SCHEMA_VERSION,
+                "session_generation": generation,
+                "observation": observation.to_dict(),
+            }
+            if len(_canonical_json(payload).encode("utf-8")) > (
+                self._journal.MAX_STATE_SNAPSHOT_BYTES - _STATE_METADATA_RESERVE_BYTES
+            ):
+                self._snapshot_counter -= 1
+                raise GatewayAccountSessionWorkerError("STATE_SNAPSHOT_TOO_LARGE")
+            captured_at = self._wall_clock()
+            if self._last_captured_at is not None and captured_at < self._last_captured_at:
+                raise GatewayAccountSessionWorkerError("WALL_CLOCK_REGRESSED")
+            self._assert_current_generation_owned(generation)
+            accepted_monotonic = self._monotonic_now()
+            if accepted_monotonic < end_monotonic:
+                raise GatewayAccountSessionWorkerError("MONOTONIC_CLOCK_REGRESSED")
+            if self._wall_monotonic_anchor is not None:
+                anchor_wall, anchor_monotonic = self._wall_monotonic_anchor
+                if accepted_monotonic < anchor_monotonic:
+                    raise GatewayAccountSessionWorkerError("MONOTONIC_CLOCK_REGRESSED")
+                expected_wall = anchor_wall + (accepted_monotonic - anchor_monotonic)
+                if captured_at < expected_wall:
+                    raise GatewayAccountSessionWorkerError("WALL_CLOCK_REGRESSED")
+            oldest_provider_time = min(
+                timestamp.timestamp() for timestamp in _observation_times(observation)
+            )
+            provider_age = max(0.0, captured_at - oldest_provider_time)
+            provider_remaining = max(0.0, self._max_staleness - provider_age)
+            snapshot = self._journal.replace_state_snapshot(
+                self._journal_account_scope,
+                self._state_scope,
+                snapshot_id,
+                payload,
+                expected_cursor=self._cursor,
+                captured_at=captured_at,
+            )
+            self._cursor = snapshot.cursor
+            self._latest_snapshot = snapshot
+            self._latest_observation = observation
+            self._last_observation_id = observation.observation_id
+            self._last_observation_digest = digest
+            self._last_completed_at = completed_at
+            self._last_row_times = row_times
+            self._last_captured_at = captured_at
+            self._wall_monotonic_anchor = (captured_at, accepted_monotonic)
+            self._last_success_monotonic = accepted_monotonic
+            self._provider_expiry_monotonic = accepted_monotonic + provider_remaining
+            self._next_refresh_monotonic = self._last_success_monotonic + self._refresh_interval
+            self._freshness_invalidated = False
+            self._state = "ready"
+            return snapshot
+        except GatewayAccountSessionWorkerError as exc:
+            if exc.code == "SESSION_OWNERSHIP_LOST":
+                raise
+            if not (
+                exc.code == "PROVIDER_RESULT_GENERATION_STALE" and self._generation != generation
+            ):
+                self._record_refresh_failure()
+            raise
+        except GatewayEventJournalError:
+            self._record_refresh_failure()
+            raise GatewayAccountSessionWorkerError("STATE_WRITE_FAILED") from None
+        except BaseException as exc:
+            self._record_refresh_failure()
+            if isinstance(exc, Exception):
+                code = "PROVIDER_READ_FAILED" if phase == "provider_read" else "OBSERVATION_INVALID"
+                if phase == "journal_replace":
+                    code = "STATE_WRITE_FAILED"
+                raise GatewayAccountSessionWorkerError(code) from None
+            raise
+
+    def _load_existing_state(self) -> None:
+        batch = self._journal.read_after(
+            self._journal_principal,
+            self._journal_account_scope,
+            self._state_scope,
+            cursor=None,
+            limit=GatewayEventJournal.MAX_BATCH_SIZE,
+        )
+        if batch.events:
+            raise GatewayAccountSessionWorkerError("STATE_STREAM_HAS_EVENTS")
+        snapshot = batch.snapshot
+        if snapshot is not None and (
+            snapshot.payload.get("schema_id") != _STATE_SCHEMA_ID
+            or snapshot.payload.get("schema_version") != _STATE_SCHEMA_VERSION
+        ):
+            raise GatewayAccountSessionWorkerError("STATE_STREAM_SCHEMA_MISMATCH")
+        persisted_observation: Optional[AccountObservation] = None  # noqa: UP045
+        if snapshot is not None:
+            payload = _plain_json(snapshot.payload)
+            expected_fields = {
+                "schema_id",
+                "schema_version",
+                "session_generation",
+                "observation",
+            }
+            if (
+                type(payload) is not dict
+                or set(payload) != expected_fields
+                or type(payload.get("session_generation")) is not str
+                or not payload["session_generation"]
+            ):
+                raise GatewayAccountSessionWorkerError("STATE_STREAM_PAYLOAD_INVALID")
+            try:
+                persisted_observation = AccountObservation.from_dict(payload["observation"])
+            except (KeyError, TypeError, ValueError):
+                raise GatewayAccountSessionWorkerError("STATE_STREAM_OBSERVATION_INVALID") from None
+            if persisted_observation.account_key != self._account_key:
+                raise GatewayAccountSessionWorkerError("STATE_STREAM_ACCOUNT_MISMATCH")
+            if len(persisted_observation.coverage) != len(self._required_coverage) or set(
+                persisted_observation.coverage
+            ) != set(self._required_coverage):
+                raise GatewayAccountSessionWorkerError("STATE_STREAM_COVERAGE_MISMATCH")
+            if (
+                not persisted_observation.balances_complete
+                or not persisted_observation.positions_complete
+            ):
+                raise GatewayAccountSessionWorkerError("STATE_STREAM_OBSERVATION_INCOMPLETE")
+        self._cursor = batch.latest_cursor
+        self._latest_snapshot = snapshot
+        if persisted_observation is not None and snapshot is not None:
+            # The persisted state remains diagnostic after restart. Its provider
+            # timestamps only prevent a later generation from replacing known
+            # facts with chronologically older data; they never make this worker
+            # ready or count as a current-generation observation.
+            self._last_completed_at = _parse_utc(persisted_observation.completed_at_utc)
+            self._last_row_times = _row_times(persisted_observation)
+            self._last_captured_at = snapshot.captured_at
+            current_wall = self._wall_clock()
+            if current_wall < snapshot.captured_at:
+                raise GatewayAccountSessionWorkerError("WALL_CLOCK_REGRESSED")
+            self._wall_monotonic_anchor = (current_wall, self._monotonic_now())
+
+    def _validate_observation(self, observation: object) -> tuple[dict[str, datetime], datetime]:
+        if type(observation) is not AccountObservation:
+            raise GatewayAccountSessionWorkerError("OBSERVATION_TYPE_INVALID")
+        if observation.account_key != self._account_key:
+            raise GatewayAccountSessionWorkerError("OBSERVATION_ACCOUNT_MISMATCH")
+        if len(observation.coverage) != len(self._required_coverage) or set(
+            observation.coverage
+        ) != set(self._required_coverage):
+            raise GatewayAccountSessionWorkerError("OBSERVATION_COVERAGE_MISMATCH")
+        if not observation.balances_complete or not observation.positions_complete:
+            raise GatewayAccountSessionWorkerError("OBSERVATION_INCOMPLETE")
+
+        now = self._wall_clock()
+        completed_at = _parse_utc(observation.completed_at_utc)
+        if self._last_completed_at is not None and completed_at < self._last_completed_at:
+            raise GatewayAccountSessionWorkerError("OBSERVATION_COMPLETION_TIME_REGRESSED")
+        provider_times = _observation_times(observation)
+        if any(timestamp.timestamp() > now + self._request_timeout for timestamp in provider_times):
+            raise GatewayAccountSessionWorkerError("OBSERVATION_FROM_FUTURE")
+        if any(now - timestamp.timestamp() > self._max_staleness for timestamp in provider_times):
+            raise GatewayAccountSessionWorkerError("OBSERVATION_STALE")
+        row_times = _row_times(observation)
+        combined = dict(self._last_row_times)
+        for key, timestamp in row_times.items():
+            previous = combined.get(key)
+            if previous is not None and timestamp < previous:
+                raise GatewayAccountSessionWorkerError("ROW_OBSERVATION_TIME_REGRESSED")
+            combined[key] = timestamp
+        if len(combined) > _MAX_TRACKED_ROWS:
+            raise GatewayAccountSessionWorkerError("ROW_TIME_TRACKING_LIMIT")
+        return combined, completed_at
+
+    def _freshness_seconds(
+        self, observation: AccountObservation, last_success_monotonic: float
+    ) -> float:
+        now_wall = self._wall_clock()
+        now_mono = self._monotonic_now()
+        expiry = self._provider_expiry_monotonic
+        if now_mono < last_success_monotonic or expiry is None:
+            return 0.0
+        oldest_provider_time = min(
+            timestamp.timestamp() for timestamp in _observation_times(observation)
+        )
+        provider_wall_remaining = self._max_staleness - max(0.0, now_wall - oldest_provider_time)
+        provider_monotonic_remaining = expiry - now_mono
+        local_remaining = self._max_staleness - (now_mono - last_success_monotonic)
+        return max(
+            0.0,
+            min(
+                self._max_staleness,
+                provider_wall_remaining,
+                provider_monotonic_remaining,
+                local_remaining,
+            ),
+        )
+
+    def _record_refresh_failure(self) -> None:
+        self._freshness_invalidated = True
+        self._state = "refresh_failed"
+        try:
+            self._next_refresh_monotonic = self._monotonic_now() + self._refresh_interval
+        except GatewayAccountSessionWorkerError:
+            self._next_refresh_monotonic = None
+
+    def _assert_current_generation_owned(self, generation: str) -> None:
+        try:
+            self._guard.assert_owned()
+        except LocalAccountSessionGuardError:
+            self._freshness_invalidated = True
+            self._state = "ownership_lost"
+            raise GatewayAccountSessionWorkerError("SESSION_OWNERSHIP_LOST") from None
+        if self._generation != generation:
+            raise GatewayAccountSessionWorkerError("PROVIDER_RESULT_GENERATION_STALE")
+
+    def _reset_for_restart(self) -> None:
+        self._state = "new"
+        self._generation = None
+        self._cursor = 0
+        self._latest_observation = None
+        self._last_observation_id = None
+        self._last_observation_digest = None
+        self._last_completed_at = None
+        self._last_row_times.clear()
+        self._last_captured_at = None
+        self._wall_monotonic_anchor = None
+        self._snapshot_counter = 0
+        self._last_success_monotonic = None
+        self._provider_expiry_monotonic = None
+        self._next_refresh_monotonic = None
+        self._freshness_invalidated = True
+        self._guard_attempted = False
+        self._guard_acquired = False
+        self._connect_attempted = False
+        self._provider_connect_active = False
+        self._provider_close_confirmed = False
+
+    def _wall_clock(self) -> float:
+        return _clock_value(self._clock)
+
+    def _monotonic_now(self) -> float:
+        return _clock_value(self._monotonic_clock)
+
+    def _check_owner(self) -> None:
+        if threading.get_ident() != self._owner_thread_id:
+            raise GatewayAccountSessionWorkerError("WORKER_WRONG_THREAD")
+
+
+def _observation_times(observation: AccountObservation) -> tuple[datetime, ...]:
+    values = [
+        observation.completed_at_utc,
+        *(row.observed_at_utc for row in observation.balances),
+        *(row.observed_at_utc for row in observation.positions),
+    ]
+    if observation.valuation is not None:
+        values.append(observation.valuation.observed_at_utc)
+    return tuple(_parse_utc(value) for value in values)
+
+
+def _row_times(observation: AccountObservation) -> dict[str, datetime]:
+    rows: dict[str, datetime] = {}
+    for balance in observation.balances:
+        identity = {
+            "kind": "balance",
+            "resource": balance.resource.to_dict(),
+            "currency": balance.currency,
+        }
+        rows[_canonical_json(identity)] = _parse_utc(balance.observed_at_utc)
+    for position in observation.positions:
+        identity = {
+            "kind": "position",
+            "resource": position.resource.to_dict(),
+            "instrument": position.instrument.to_dict(),
+            "side": position.side,
+        }
+        rows[_canonical_json(identity)] = _parse_utc(position.observed_at_utc)
+    if observation.valuation is not None:
+        rows["valuation"] = _parse_utc(observation.valuation.observed_at_utc)
+    return rows
+
+
+def _snapshot_generation(snapshot: GatewayAccountSnapshot) -> Optional[str]:  # noqa: UP045
+    generation = snapshot.payload.get("session_generation")
+    return generation if type(generation) is str else None
+
+
+def _parse_utc(value: str) -> datetime:
+    try:
+        return datetime.fromisoformat(value[:-1] + "+00:00")
+    except (TypeError, ValueError, IndexError) as exc:
+        raise GatewayAccountSessionWorkerError("OBSERVATION_TIME_INVALID") from exc
+
+
+def _canonical_json(value: object) -> str:
+    try:
+        return json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise GatewayAccountSessionWorkerError("OBSERVATION_SERIALIZATION_INVALID") from exc
+
+
+def _plain_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _plain_json(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_plain_json(item) for item in value]
+    return value
+
+
+def _require_scope_text(value: object, code: str) -> None:
+    if type(value) is not str or not value or value != value.strip():
+        raise GatewayAccountSessionWorkerError(code)
+    try:
+        encoded = value.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise GatewayAccountSessionWorkerError(code) from exc
+    if len(encoded) > 128 or any(ord(char) < 32 or 0x7F <= ord(char) <= 0x9F for char in value):
+        raise GatewayAccountSessionWorkerError(code)
+
+
+def _positive_seconds(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise GatewayAccountSessionWorkerError("INVALID_TIME_LIMIT")
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise GatewayAccountSessionWorkerError("INVALID_TIME_LIMIT") from exc
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise GatewayAccountSessionWorkerError("INVALID_TIME_LIMIT")
+    return seconds
+
+
+def _clock_value(clock: Callable[[], float]) -> float:
+    try:
+        value = clock()
+    except Exception as exc:
+        raise GatewayAccountSessionWorkerError("CLOCK_INVALID") from exc
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise GatewayAccountSessionWorkerError("CLOCK_INVALID")
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise GatewayAccountSessionWorkerError("CLOCK_INVALID") from exc
+    if not math.isfinite(result):
+        raise GatewayAccountSessionWorkerError("CLOCK_INVALID")
+    return result
+
+
+__all__ = [
+    "GatewayAccountSessionProvider",
+    "GatewayAccountSessionWorker",
+    "GatewayAccountSessionWorkerError",
+]
