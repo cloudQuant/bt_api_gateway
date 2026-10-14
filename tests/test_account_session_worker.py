@@ -218,6 +218,7 @@ def _worker(
     max_staleness_seconds: float = 5.0,
     request_timeout_seconds: float = 2.0,
     guard: Optional[LocalAccountSessionGuard] = None,  # noqa: UP045
+    clock_resolution_seconds: Optional[tuple[float, float]] = None,  # noqa: UP045
 ) -> tuple[GatewayAccountSessionWorker, GatewayEventJournal]:
     identity = account_key or _identity()
     journal = GatewayEventJournal(tmp_path / "gateway.db", clock=clocks.utc)
@@ -240,6 +241,7 @@ def _worker(
         request_timeout_seconds=request_timeout_seconds,
         clock=clocks.utc,
         monotonic_clock=clocks.mono,
+        clock_resolution_seconds=clock_resolution_seconds,
     )
     return worker, journal
 
@@ -585,6 +587,113 @@ def test_new_observation_cannot_rejuvenate_old_provider_times_after_utc_rollback
     worker.close()
 
 
+def test_reported_clock_quantization_is_tolerated_without_renewing_old_facts(tmp_path) -> None:
+    clocks = Clocks()
+    sample = _observation(clocks, observation_id="quantized-clock-base")
+    provider = FakeProvider([sample, replace(sample, observation_id="quantized-clock-new-id")])
+    worker, _ = _worker(
+        tmp_path,
+        provider,
+        clocks,
+        clock_resolution_seconds=(0.015625, 0.015625),
+    )
+
+    try:
+        worker.start()
+        # The wall clock advances by one tick while monotonic advances by
+        # several. This is inside the two-clock endpoint quantization bound.
+        clocks.wall += 0.015625
+        clocks.monotonic += 0.05
+        worker.refresh()
+
+        status = worker.read_status()
+        assert status["ready"] is True
+        assert status["fresh_for_seconds"] == pytest.approx(4.95)
+
+        # A new observation id with the same provider timestamps cannot use
+        # the tolerated wall/monotonic difference to extend its deadline.
+        clocks.monotonic += 4.96
+        status = worker.read_status()
+        assert status["ready"] is False
+        assert status["fresh_for_seconds"] == 0.0
+        assert worker.latest_snapshot is not None
+        assert worker.latest_snapshot.cursor == 2
+    finally:
+        worker.close()
+
+
+def test_wall_clock_regression_beyond_reported_quantization_is_rejected(tmp_path) -> None:
+    clocks = Clocks()
+    sample = _observation(clocks, observation_id="regression-budget-base")
+    provider = FakeProvider([sample, replace(sample, observation_id="regression-budget-new-id")])
+    worker, _ = _worker(
+        tmp_path,
+        provider,
+        clocks,
+        clock_resolution_seconds=(0.015625, 0.015625),
+    )
+
+    try:
+        worker.start()
+        clocks.wall += 0.015625
+        clocks.monotonic += 0.10
+        with pytest.raises(GatewayAccountSessionWorkerError) as raised:
+            worker.refresh()
+
+        assert raised.value.code == "WALL_CLOCK_REGRESSED"
+        assert worker.latest_snapshot is not None
+        assert worker.latest_snapshot.cursor == 1
+        assert worker.ready is False
+    finally:
+        worker.close()
+
+
+def test_default_clocks_support_fast_continuous_refreshes(tmp_path) -> None:
+    def current_observation(observation_id: str) -> AccountObservation:
+        now = datetime.now(timezone.utc)
+        timestamp = now.isoformat(timespec="microseconds").replace("+00:00", "Z")
+        clocks = Clocks(wall=now.timestamp())
+        return _observation(
+            clocks,
+            observation_id=observation_id,
+            row_timestamp=timestamp,
+            started_at_utc=timestamp,
+            completed_at_utc=timestamp,
+        )
+
+    provider = FakeProvider([current_observation("default-clock-0")])
+    provider.read_hook = lambda: provider.observations.append(
+        current_observation(f"default-clock-{provider.read_calls}")
+    )
+    account_key = _identity()
+    journal = GatewayEventJournal(tmp_path / "default-clock.db")
+    guard_directory = tmp_path / "default-clock-guards"
+    guard_directory.mkdir()
+    guard = LocalAccountSessionGuard(guard_directory, account_key.account_key_id, "default-clock")
+    worker = GatewayAccountSessionWorker(
+        provider,
+        journal,
+        account_key=account_key,
+        journal_account_scope="account:default-clock",
+        state_scope="strategy:default-clock-facts",
+        guard=guard,
+        required_coverage=(_resource(),),
+        max_staleness_seconds=30.0,
+    )
+
+    try:
+        worker.start()
+        for _ in range(24):
+            worker.refresh()
+            assert worker.ready is True
+        assert worker.latest_snapshot is not None
+        assert worker.latest_snapshot.cursor == 25
+        assert provider.read_calls == 25
+    finally:
+        worker.close()
+    assert provider.close_calls == 1
+
+
 def test_reused_latest_observation_id_with_changed_content_is_rejected(tmp_path) -> None:
     clocks = Clocks()
     sample = _observation(clocks, observation_id="obs-reused")
@@ -706,6 +815,70 @@ def test_restart_uses_new_generation_and_old_persisted_state_is_not_ready(tmp_pa
         ).latest_cursor
         == 1
     )
+
+
+def test_restart_wall_to_monotonic_sampling_delay_does_not_rejuvenate_old_state(tmp_path) -> None:
+    clocks = Clocks()
+    old_observation = _observation(clocks, observation_id="restart-delayed-clock-sample")
+    first_provider = FakeProvider([old_observation])
+    first, journal = _worker(tmp_path, first_provider, clocks)
+    try:
+        first.start()
+        old_snapshot = first.latest_snapshot
+        assert old_snapshot is not None
+        old_generation = first.session_generation
+    finally:
+        first.close()
+
+    # The wall clock has advanced close to the stale limit. During restart,
+    # simulate a scheduler pause after reading wall time but before taking the
+    # trailing monotonic sample, then leave wall time stopped at that reading.
+    clocks.advance(4.2)
+    delay_after_wall_read = [1.0]
+
+    def delayed_wall_clock() -> float:
+        wall = clocks.utc()
+        if delay_after_wall_read[0]:
+            clocks.monotonic += delay_after_wall_read[0]
+            delay_after_wall_read[0] = 0.0
+        return wall
+
+    second_provider = FakeProvider([old_observation])
+    guard_directory = tmp_path / "session-guards"
+    second_guard = LocalAccountSessionGuard(
+        guard_directory, _identity().account_key_id, "worker-restart-delayed-sample"
+    )
+    second = GatewayAccountSessionWorker(
+        second_provider,
+        journal,
+        account_key=_identity(),
+        journal_account_scope="account:shared",
+        state_scope="strategy:account-facts",
+        guard=second_guard,
+        required_coverage=(_resource(),),
+        max_staleness_seconds=5.0,
+        clock=delayed_wall_clock,
+        monotonic_clock=clocks.mono,
+    )
+    wall_after_restart_sample = clocks.wall
+
+    try:
+        with pytest.raises(GatewayAccountSessionWorkerError) as raised:
+            second.start()
+
+        assert raised.value.code == "OBSERVATION_STALE"
+        assert delay_after_wall_read == [0.0]
+        assert clocks.wall == wall_after_restart_sample
+        assert second.session_generation != old_generation
+        assert second.latest_snapshot == old_snapshot
+        assert second.read_status() == {
+            "session_generation": second.session_generation,
+            "ready": False,
+            "fresh_for_seconds": 0.0,
+        }
+    finally:
+        second.close()
+    assert second_provider.close_calls == 1
 
 
 def test_restart_rejects_older_complete_empty_snapshot_against_persisted_floor(tmp_path) -> None:

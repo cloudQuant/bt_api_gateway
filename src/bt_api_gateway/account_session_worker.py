@@ -68,7 +68,9 @@ class GatewayAccountSessionWorker:
     registered the resource's retryable close callback. All lifecycle and
     provider calls belong to the creating thread. Refresh is synchronous and
     occurs only on explicit refresh or a later maintain call; client reads do
-    not trigger provider queries.
+    not trigger provider queries. ``clock_resolution_seconds`` may specify
+    ``(wall, monotonic)`` resolutions for injected clocks; omitted injected
+    clocks use a zero comparison allowance.
     """
 
     def __init__(
@@ -87,6 +89,7 @@ class GatewayAccountSessionWorker:
         request_timeout_seconds: float = 2.0,
         clock: Callable[[], float] = time.time,
         monotonic_clock: Callable[[], float] = time.monotonic,
+        clock_resolution_seconds: Optional[tuple[float, float]] = None,  # noqa: UP045
     ) -> None:
         if type(account_key) is not AccountKey:
             raise GatewayAccountSessionWorkerError("INVALID_ACCOUNT_KEY")
@@ -112,6 +115,9 @@ class GatewayAccountSessionWorker:
             raise GatewayAccountSessionWorkerError("INVALID_OPEN_ORDERS_REQUIREMENT")
         if not callable(clock) or not callable(monotonic_clock):
             raise GatewayAccountSessionWorkerError("INVALID_CLOCK")
+        wall_resolution, monotonic_resolution = _clock_resolutions(
+            clock, monotonic_clock, clock_resolution_seconds
+        )
         self._refresh_interval = _positive_seconds(refresh_interval_seconds)
         self._max_staleness = _positive_seconds(max_staleness_seconds)
         self._request_timeout = _positive_seconds(request_timeout_seconds)
@@ -127,6 +133,10 @@ class GatewayAccountSessionWorker:
         self._require_open_orders = require_open_orders
         self._clock = clock
         self._monotonic_clock = monotonic_clock
+        # A delta uses two readings from each clock. Allow only their combined,
+        # reported quantization error when comparing wall time with monotonic
+        # elapsed time; this budget never extends provider freshness.
+        self._wall_clock_regression_budget = 2.0 * (wall_resolution + monotonic_resolution)
         principal_digest = hashlib.sha256(account_key.account_key_id.encode("ascii")).hexdigest()
         self._journal_principal = GatewayPrincipal(
             principal_id="gateway-account-session-" + principal_digest,
@@ -383,8 +393,11 @@ class GatewayAccountSessionWorker:
                 raise GatewayAccountSessionWorkerError("MONOTONIC_CLOCK_REGRESSED")
             if end_monotonic - start_monotonic > self._request_timeout:
                 raise GatewayAccountSessionWorkerError("PROVIDER_RESPONSE_LATE")
+            captured_at, wall_after, logical_wall, projected_floor = self._capture_wall_sample()
+            if wall_after < end_monotonic:
+                raise GatewayAccountSessionWorkerError("MONOTONIC_CLOCK_REGRESSED")
             phase = "observation_validation"
-            row_times, completed_at = self._validate_observation(observation)
+            row_times, completed_at = self._validate_observation(observation, now=logical_wall)
             serialized_observation = _canonical_json(observation.to_dict())
             digest = hashlib.sha256(serialized_observation.encode("utf-8")).hexdigest()
             if observation.observation_id == self._last_observation_id:
@@ -411,25 +424,21 @@ class GatewayAccountSessionWorker:
             ):
                 self._snapshot_counter -= 1
                 raise GatewayAccountSessionWorkerError("STATE_SNAPSHOT_TOO_LARGE")
-            captured_at = self._wall_clock()
             if self._last_captured_at is not None and captured_at < self._last_captured_at:
                 raise GatewayAccountSessionWorkerError("WALL_CLOCK_REGRESSED")
-            self._assert_current_generation_owned(generation)
-            accepted_monotonic = self._monotonic_now()
-            if accepted_monotonic < end_monotonic:
-                raise GatewayAccountSessionWorkerError("MONOTONIC_CLOCK_REGRESSED")
-            if self._wall_monotonic_anchor is not None:
-                anchor_wall, anchor_monotonic = self._wall_monotonic_anchor
-                if accepted_monotonic < anchor_monotonic:
-                    raise GatewayAccountSessionWorkerError("MONOTONIC_CLOCK_REGRESSED")
-                expected_wall = anchor_wall + (accepted_monotonic - anchor_monotonic)
-                if captured_at < expected_wall:
+            if projected_floor is not None:
+                floating_rounding = 2.0 * max(math.ulp(captured_at), math.ulp(projected_floor))
+                if (
+                    captured_at + self._wall_clock_regression_budget + floating_rounding
+                    < projected_floor
+                ):
                     raise GatewayAccountSessionWorkerError("WALL_CLOCK_REGRESSED")
             oldest_provider_time = min(
                 timestamp.timestamp() for timestamp in _observation_times(observation)
             )
-            provider_age = max(0.0, captured_at - oldest_provider_time)
+            provider_age = max(0.0, logical_wall - oldest_provider_time)
             provider_remaining = max(0.0, self._max_staleness - provider_age)
+            self._assert_current_generation_owned(generation)
             snapshot = self._journal.replace_state_snapshot(
                 self._journal_account_scope,
                 self._state_scope,
@@ -446,9 +455,9 @@ class GatewayAccountSessionWorker:
             self._last_completed_at = completed_at
             self._last_row_times = row_times
             self._last_captured_at = captured_at
-            self._wall_monotonic_anchor = (captured_at, accepted_monotonic)
-            self._last_success_monotonic = accepted_monotonic
-            self._provider_expiry_monotonic = accepted_monotonic + provider_remaining
+            self._wall_monotonic_anchor = (logical_wall, wall_after)
+            self._last_success_monotonic = wall_after
+            self._provider_expiry_monotonic = wall_after + provider_remaining
             self._next_refresh_monotonic = self._last_success_monotonic + self._refresh_interval
             self._freshness_invalidated = False
             self._state = "ready"
@@ -535,12 +544,14 @@ class GatewayAccountSessionWorker:
             self._last_completed_at = _parse_utc(persisted_observation.completed_at_utc)
             self._last_row_times = _row_times(persisted_observation)
             self._last_captured_at = snapshot.captured_at
-            current_wall = self._wall_clock()
+            current_wall, sample_after, logical_wall, _ = self._capture_wall_sample()
             if current_wall < snapshot.captured_at:
                 raise GatewayAccountSessionWorkerError("WALL_CLOCK_REGRESSED")
-            self._wall_monotonic_anchor = (current_wall, self._monotonic_now())
+            self._wall_monotonic_anchor = (logical_wall, sample_after)
 
-    def _validate_observation(self, observation: object) -> tuple[dict[str, datetime], datetime]:
+    def _validate_observation(
+        self, observation: object, *, now: float
+    ) -> tuple[dict[str, datetime], datetime]:
         if type(observation) is not AccountObservation:
             raise GatewayAccountSessionWorkerError("OBSERVATION_TYPE_INVALID")
         if observation.account_key != self._account_key:
@@ -556,7 +567,6 @@ class GatewayAccountSessionWorker:
         ):
             raise GatewayAccountSessionWorkerError("OBSERVATION_OPEN_ORDERS_INCOMPLETE")
 
-        now = self._wall_clock()
         completed_at = _parse_utc(observation.completed_at_utc)
         if self._last_completed_at is not None and completed_at < self._last_completed_at:
             raise GatewayAccountSessionWorkerError("OBSERVATION_COMPLETION_TIME_REGRESSED")
@@ -579,11 +589,22 @@ class GatewayAccountSessionWorker:
     def _freshness_seconds(
         self, observation: AccountObservation, last_success_monotonic: float
     ) -> float:
+        wall_before = self._monotonic_now()
         now_wall = self._wall_clock()
         now_mono = self._monotonic_now()
         expiry = self._provider_expiry_monotonic
-        if now_mono < last_success_monotonic or expiry is None:
+        if now_mono < wall_before or now_mono < last_success_monotonic or expiry is None:
             return 0.0
+        # Place the wall reading at the end of its monotonic bracket, then keep
+        # the provider-age clock at least as far forward as the last accepted
+        # monotonic projection. A wall-clock rollback can therefore shorten
+        # freshness but can never renew it.
+        now_wall += now_mono - wall_before
+        if self._wall_monotonic_anchor is not None:
+            anchor_wall, anchor_monotonic = self._wall_monotonic_anchor
+            if now_mono < anchor_monotonic:
+                return 0.0
+            now_wall = max(now_wall, anchor_wall + (now_mono - anchor_monotonic))
         oldest_provider_time = min(
             timestamp.timestamp() for timestamp in _observation_times(observation)
         )
@@ -642,6 +663,31 @@ class GatewayAccountSessionWorker:
 
     def _wall_clock(self) -> float:
         return _clock_value(self._clock)
+
+    def _capture_wall_sample(
+        self,
+    ) -> tuple[float, float, float, Optional[float]]:  # noqa: UP045
+        monotonic_before = self._monotonic_now()
+        captured_at = self._wall_clock()
+        monotonic_after = self._monotonic_now()
+        if monotonic_after < monotonic_before:
+            raise GatewayAccountSessionWorkerError("MONOTONIC_CLOCK_REGRESSED")
+
+        anchor = self._wall_monotonic_anchor
+        if anchor is None:
+            logical_wall = captured_at + (monotonic_after - monotonic_before)
+            return captured_at, monotonic_after, logical_wall, None
+
+        anchor_wall, anchor_monotonic = anchor
+        if monotonic_before < anchor_monotonic:
+            raise GatewayAccountSessionWorkerError("MONOTONIC_CLOCK_REGRESSED")
+        projected_floor = anchor_wall + (monotonic_before - anchor_monotonic)
+        projected_after = anchor_wall + (monotonic_after - anchor_monotonic)
+        # The wall sample may have occurred anywhere inside its monotonic
+        # bracket. Advancing it by the full span errs toward older provider
+        # data; max() also prevents the logical floor from ever moving back.
+        logical_wall = max(captured_at + (monotonic_after - monotonic_before), projected_after)
+        return captured_at, monotonic_after, logical_wall, projected_floor
 
     def _monotonic_now(self) -> float:
         return _clock_value(self._monotonic_clock)
@@ -757,6 +803,39 @@ def _positive_seconds(value: object) -> float:
     if not math.isfinite(seconds) or seconds <= 0:
         raise GatewayAccountSessionWorkerError("INVALID_TIME_LIMIT")
     return seconds
+
+
+def _clock_resolutions(
+    clock: Callable[[], float],
+    monotonic_clock: Callable[[], float],
+    configured: Optional[tuple[float, float]],  # noqa: UP045
+) -> tuple[float, float]:
+    if configured is None:
+        try:
+            configured = (
+                time.get_clock_info("time").resolution if clock is time.time else 0.0,
+                time.get_clock_info("monotonic").resolution
+                if monotonic_clock is time.monotonic
+                else 0.0,
+            )
+        except (AttributeError, OSError, ValueError) as exc:
+            raise GatewayAccountSessionWorkerError("INVALID_CLOCK_RESOLUTION") from exc
+    if type(configured) is not tuple or len(configured) != 2:
+        raise GatewayAccountSessionWorkerError("INVALID_CLOCK_RESOLUTION")
+    values: list[float] = []
+    for value in configured:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise GatewayAccountSessionWorkerError("INVALID_CLOCK_RESOLUTION")
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise GatewayAccountSessionWorkerError("INVALID_CLOCK_RESOLUTION") from exc
+        if not math.isfinite(seconds) or seconds < 0.0:
+            raise GatewayAccountSessionWorkerError("INVALID_CLOCK_RESOLUTION")
+        values.append(seconds)
+    if not math.isfinite(2.0 * (values[0] + values[1])):
+        raise GatewayAccountSessionWorkerError("INVALID_CLOCK_RESOLUTION")
+    return values[0], values[1]
 
 
 def _clock_value(clock: Callable[[], float]) -> float:
