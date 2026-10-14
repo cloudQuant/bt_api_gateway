@@ -16,7 +16,7 @@ import time
 import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
@@ -510,6 +510,9 @@ class GatewayEventJournal:
         cursor: Optional[int] = None,  # noqa: UP045 -- Python 3.9 is supported.
         limit: int = 100,
         stream_epoch: Optional[str] = None,  # noqa: UP045 -- Python 3.9 is supported.
+        page_fits: Optional[  # noqa: UP045 -- Python 3.9 is supported.
+            Callable[[GatewayReadBatch, GatewayConsumerProgress], bool]
+        ] = None,
     ) -> tuple[GatewayReadBatch, GatewayConsumerProgress]:
         """Offer a read range and persist its cursor with the same SQLite commit.
 
@@ -517,10 +520,17 @@ class GatewayEventJournal:
         does not assert that a transport delivered or consumed that range.
         ``consumer_ref`` must be a bounded identifier derived by trusted
         server-side code, not an arbitrary client-selected progress key.
+        A ``page_fits`` callback is a trusted, deterministic, monotone size
+        predicate over contiguous event prefixes. When supplied, the largest
+        fitting prefix is selected before any progress write is committed.
         """
         self._authorize_read(principal, account_scope, strategy_scope)
         self._validate_consumer_ref(consumer_ref)
         self._validate_read_request(cursor, limit)
+        if page_fits is not None and not callable(page_fits):
+            raise GatewayEventJournalError(
+                "CONSUMER_PAGE_FIT_INVALID", "page fit callback must be callable"
+            )
         if stream_epoch is not None:
             self._validate_stream_epoch(stream_epoch)
         if cursor is not None and cursor > 0 and stream_epoch is None:
@@ -563,15 +573,9 @@ class GatewayEventJournal:
                         "CONSUMER_STREAM_CAPACITY", "consumer stream capacity is exhausted"
                     )
                 current_epoch = uuid.uuid4().hex
-                connection.execute(
-                    """
-                    INSERT INTO gateway_consumer_streams
-                        (account_scope, strategy_scope, stream_epoch)
-                    VALUES (?, ?, ?)
-                    """,
-                    (account_scope, strategy_scope, current_epoch),
-                )
+                create_stream = True
             else:
+                create_stream = False
                 current_epoch = stream_row["stream_epoch"]
                 if not _valid_bounded_identifier(current_epoch):
                     raise self._consumer_progress_corrupt()
@@ -607,10 +611,33 @@ class GatewayEventJournal:
                         "CONSUMER_PROGRESS_CAPACITY", "consumer progress capacity is exhausted"
                     )
 
-            batch = self._read_batch_in_transaction(
+            full_batch = self._read_batch_in_transaction(
                 connection, account_scope, strategy_scope, cursor, limit
             )
-            offered = max(offered, batch.next_cursor)
+            if page_fits is None:
+                batch = full_batch
+                next_offered = max(offered, batch.next_cursor)
+                progress = GatewayConsumerProgress(current_epoch, next_offered, acknowledged)
+            else:
+                batch, progress = self._fit_consumer_page(
+                    full_batch,
+                    stream_epoch=current_epoch,
+                    previous_offered=offered,
+                    acknowledged=acknowledged,
+                    page_fits=page_fits,
+                )
+
+            # Do not create either durable key until the exact response shape
+            # has passed the caller's bounded serializer for this candidate.
+            if create_stream:
+                connection.execute(
+                    """
+                    INSERT INTO gateway_consumer_streams
+                        (account_scope, strategy_scope, stream_epoch)
+                    VALUES (?, ?, ?)
+                    """,
+                    (account_scope, strategy_scope, current_epoch),
+                )
             if progress_row is None:
                 connection.execute(
                     """
@@ -619,7 +646,12 @@ class GatewayEventJournal:
                         stream_epoch, offered_cursor, acknowledged_cursor
                     ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (*progress_key, current_epoch, offered, acknowledged),
+                    (
+                        *progress_key,
+                        current_epoch,
+                        progress.offered_cursor,
+                        progress.acknowledged_cursor,
+                    ),
                 )
             else:
                 connection.execute(
@@ -629,9 +661,8 @@ class GatewayEventJournal:
                     WHERE principal_id = ? AND consumer_ref = ?
                         AND account_scope = ? AND strategy_scope = ?
                     """,
-                    (offered, *progress_key),
+                    (progress.offered_cursor, *progress_key),
                 )
-            progress = GatewayConsumerProgress(current_epoch, offered, acknowledged)
             connection.execute("COMMIT")
             return batch, progress
         except BaseException:
@@ -640,6 +671,101 @@ class GatewayEventJournal:
             raise
         finally:
             connection.close()
+
+    def _fit_consumer_page(
+        self,
+        batch: GatewayReadBatch,
+        *,
+        stream_epoch: str,
+        previous_offered: int,
+        acknowledged: int,
+        page_fits: Callable[[GatewayReadBatch, GatewayConsumerProgress], bool],
+    ) -> tuple[GatewayReadBatch, GatewayConsumerProgress]:
+        """Choose the largest fitting contiguous prefix without advancing on a stall."""
+        if not batch.events and batch.latest_cursor > batch.next_cursor:
+            raise GatewayEventJournalError(
+                "CURSOR_GAP", "journal page has an unavailable cursor range"
+            )
+
+        base_cursor = (
+            batch.snapshot.cursor
+            if batch.snapshot is not None
+            else (batch.requested_cursor if batch.requested_cursor is not None else 0)
+        )
+        expected_sequence = base_cursor + 1
+        for event in batch.events:
+            if event.sequence != expected_sequence:
+                raise GatewayEventJournalError(
+                    "CURSOR_GAP", "journal page has a non-contiguous cursor range"
+                )
+            expected_sequence += 1
+
+        maximum_prefix = len(batch.events)
+        minimum_prefix = 0 if batch.snapshot is not None or not batch.events else 1
+
+        def candidate_for(
+            prefix_length: int,
+        ) -> tuple[GatewayReadBatch, GatewayConsumerProgress]:
+            events = batch.events[:prefix_length]
+            next_cursor = events[-1].sequence if events else base_cursor
+            candidate = replace(batch, events=events, next_cursor=next_cursor)
+            candidate_progress = GatewayConsumerProgress(
+                stream_epoch,
+                max(previous_offered, candidate.next_cursor),
+                acknowledged,
+            )
+            return candidate, candidate_progress
+
+        def fits_candidate(candidate: GatewayReadBatch, progress: GatewayConsumerProgress) -> bool:
+            try:
+                fits = page_fits(candidate, progress)
+            except Exception:
+                raise GatewayEventJournalError(
+                    "CONSUMER_PAGE_CHECK_FAILED", "consumer page fit check failed"
+                ) from None
+            if type(fits) is not bool:
+                raise GatewayEventJournalError(
+                    "CONSUMER_PAGE_FIT_INVALID", "page fit callback must return bool"
+                )
+            return fits
+
+        smallest, smallest_progress = candidate_for(minimum_prefix)
+        if not fits_candidate(smallest, smallest_progress):
+            raise GatewayEventJournalError(
+                "CONSUMER_PAGE_TOO_LARGE", "no contiguous consumer page fits the response limit"
+            )
+
+        if minimum_prefix == maximum_prefix:
+            return smallest, smallest_progress
+
+        largest, largest_progress = candidate_for(maximum_prefix)
+        if fits_candidate(largest, largest_progress):
+            return largest, largest_progress
+
+        # The callback is a monotone response-size predicate. Keep a known-fit
+        # lower bound and a known-too-large upper bound, so work is logarithmic
+        # in the journal's maximum page length rather than serializing every
+        # progressively smaller candidate.
+        low = minimum_prefix
+        high = maximum_prefix - 1
+        while low < high:
+            middle = (low + high + 1) // 2
+            middle_batch, middle_progress = candidate_for(middle)
+            if fits_candidate(middle_batch, middle_progress):
+                low = middle
+            else:
+                high = middle - 1
+
+        selected, selected_progress = candidate_for(low)
+        # Leave adapter-side one-candidate caches aligned with the exact page
+        # that will be returned. The adapter must freeze non-page state (for
+        # example, a freshness sample) for the duration of this callback.
+        if not fits_candidate(selected, selected_progress):
+            raise GatewayEventJournalError(
+                "CONSUMER_PAGE_TOO_LARGE",
+                "no contiguous consumer page fits the response limit",
+            )
+        return selected, selected_progress
 
     def consumer_progress(
         self,

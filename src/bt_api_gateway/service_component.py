@@ -12,7 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Optional
@@ -221,8 +221,15 @@ class GatewayReadService:
         scope: WireScope,
         arguments: Mapping[str, object],
         identity: Optional[WireIdentity] = None,  # noqa: UP045 -- Python 3.9 support.
+        result_fits: Optional[Callable[[Mapping[str, object]], bool]] = None,  # noqa: UP045
     ) -> Mapping[str, object]:
-        """Dispatch a bounded journal read or consumer-progress operation."""
+        """Dispatch a bounded journal read or consumer-progress operation.
+
+        ``result_fits`` is trusted in-process context supplied by the service
+        runtime. For tracked reads it must be a pure, monotone result-size
+        predicate over the complete mapping returned to the client. It is never
+        accepted through wire ``arguments``.
+        """
 
         if type(operation) is not str or operation not in SUPPORTED_OPERATIONS:
             raise GatewayServiceError("UNSUPPORTED_OPERATION")
@@ -250,6 +257,8 @@ class GatewayReadService:
             if type(track_delivery) is not bool:
                 raise GatewayServiceError("INVALID_ARGUMENTS")
             if track_delivery:
+                if result_fits is not None and not callable(result_fits):
+                    raise GatewayServiceError("INVALID_RESULT_FITNESS_CHECK")
                 consumer_ref = self._consumer_ref(
                     identity,
                     principal_ref=principal_ref,
@@ -258,6 +267,59 @@ class GatewayReadService:
                     account=account,
                     journal_strategy_scope=journal_strategy_scope,
                 )
+
+                if result_fits is None:
+                    batch, progress = self._journal.read_for_consumer(
+                        principal,
+                        account.journal_account_scope,
+                        journal_strategy_scope,
+                        consumer_ref,
+                        cursor=cursor,  # type: ignore[arg-type] -- validated above.
+                        limit=limit,  # type: ignore[arg-type] -- validated above.
+                        stream_epoch=arguments.get("stream_epoch"),
+                    )
+                    return self._consumer_read_result(
+                        batch,
+                        progress,
+                        operation=operation,
+                        strategy_scope=journal_strategy_scope,
+                    )
+
+                selected_batch: Optional[GatewayReadBatch] = None  # noqa: UP045
+                selected_progress: Optional[GatewayConsumerProgress] = None  # noqa: UP045
+                selected_result: Optional[Mapping[str, object]] = None  # noqa: UP045
+                selected_fits = False
+                state_status_snapshot: Optional[Mapping[str, object]] = None  # noqa: UP045
+                state_status_captured = False
+
+                def page_fits(
+                    candidate_batch: GatewayReadBatch,
+                    candidate_progress: GatewayConsumerProgress,
+                ) -> bool:
+                    nonlocal selected_batch, selected_progress, selected_result
+                    nonlocal selected_fits, state_status_snapshot, state_status_captured
+                    if self._state_worker is not None and not state_status_captured:
+                        candidate_status = self._state_worker.read_status()
+                        if not isinstance(candidate_status, Mapping):
+                            raise GatewayServiceError("STATE_STATUS_INVALID")
+                        state_status_snapshot = candidate_status
+                        state_status_captured = True
+                    candidate_result = self._consumer_read_result(
+                        candidate_batch,
+                        candidate_progress,
+                        operation=operation,
+                        strategy_scope=journal_strategy_scope,
+                        state_status=state_status_snapshot,
+                    )
+                    fits = result_fits(candidate_result)
+                    if type(fits) is not bool:
+                        raise GatewayServiceError("INVALID_RESULT_FITNESS_RESULT")
+                    selected_batch = candidate_batch
+                    selected_progress = candidate_progress
+                    selected_result = candidate_result
+                    selected_fits = fits
+                    return fits
+
                 batch, progress = self._journal.read_for_consumer(
                     principal,
                     account.journal_account_scope,
@@ -266,14 +328,16 @@ class GatewayReadService:
                     cursor=cursor,  # type: ignore[arg-type] -- validated above.
                     limit=limit,  # type: ignore[arg-type] -- validated above.
                     stream_epoch=arguments.get("stream_epoch"),
+                    page_fits=page_fits,
                 )
-                result = dict(_batch_result(batch, include_snapshot_source=False))
-                result["consumer_progress"] = _consumer_progress_result(progress)
-                return self._with_state_status(
-                    MappingProxyType(result),
-                    operation=operation,
-                    strategy_scope=journal_strategy_scope,
-                )
+                if (
+                    selected_batch != batch
+                    or selected_progress != progress
+                    or selected_result is None
+                    or not selected_fits
+                ):
+                    raise GatewayServiceError("CONSUMER_PAGE_RESULT_MISMATCH")
+                return selected_result
             if "stream_epoch" in arguments:
                 raise GatewayServiceError("UNKNOWN_ARGUMENT")
             batch = self._journal.read_after(
@@ -414,11 +478,12 @@ class GatewayReadService:
         *,
         operation: str,
         strategy_scope: str,
+        state_status: Optional[Mapping[str, object]] = None,  # noqa: UP045
     ) -> Mapping[str, object]:
         if self._state_worker is None:
             return result
         copied = dict(result)
-        status = dict(self._state_worker.read_status())
+        status = dict(self._state_worker.read_status() if state_status is None else state_status)
         if status["ready"] and not _state_result_matches_worker(
             result,
             operation=operation,
@@ -430,6 +495,24 @@ class GatewayReadService:
             status["fresh_for_seconds"] = 0.0
         copied["state_status"] = MappingProxyType(status)
         return MappingProxyType(copied)
+
+    def _consumer_read_result(
+        self,
+        batch: GatewayReadBatch,
+        progress: GatewayConsumerProgress,
+        *,
+        operation: str,
+        strategy_scope: str,
+        state_status: Optional[Mapping[str, object]] = None,  # noqa: UP045
+    ) -> Mapping[str, object]:
+        result = dict(_batch_result(batch, include_snapshot_source=False))
+        result["consumer_progress"] = _consumer_progress_result(progress)
+        return self._with_state_status(
+            MappingProxyType(result),
+            operation=operation,
+            strategy_scope=strategy_scope,
+            state_status=state_status,
+        )
 
     def _resolve_scope(self, scope: WireScope) -> tuple[GatewayServiceAccountScope, str]:
         if (
