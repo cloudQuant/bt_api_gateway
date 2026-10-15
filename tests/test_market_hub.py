@@ -323,6 +323,76 @@ def test_application_registration_has_no_fabricated_strategy_and_scope_is_public
         )
 
 
+def test_strategy_registration_preserves_account_binding_without_stream_partition() -> None:
+    key = _key()
+    hub, provider, _ = _hub(principals=("principal:a",))
+    registration = GatewayMarketRegistration(
+        principal_ref="principal:a",
+        execution_domain_ref="domain:paper",
+        strategy_ref="strategy:a",
+        run_id="run:a",
+        account_ref="account:shared",
+    )
+    service = GatewayMarketService(hub, registrations={"registration:a": registration})
+
+    accepted = service.handle(
+        "market.subscribe",
+        principal_ref="principal:a",
+        scope=_scope(
+            account_ref="account:shared",
+            strategy_ref="strategy:a",
+            run_id="run:a",
+        ),
+        arguments={"key": key.to_dict()},
+        registration_id="registration:a",
+    )
+    assert accepted["stream_id"] == key.stream_id
+    assert [subscribed_key for subscribed_key, _handle in provider.subscribed] == [key]
+    assert hub.readiness["active_registrations"] == 1
+
+    # Account association is checked against each strategy registration but
+    # does not partition the shared stream or create another provider handle.
+    service.register_registration(
+        "registration:b",
+        GatewayMarketRegistration(
+            principal_ref="principal:a",
+            execution_domain_ref="domain:paper",
+            strategy_ref="strategy:b",
+            run_id="run:b",
+            account_ref="account:other",
+        ),
+    )
+    second_account = service.handle(
+        "market.subscribe",
+        principal_ref="principal:a",
+        scope=_scope(
+            account_ref="account:other",
+            strategy_ref="strategy:b",
+            run_id="run:b",
+        ),
+        arguments={"key": key.to_dict()},
+        registration_id="registration:b",
+    )
+    assert second_account["stream_id"] == key.stream_id
+    assert [subscribed_key for subscribed_key, _handle in provider.subscribed] == [key]
+    assert hub.readiness["active_registrations"] == 2
+
+    with pytest.raises(GatewayMarketServiceError, match="ACCOUNT_SCOPE_DENIED"):
+        service.handle(
+            "market.subscribe",
+            principal_ref="principal:a",
+            scope=_scope(
+                account_ref="account:other",
+                strategy_ref="strategy:a",
+                run_id="run:a",
+            ),
+            arguments={"key": key.to_dict()},
+            registration_id="registration:a",
+        )
+    assert [subscribed_key for subscribed_key, _handle in provider.subscribed] == [key]
+    assert hub.readiness["active_registrations"] == 2
+
+
 def test_registration_binding_is_idempotent_but_cannot_be_rebound() -> None:
     hub, _, _ = _hub()
     service = GatewayMarketService(hub)

@@ -140,13 +140,16 @@ class GatewayMarketRegistration:
     Strategy-client registrations carry both strategy and run refs, created
     only after the service registry verifies that run. Application/service
     registrations carry neither; they do not invent a strategy identity to
-    enter the public market scope.
+    enter the public market scope. An optional account ref preserves the
+    registry's trusted strategy-to-account association without adding account
+    data to the shared market stream or its deduplication key.
     """
 
     principal_ref: str
     execution_domain_ref: str
     strategy_ref: Optional[str] = None  # noqa: UP045 -- Python 3.9 support.
     run_id: Optional[str] = None  # noqa: UP045 -- Python 3.9 support.
+    account_ref: Optional[str] = None  # noqa: UP045 -- Python 3.9 support.
 
     def __post_init__(self) -> None:
         for name in ("principal_ref", "execution_domain_ref"):
@@ -156,6 +159,8 @@ class GatewayMarketRegistration:
         if self.strategy_ref is not None:
             _require_reference(self.strategy_ref, "INVALID_REGISTRATION")
             _require_reference(self.run_id, "INVALID_REGISTRATION")
+        if self.account_ref is not None:
+            _require_reference(self.account_ref, "INVALID_REGISTRATION")
 
 
 @dataclass
@@ -1019,14 +1024,17 @@ class GatewayMarketService:
         if type(scope) is not WireScope:
             raise GatewayMarketServiceError("INVALID_SCOPE")
         if (
-            scope.account_ref is not None
-            or scope.account_refs
+            scope.account_refs
             or scope.manual_book_ref is not None
             or scope.portfolio_ref is not None
             or scope.group_id is not None
             or scope.leg_id is not None
         ):
             raise GatewayMarketServiceError("PUBLIC_MARKET_SCOPE_REQUIRED")
+        if scope.account_ref is not None and registration.account_ref is None:
+            raise GatewayMarketServiceError("PUBLIC_MARKET_SCOPE_REQUIRED")
+        if scope.account_ref != registration.account_ref:
+            raise GatewayMarketServiceError("ACCOUNT_SCOPE_DENIED")
         if scope.execution_domain_ref != registration.execution_domain_ref:
             raise GatewayMarketServiceError("EXECUTION_DOMAIN_DENIED")
         if (scope.strategy_ref, scope.run_id) != (
