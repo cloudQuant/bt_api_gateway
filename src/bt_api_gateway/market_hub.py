@@ -36,6 +36,7 @@ from bt_api_base.market_protocol import (
     MARKET_EVENT_SCHEMA,
     MARKET_EVENT_SCHEMA_VERSION,
     MarketProviderEvent,
+    MarketSourceDescriptor,
     MarketSubscriptionKey,
 )
 from bt_api_base.service_protocol import (
@@ -122,6 +123,21 @@ class MarketProvider(Protocol):
         retries it later. The provider must accept that same handle again even
         if the previous call already stopped its upstream subscription.
         """
+
+
+class MarketProviderSourceDescriber(Protocol):
+    """Optional capability to describe the exact active provider source."""
+
+    def describe_source(
+        self,
+        handle: object,
+        *,
+        key: MarketSubscriptionKey,
+        generation: str,
+        stream_id: str,
+        epoch: str,
+    ) -> MarketSourceDescriptor | None:
+        """Return source identity bound to this active handle, or ``None``."""
 
 
 class MarketProviderPolling(Protocol):
@@ -462,18 +478,27 @@ class GatewayMarketHub:
         principal_ref: str,
         key: MarketSubscriptionKey,
         registration_id: str,
+        *,
+        require_source_descriptor: bool = False,
     ) -> Mapping[str, object]:
         """Acquire one registration ref, starting the provider only on first use."""
         self._check_owner()
         self._ensure_open()
         stream = self._authorize_key(principal_ref, key)
         _require_reference(registration_id, "INVALID_REGISTRATION")
+        if type(require_source_descriptor) is not bool:
+            raise GatewayMarketHubError("INVALID_SOURCE_DESCRIPTOR_REQUEST")
         if stream.starting or stream.releasing:
             raise GatewayMarketHubError("STREAM_TRANSITION_IN_PROGRESS", retryable=True)
 
         already_subscribed = registration_id in stream.registrations
         if already_subscribed:
-            return self._subscription_result(stream, already_subscribed=True)
+            descriptor = self._describe_source(stream) if require_source_descriptor else None
+            return self._subscription_result(
+                stream,
+                already_subscribed=True,
+                source_descriptor=descriptor,
+            )
         if self._registration_ref_count >= MAX_MARKET_REGISTRATION_REFS:
             raise GatewayMarketHubError("REGISTRATION_REF_LIMIT_EXCEEDED")
 
@@ -487,6 +512,7 @@ class GatewayMarketHub:
             # shared upstream to a new registration.
             raise GatewayMarketHubError("PROVIDER_UNSUBSCRIBE_FAILED", retryable=True)
 
+        acquired_here = False
         if stream.handle is None:
             if self._publisher is None:
                 raise GatewayMarketHubError("PUBLISHER_NOT_CONFIGURED")
@@ -506,6 +532,7 @@ class GatewayMarketHub:
                 raise GatewayMarketHubError("INVALID_PROVIDER_HANDLE", retryable=True)
             stream.handle = handle
             stream.generation = generation
+            acquired_here = True
             if next_epoch is not None:
                 stream.epoch = next_epoch
                 stream.sequence = 0
@@ -513,12 +540,29 @@ class GatewayMarketHub:
                 stream.replay_bytes = 0
                 stream.needs_new_epoch = False
 
+        descriptor: MarketSourceDescriptor | None = None
+        if require_source_descriptor:
+            try:
+                descriptor = self._describe_source(stream)
+            except GatewayMarketHubError:
+                if acquired_here:
+                    # The caller is not registered until its descriptor has
+                    # been validated. Release a newly acquired source now; if
+                    # release is uncertain, _attempt_release retains its exact
+                    # handle for the ordinary owner-thread retry path.
+                    self._attempt_release(stream)
+                raise
+
         # Reuse a retained handle after an uncertain failed stop; never start a
         # second upstream stream while the original handle is still owned.
         stream.registrations.add(registration_id)
         self._registration_ref_count += 1
         stream.pending_release = False
-        return self._subscription_result(stream, already_subscribed=False)
+        return self._subscription_result(
+            stream,
+            already_subscribed=False,
+            source_descriptor=descriptor,
+        )
 
     def unsubscribe(
         self,
@@ -966,17 +1010,54 @@ class GatewayMarketHub:
         return stream
 
     def _subscription_result(
-        self, stream: _MarketStream, *, already_subscribed: bool
+        self,
+        stream: _MarketStream,
+        *,
+        already_subscribed: bool,
+        source_descriptor: MarketSourceDescriptor | None = None,
     ) -> Mapping[str, object]:
-        return MappingProxyType(
-            {
-                "stream_id": stream.key.stream_id,
-                "epoch": stream.epoch,
-                "head": stream.sequence,
-                "oldest_sequence": _oldest_sequence(stream),
-                "already_subscribed": already_subscribed,
-            }
-        )
+        result: dict[str, object] = {
+            "stream_id": stream.key.stream_id,
+            "epoch": stream.epoch,
+            "head": stream.sequence,
+            "oldest_sequence": _oldest_sequence(stream),
+            "already_subscribed": already_subscribed,
+        }
+        if source_descriptor is not None:
+            result["source_descriptor"] = source_descriptor.to_dict()
+        return MappingProxyType(result)
+
+    def _describe_source(self, stream: _MarketStream) -> MarketSourceDescriptor:
+        handle = stream.handle
+        generation = stream.generation
+        if handle is None or generation is None:
+            raise GatewayMarketHubError("MARKET_SOURCE_DESCRIPTOR_UNAVAILABLE")
+        try:
+            describe = getattr(self._provider, "describe_source", None)
+            if not callable(describe):
+                raise ValueError("source descriptor capability is unavailable")
+            descriptor = describe(
+                handle,
+                key=stream.key,
+                generation=generation,
+                stream_id=stream.key.stream_id,
+                epoch=stream.epoch,
+            )
+            if type(descriptor) is not MarketSourceDescriptor:
+                raise ValueError("invalid source descriptor")
+            # Re-parse the public representation at this provider boundary so
+            # malformed or forged instances cannot bypass the wire contract.
+            descriptor = MarketSourceDescriptor.from_dict(descriptor.to_dict())
+            if (
+                descriptor.key != stream.key
+                or descriptor.stream_id != stream.key.stream_id
+                or descriptor.epoch != stream.epoch
+                or descriptor.provider != stream.key.instrument.provider
+            ):
+                raise ValueError("source descriptor is bound to another stream")
+        except Exception:
+            raise GatewayMarketHubError("MARKET_SOURCE_DESCRIPTOR_UNAVAILABLE") from None
+        return descriptor
 
     def _trim_replay(self, stream: _MarketStream) -> None:
         while stream.events and (
@@ -1106,13 +1187,25 @@ class GatewayMarketService:
             raise GatewayMarketServiceError("UNSUPPORTED_OPERATION")
         self._resolve_registration(principal_ref, scope, registration_id)
         raw = _require_arguments(arguments)
-        if operation == MARKET_HISTORY_OPERATION:
+        require_source_descriptor = False
+        if operation == "market.subscribe":
+            if set(raw) == {"key"}:
+                pass
+            elif set(raw) == {"key", "require_source_descriptor"}:
+                requested_descriptor = raw["require_source_descriptor"]
+                if type(requested_descriptor) is not bool:
+                    raise GatewayMarketServiceError("INVALID_ARGUMENTS")
+                require_source_descriptor = requested_descriptor
+            else:
+                raise GatewayMarketServiceError("INVALID_ARGUMENTS")
+        elif operation == MARKET_HISTORY_OPERATION:
             expected = {"key", "start_time_utc", "end_time_utc", "limit"}
         elif operation == "market.read_after":
             expected = {"key", "epoch", "after", "limit"}
         else:
             expected = {"key"}
-        _require_exact_arguments(raw, expected)
+        if operation != "market.subscribe":
+            _require_exact_arguments(raw, expected)
         if operation == MARKET_HISTORY_OPERATION:
             request = _parse_history_request(raw)
             try:
@@ -1124,7 +1217,15 @@ class GatewayMarketService:
         self._hub._authorize_key(principal_ref, key)
 
         if operation == "market.subscribe":
-            return self._hub.subscribe(principal_ref, key, registration_id)
+            try:
+                return self._hub.subscribe(
+                    principal_ref,
+                    key,
+                    registration_id,
+                    require_source_descriptor=require_source_descriptor,
+                )
+            except GatewayMarketHubError as exc:
+                raise GatewayMarketServiceError(exc.code, retryable=exc.retryable) from None
         if operation == "market.unsubscribe":
             return self._hub.unsubscribe(principal_ref, key, registration_id)
         if not self._hub.registration_active(key, registration_id):
@@ -1462,6 +1563,7 @@ __all__ = [
     "GatewayMarketServiceError",
     "MARKET_HISTORY_OPERATION",
     "MARKET_OPERATIONS",
+    "MarketProviderSourceDescriber",
     "SUPPORTED_OPERATIONS",
     "MAX_MARKET_EVENT_BYTES",
     "MAX_MARKET_HISTORY_TIMEOUT_SECONDS",

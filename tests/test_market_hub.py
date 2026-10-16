@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from itertools import count
 import threading
+from itertools import count
 from typing import Any
 
 import pytest
 from bt_api_base.market_protocol import (
     MarketInstrumentKey,
     MarketProviderEvent,
+    MarketSourceDescriptor,
     MarketSubscriptionKey,
 )
 from bt_api_base.service_protocol import WireIdentity, WireRole, WireScope, encode_envelope
@@ -67,6 +68,41 @@ class CountedProvider:
         self.pending_events[handle].append(event)
 
 
+class DescribingProvider(CountedProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.describe_calls: list[dict[str, object]] = []
+        self.descriptor_factory: Any = None
+
+    def describe_source(
+        self,
+        handle: object,
+        *,
+        key: MarketSubscriptionKey,
+        generation: str,
+        stream_id: str,
+        epoch: str,
+    ) -> MarketSourceDescriptor | None:
+        self.describe_calls.append(
+            {
+                "handle": handle,
+                "key": key,
+                "generation": generation,
+                "stream_id": stream_id,
+                "epoch": epoch,
+            }
+        )
+        if self.descriptor_factory is None:
+            return None
+        return self.descriptor_factory(
+            handle=handle,
+            key=key,
+            generation=generation,
+            stream_id=stream_id,
+            epoch=epoch,
+        )
+
+
 def _key(**changes: Any) -> MarketSubscriptionKey:
     instrument_fields: dict[str, str] = {
         "provider": "synthetic",
@@ -108,13 +144,15 @@ def _hub(
     keys: tuple[MarketSubscriptionKey, ...] | None = None,
     principals: tuple[str, ...] = ("principal:a", "principal:b"),
     *,
+    provider: Any = None,
     max_replay_events: int = 1_000,
     max_replay_bytes: int = 256 * 1024,
     max_provider_events_per_maintain: int = 32,
     publisher: Any = None,
 ) -> tuple[GatewayMarketHub, CountedProvider, list[Any]]:
     exported = keys or (_key(),)
-    provider = CountedProvider()
+    if provider is None:
+        provider = CountedProvider()
     published: list[Any] = []
     epochs = count(1)
     hub = GatewayMarketHub(
@@ -130,6 +168,31 @@ def _hub(
     )
     hub.set_publisher(publisher or published.append)
     return hub, provider, published
+
+
+def _source_descriptor(
+    key: MarketSubscriptionKey,
+    *,
+    stream_id: str | None = None,
+    epoch: str = "epoch-1",
+    provider: str | None = None,
+    connection_generation: int = 7,
+    source: str = "ctp.native.md",
+    clock_domain_id: str = "ctp-md-process:123:monotonic:session-a",
+    clock_source_session_id: str = "session-a",
+    clock_source: str = "time.monotonic_ns",
+) -> MarketSourceDescriptor:
+    return MarketSourceDescriptor(
+        key=key,
+        stream_id=key.stream_id if stream_id is None else stream_id,
+        epoch=epoch,
+        provider=key.instrument.provider if provider is None else provider,
+        source=source,
+        connection_generation=connection_generation,
+        clock_domain_id=clock_domain_id,
+        clock_source_session_id=clock_source_session_id,
+        clock_source=clock_source,
+    )
 
 
 def _publish(
@@ -486,6 +549,258 @@ def test_registration_binding_is_idempotent_but_cannot_be_rebound() -> None:
         )
 
 
+def test_source_descriptor_is_opt_in_and_bound_to_the_active_provider_handle() -> None:
+    key = _key()
+    provider = DescribingProvider()
+    provider.descriptor_factory = lambda **values: _source_descriptor(
+        values["key"], epoch=values["epoch"]
+    )
+    hub, _, _ = _hub(principals=("principal:a",), provider=provider)
+    service = GatewayMarketService(hub)
+    registration = GatewayMarketRegistration("principal:a", "domain:paper")
+    service.register_registration("registration:a", registration)
+    service.register_registration("registration:b", registration)
+
+    legacy = service.handle(
+        "market.subscribe",
+        principal_ref="principal:a",
+        scope=_scope(),
+        arguments={"key": key.to_dict()},
+        registration_id="registration:a",
+    )
+    explicit_false = service.handle(
+        "market.subscribe",
+        principal_ref="principal:a",
+        scope=_scope(),
+        arguments={"key": key.to_dict(), "require_source_descriptor": False},
+        registration_id="registration:b",
+    )
+    assert set(legacy) == {
+        "stream_id",
+        "epoch",
+        "head",
+        "oldest_sequence",
+        "already_subscribed",
+    }
+    assert set(explicit_false) == set(legacy)
+    assert legacy["stream_id"] == key.stream_id
+    assert legacy["already_subscribed"] is False
+    assert explicit_false["already_subscribed"] is False
+    assert provider.describe_calls == []
+
+
+def test_requested_descriptor_uses_current_generation_key_and_epoch() -> None:
+    key = _key()
+    provider = DescribingProvider()
+    provider.descriptor_factory = lambda **values: _source_descriptor(
+        values["key"], epoch=values["epoch"]
+    )
+    hub, _, _ = _hub(principals=("principal:a",), provider=provider)
+    service = GatewayMarketService(
+        hub,
+        registrations={"registration:a": GatewayMarketRegistration("principal:a", "domain:paper")},
+    )
+
+    result = service.handle(
+        "market.subscribe",
+        principal_ref="principal:a",
+        scope=_scope(),
+        arguments={"key": key.to_dict(), "require_source_descriptor": True},
+        registration_id="registration:a",
+    )
+
+    assert set(result) == {
+        "stream_id",
+        "epoch",
+        "head",
+        "oldest_sequence",
+        "already_subscribed",
+        "source_descriptor",
+    }
+    assert result["source_descriptor"] == _source_descriptor(key, epoch=result["epoch"]).to_dict()
+    assert len(provider.subscribed) == 1
+    handle = provider.subscribed[0][1]
+    assert provider.describe_calls == [
+        {
+            "handle": handle,
+            "key": key,
+            "generation": provider.generations[key],
+            "stream_id": key.stream_id,
+            "epoch": result["epoch"],
+        }
+    ]
+    repeated = service.handle(
+        "market.subscribe",
+        principal_ref="principal:a",
+        scope=_scope(),
+        arguments={"key": key.to_dict(), "require_source_descriptor": True},
+        registration_id="registration:a",
+    )
+    assert repeated["already_subscribed"] is True
+    assert repeated["source_descriptor"] == result["source_descriptor"]
+    assert len(provider.describe_calls) == 2
+
+
+@pytest.mark.parametrize("flag", [0, 1, "true", None])
+def test_subscribe_descriptor_flag_requires_exact_bool(flag: object) -> None:
+    key = _key()
+    hub, provider, _ = _hub(principals=("principal:a",))
+    service = GatewayMarketService(
+        hub,
+        registrations={"registration:a": GatewayMarketRegistration("principal:a", "domain:paper")},
+    )
+
+    with pytest.raises(GatewayMarketServiceError, match="INVALID_ARGUMENTS"):
+        service.handle(
+            "market.subscribe",
+            principal_ref="principal:a",
+            scope=_scope(),
+            arguments={"key": key.to_dict(), "require_source_descriptor": flag},
+            registration_id="registration:a",
+        )
+    assert provider.subscribed == []
+
+
+@pytest.mark.parametrize("failure", ["missing", "none", "raises", "wrong_key", "wrong_epoch"])
+def test_descriptor_failure_is_finite_and_cleans_new_provider_acquisition(failure: str) -> None:
+    key = _key()
+    provider: CountedProvider
+    if failure == "missing":
+        provider = CountedProvider()
+    else:
+        provider = DescribingProvider()
+        if failure == "none":
+            provider.descriptor_factory = lambda **_values: None
+        elif failure == "raises":
+
+            def _raise(**_values: Any) -> None:
+                raise RuntimeError("private provider detail")
+
+            provider.descriptor_factory = _raise
+        elif failure == "wrong_key":
+            other = _key(source_ref="source:other")
+            provider.descriptor_factory = lambda **values: _source_descriptor(
+                other, epoch=values["epoch"]
+            )
+        else:
+            provider.descriptor_factory = lambda **values: _source_descriptor(
+                values["key"], epoch="another-epoch"
+            )
+
+    hub, _, _ = _hub(principals=("principal:a",), provider=provider)
+    service = GatewayMarketService(
+        hub,
+        registrations={"registration:a": GatewayMarketRegistration("principal:a", "domain:paper")},
+    )
+
+    with pytest.raises(
+        GatewayMarketServiceError, match="MARKET_SOURCE_DESCRIPTOR_UNAVAILABLE"
+    ) as raised:
+        service.handle(
+            "market.subscribe",
+            principal_ref="principal:a",
+            scope=_scope(),
+            arguments={"key": key.to_dict(), "require_source_descriptor": True},
+            registration_id="registration:a",
+        )
+
+    assert str(raised.value) == "MARKET_SOURCE_DESCRIPTOR_UNAVAILABLE"
+    assert hub.registration_active(key, "registration:a") is False
+    assert hub.readiness["active_registrations"] == 0
+    assert provider.active_handles == set()
+    assert len(provider.subscribed) == 1
+    assert provider.unsubscribed == [provider.subscribed[0][1]]
+
+
+def test_uncertain_descriptor_cleanup_retains_handle_until_release_retry() -> None:
+    key = _key()
+    provider = DescribingProvider()
+    provider.descriptor_factory = lambda **_values: None
+    provider.fail_unsubscribe = 1
+    original_unsubscribe = provider.unsubscribe
+
+    def uncertain_unsubscribe(handle: object) -> bool:
+        if provider.fail_unsubscribe:
+            provider.fail_unsubscribe -= 1
+            provider.unsubscribed.append(handle)
+            return False
+        return original_unsubscribe(handle)
+
+    provider.unsubscribe = uncertain_unsubscribe  # type: ignore[method-assign]
+    hub, _, _ = _hub(principals=("principal:a",), provider=provider)
+    service = GatewayMarketService(
+        hub,
+        registrations={"registration:a": GatewayMarketRegistration("principal:a", "domain:paper")},
+    )
+
+    with pytest.raises(GatewayMarketServiceError, match="MARKET_SOURCE_DESCRIPTOR_UNAVAILABLE"):
+        service.handle(
+            "market.subscribe",
+            principal_ref="principal:a",
+            scope=_scope(),
+            arguments={"key": key.to_dict(), "require_source_descriptor": True},
+            registration_id="registration:a",
+        )
+
+    handle = provider.subscribed[0][1]
+    assert hub.readiness["pending_releases"] == 1
+    assert hub.registration_active(key, "registration:a") is False
+    assert provider.active_handles == {handle}
+
+    provider.descriptor_factory = lambda **values: _source_descriptor(
+        values["key"], epoch=values["epoch"]
+    )
+    result = service.handle(
+        "market.subscribe",
+        principal_ref="principal:a",
+        scope=_scope(),
+        arguments={"key": key.to_dict(), "require_source_descriptor": True},
+        registration_id="registration:a",
+    )
+    assert result["source_descriptor"] == _source_descriptor(key, epoch=result["epoch"]).to_dict()
+    assert len(provider.subscribed) == 2
+    assert provider.unsubscribed[0] is handle
+    assert provider.active_handles == {provider.subscribed[1][1]}
+    assert hub.readiness["pending_releases"] == 0
+    assert hub.readiness["active_upstreams"] == 1
+
+
+def test_invalid_descriptor_for_new_registration_preserves_existing_shared_stream() -> None:
+    key = _key()
+    provider = DescribingProvider()
+    provider.descriptor_factory = lambda **values: _source_descriptor(
+        values["key"], epoch="stale-epoch"
+    )
+    hub, _, _ = _hub(principals=("principal:a",), provider=provider)
+    service = GatewayMarketService(hub)
+    registration = GatewayMarketRegistration("principal:a", "domain:paper")
+    service.register_registration("registration:a", registration)
+    service.register_registration("registration:b", registration)
+    legacy = service.handle(
+        "market.subscribe",
+        principal_ref="principal:a",
+        scope=_scope(),
+        arguments={"key": key.to_dict()},
+        registration_id="registration:a",
+    )
+
+    with pytest.raises(GatewayMarketServiceError, match="MARKET_SOURCE_DESCRIPTOR_UNAVAILABLE"):
+        service.handle(
+            "market.subscribe",
+            principal_ref="principal:a",
+            scope=_scope(),
+            arguments={"key": key.to_dict(), "require_source_descriptor": True},
+            registration_id="registration:b",
+        )
+
+    assert hub.registration_active(key, "registration:a") is True
+    assert hub.registration_active(key, "registration:b") is False
+    assert hub.readiness["active_registrations"] == 1
+    assert len(provider.subscribed) == 1
+    assert provider.unsubscribed == []
+    assert legacy["stream_id"] == key.stream_id
+
+
 def test_service_rejects_extra_arguments_and_requires_active_subscription() -> None:
     key = _key()
     hub, _, _ = _hub(principals=("principal:a",))
@@ -579,9 +894,7 @@ def test_maintain_publishes_provider_events_on_owner_thread_with_existing_wire_s
 def test_maintain_uses_a_finite_round_robin_provider_poll_budget() -> None:
     first = _key()
     second = _key(source_ref="source:second")
-    hub, provider, published = _hub(
-        (first, second), max_provider_events_per_maintain=4
-    )
+    hub, provider, published = _hub((first, second), max_provider_events_per_maintain=4)
     hub.subscribe("principal:a", first, "registration:a")
     hub.subscribe("principal:a", second, "registration:b")
     for key in (first, second):
