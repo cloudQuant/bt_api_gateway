@@ -8,10 +8,10 @@ quota owner. Only opaque identifiers and quota events are persisted; provider
 credentials never enter this module.
 
 Each grant consumes one slot even if the provider call later fails. Ordinary
-work is limited to ``capacity_per_window - reserved_capacity``. Cancellation,
-reconciliation, and accepted-group actions may use the reserved slots. The
-same admission API is intended for later Risk/CTP callers, so those paths can
-share one quota owner rather than creating independent limiters.
+work is limited to ``capacity_per_window - reserved_capacity``. Risk CLOSE,
+cancellation, reconciliation, and accepted-group actions may use the reserved
+slots. Risk/Execution callers share one provider-neutral callback and one quota
+owner rather than creating independent limiters.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ from bt_api_base.exceptions import RateLimitError
 
 _SAFE_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _CRITICAL_OPERATIONS = frozenset(
-    {"cancel", "reconcile", "accepted_group_action"}
+    {"close", "cancel", "reconcile", "accepted_group_action"}
 )
 _OPTIONAL_PROVIDER_READS = frozenset(
     {"read_account_configuration", "read_exchange_server_time"}
@@ -55,6 +55,8 @@ class GatewayQuotaOperation(str, Enum):
     SUBSCRIBE = "subscribe"
     QUERY = "query"
     CTP_QUERY = "ctp_query"
+    OPEN = "open"
+    CLOSE = "close"
     CANCEL = "cancel"
     RECONCILE = "reconcile"
     ACCEPTED_GROUP_ACTION = "accepted_group_action"
@@ -85,11 +87,12 @@ class GatewayQuotaAdmissionError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class GatewayQuotaSubject:
-    """Non-secret fairness identity for one account/strategy/instrument."""
+    """Non-secret fairness identity for one account/strategy/run/instrument."""
 
     account_ref: str
     strategy_ref: Optional[str] = None  # noqa: UP045 -- Gateway package supports Python 3.9.
     instrument_ref: Optional[str] = None  # noqa: UP045 -- Gateway package supports Python 3.9.
+    run_ref: Optional[str] = None  # noqa: UP045 -- Gateway package supports Python 3.9.
 
     def __post_init__(self) -> None:
         if not _valid_ref(self.account_ref):
@@ -97,6 +100,8 @@ class GatewayQuotaSubject:
         if self.strategy_ref is not None and not _valid_ref(self.strategy_ref):
             raise GatewayQuotaAdmissionError("INVALID_SUBJECT")
         if self.instrument_ref is not None and not _valid_ref(self.instrument_ref):
+            raise GatewayQuotaAdmissionError("INVALID_SUBJECT")
+        if self.run_ref is not None and not _valid_ref(self.run_ref):
             raise GatewayQuotaAdmissionError("INVALID_SUBJECT")
 
 
@@ -765,9 +770,74 @@ class GatewayQuotaProviderSession:
         return "<GatewayQuotaProviderSession>"
 
 
+class GatewayQuotaDispatchAdmission:
+    """Adapt trusted Risk/CANCEL dispatch facts to the shared quota owner.
+
+    Callers pass server-resolved identity and a finite operation label. The
+    adapter consumes the grant internally so account-owner APIs receive only
+    ``None`` on success and a value-free quota error on denial.
+    """
+
+    __slots__ = ("_admission",)
+
+    _OPERATIONS = MappingProxyType(
+        {
+            "OPEN": GatewayQuotaOperation.OPEN,
+            "CLOSE": GatewayQuotaOperation.CLOSE,
+            "CANCEL": GatewayQuotaOperation.CANCEL,
+            "RECONCILE": GatewayQuotaOperation.RECONCILE,
+            "ACCEPTED_GROUP_ACTION": GatewayQuotaOperation.ACCEPTED_GROUP_ACTION,
+        }
+    )
+
+    def __init__(self, admission: GatewayQuotaAdmission) -> None:
+        if type(admission) is not GatewayQuotaAdmission:
+            raise GatewayQuotaAdmissionError("INVALID_CONFIGURATION")
+        self._admission = admission
+
+    def __call__(
+        self,
+        account_ref: str,
+        strategy_ref: str,
+        run_ref: str,
+        instrument_ref: Optional[str],  # noqa: UP045 -- Gateway package supports Python 3.9.
+        operation: str,
+        deadline_monotonic_ns: int,
+    ) -> None:
+        if (
+            not _valid_ref(account_ref)
+            or not _valid_ref(strategy_ref)
+            or not _valid_ref(run_ref)
+        ):
+            raise GatewayQuotaAdmissionError("INVALID_SUBJECT")
+        if instrument_ref is not None and not _valid_ref(instrument_ref):
+            raise GatewayQuotaAdmissionError("INVALID_SUBJECT")
+        if type(operation) is not str:
+            raise GatewayQuotaAdmissionError("INVALID_OPERATION")
+        quota_operation = self._OPERATIONS.get(operation)
+        if quota_operation is None:
+            raise GatewayQuotaAdmissionError("INVALID_OPERATION")
+        if type(deadline_monotonic_ns) is not int:
+            raise GatewayQuotaAdmissionError("INVALID_DEADLINE")
+        subject = GatewayQuotaSubject(
+            account_ref=account_ref,
+            strategy_ref=strategy_ref,
+            instrument_ref=instrument_ref,
+            run_ref=run_ref,
+        )
+        self._admission.admit(subject, quota_operation, deadline_monotonic_ns)
+        return None
+
+    def __repr__(self) -> str:
+        return "<GatewayQuotaDispatchAdmission>"
+
+
 def _subject_digest(subject: GatewayQuotaSubject) -> str:
+    identity = [subject.account_ref, subject.strategy_ref, subject.instrument_ref]
+    if subject.run_ref is not None:
+        identity.append(subject.run_ref)
     payload = json.dumps(
-        [subject.account_ref, subject.strategy_ref, subject.instrument_ref],
+        identity,
         ensure_ascii=True,
         separators=(",", ":"),
     ).encode("ascii")
@@ -792,6 +862,7 @@ def _seconds_to_ns(value: object, *, minimum: float, maximum: float) -> int:
 __all__ = [
     "GatewayQuotaAdmission",
     "GatewayQuotaAdmissionError",
+    "GatewayQuotaDispatchAdmission",
     "GatewayQuotaGrant",
     "GatewayQuotaOperation",
     "GatewayQuotaProviderSession",
