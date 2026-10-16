@@ -24,7 +24,7 @@ import re
 import sqlite3
 import time
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
@@ -87,7 +87,7 @@ class GatewayQuotaAdmissionError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class GatewayQuotaSubject:
-    """Non-secret fairness identity for one account/strategy/run/instrument."""
+    """Non-secret request identity; run metadata does not split fairness buckets."""
 
     account_ref: str
     strategy_ref: Optional[str] = None  # noqa: UP045 -- Gateway package supports Python 3.9.
@@ -114,6 +114,7 @@ class GatewayQuotaGrant:
     sequence: int
     granted_monotonic_ns: int
     subject_digest: str
+    run_digest: Optional[str]
 
 
 class GatewayQuotaAdmission:
@@ -224,6 +225,7 @@ class GatewayQuotaAdmission:
         if type(deadline_monotonic_ns) is not int:
             raise GatewayQuotaAdmissionError("INVALID_DEADLINE")
         subject_digest = _subject_digest(subject)
+        run_digest = _run_digest(subject)
         request_id = uuid.uuid4().hex
         granted = False
         try:
@@ -259,12 +261,13 @@ class GatewayQuotaAdmission:
                 ticket = int(row[0])
                 connection.execute(
                     "INSERT INTO waiters "
-                    "(domain_digest, request_id, subject_digest, operation, deadline_ns, ticket) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    "(domain_digest, request_id, subject_digest, run_digest, operation, "
+                    "deadline_ns, ticket) VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (
                         self._domain_digest,
                         request_id,
                         subject_digest,
+                        run_digest,
                         operation.value,
                         deadline_monotonic_ns,
                         ticket,
@@ -346,12 +349,14 @@ class GatewayQuotaAdmission:
                             grant_id = uuid.uuid4().hex
                             connection.execute(
                                 "INSERT INTO grants "
-                                "(grant_id, domain_digest, subject_digest, operation, "
-                                "granted_ns, sequence) VALUES (?, ?, ?, ?, ?, ?)",
+                                "(grant_id, domain_digest, subject_digest, run_digest, "
+                                "operation, granted_ns, sequence) "
+                                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                                 (
                                     grant_id,
                                     self._domain_digest,
                                     subject_digest,
+                                    run_digest,
                                     operation.value,
                                     now,
                                     sequence,
@@ -390,6 +395,7 @@ class GatewayQuotaAdmission:
                                 sequence=sequence,
                                 granted_monotonic_ns=now,
                                 subject_digest=subject_digest,
+                                run_digest=run_digest,
                             )
                 remaining_seconds = (deadline_monotonic_ns - time.monotonic_ns()) / _NANOSECONDS
                 if remaining_seconds <= 0:
@@ -476,7 +482,7 @@ class GatewayQuotaAdmission:
                     "next_ticket INTEGER NOT NULL, grant_sequence INTEGER NOT NULL);"
                     "CREATE TABLE IF NOT EXISTS waiters ("
                     "domain_digest TEXT NOT NULL, request_id TEXT NOT NULL, "
-                    "subject_digest TEXT NOT NULL, operation TEXT NOT NULL, "
+                    "subject_digest TEXT NOT NULL, run_digest TEXT, operation TEXT NOT NULL, "
                     "deadline_ns INTEGER NOT NULL, ticket INTEGER NOT NULL, "
                     "PRIMARY KEY(domain_digest, request_id), "
                     "UNIQUE(domain_digest, ticket));"
@@ -490,12 +496,20 @@ class GatewayQuotaAdmission:
                     "PRIMARY KEY(domain_digest, subject_digest));"
                     "CREATE TABLE IF NOT EXISTS grants ("
                     "grant_id TEXT PRIMARY KEY, domain_digest TEXT NOT NULL, "
-                    "subject_digest TEXT NOT NULL, operation TEXT NOT NULL, "
+                    "subject_digest TEXT NOT NULL, run_digest TEXT, operation TEXT NOT NULL, "
                     "granted_ns INTEGER NOT NULL, sequence INTEGER NOT NULL, "
                     "UNIQUE(domain_digest, sequence));"
                     "CREATE INDEX IF NOT EXISTS quota_grants_window "
                     "ON grants(domain_digest, granted_ns);"
                 )
+                connection.execute("BEGIN IMMEDIATE")
+                for table in ("waiters", "grants"):
+                    columns = {
+                        str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")
+                    }
+                    if "run_digest" not in columns:
+                        connection.execute(f"ALTER TABLE {table} ADD COLUMN run_digest TEXT")
+                connection.commit()
                 now = time.monotonic_ns()
                 connection.execute(
                     "INSERT OR IGNORE INTO quota_domains "
@@ -687,14 +701,17 @@ class GatewayQuotaProviderSession:
             if self._connect_count == 0
             else GatewayQuotaOperation.RECONNECT
         )
-        self._connect_count += 1
         return self._call(
             "connect",
             operation,
+            on_dispatch=self._record_connect_dispatch,
             account_key=account_key,
             generation=generation,
             timeout=timeout,
         )
+
+    def _record_connect_dispatch(self) -> None:
+        self._connect_count += 1
 
     def read_account(self, *, generation: str, timeout: float) -> object:
         return self._call(
@@ -735,6 +752,8 @@ class GatewayQuotaProviderSession:
         self,
         method_name: str,
         operation: GatewayQuotaOperation,
+        *,
+        on_dispatch: Optional[Callable[[], None]] = None,  # noqa: UP045 -- Python 3.9.
         **arguments: object,
     ) -> object:
         timeout = arguments.get("timeout")
@@ -760,6 +779,8 @@ class GatewayQuotaProviderSession:
         method = getattr(self._provider, method_name)
         call_arguments = dict(arguments)
         call_arguments["timeout"] = remaining
+        if on_dispatch is not None:
+            on_dispatch()
         try:
             return method(**call_arguments)
         except RateLimitError as exc:
@@ -837,14 +858,18 @@ class GatewayQuotaDispatchAdmission:
 
 def _subject_digest(subject: GatewayQuotaSubject) -> str:
     identity = [subject.account_ref, subject.strategy_ref, subject.instrument_ref]
-    if subject.run_ref is not None:
-        identity.append(subject.run_ref)
     payload = json.dumps(
         identity,
         ensure_ascii=True,
         separators=(",", ":"),
     ).encode("ascii")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _run_digest(subject: GatewayQuotaSubject) -> Optional[str]:
+    if subject.run_ref is None:
+        return None
+    return hashlib.sha256(subject.run_ref.encode("ascii")).hexdigest()
 
 
 def _valid_ref(value: object) -> bool:
