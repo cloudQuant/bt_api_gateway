@@ -40,6 +40,14 @@ from .account_view_projection import (
     project_account_view,
     validate_policy_set,
 )
+from .account_position_snapshot import (
+    GatewayFullPositionSnapshot,
+    GatewayFullPositionSnapshotReceipt,
+    GatewayPositionSnapshotError,
+    position_rows_sha256,
+    resource_coverage_sha256,
+    utc_timestamp_ns,
+)
 from .event_journal import (
     GatewayAccountSnapshot,
     GatewayEventJournal,
@@ -69,8 +77,10 @@ class GatewayAccountSessionProvider(Protocol):
     def connect(self, *, account_key: AccountKey, generation: str, timeout: float) -> None:
         """Open the selected account read session within the adapter timeout."""
 
-    def read_account(self, *, generation: str, timeout: float) -> AccountObservation:
-        """Return one complete, bounded observation for the exact account."""
+    def read_account(
+        self, *, generation: str, timeout: float
+    ) -> AccountObservation | GatewayFullPositionSnapshot:
+        """Return an observation, optionally with trusted full-position coverage."""
 
     def close(self) -> Optional[bool]:  # noqa: UP045 -- Python 3.9 support.
         """Close idempotently; only None or literal True confirms success."""
@@ -181,6 +191,7 @@ class GatewayAccountSessionWorker:
         self._cursor = 0
         self._latest_snapshot: Optional[GatewayAccountSnapshot] = None  # noqa: UP045
         self._latest_observation: Optional[AccountObservation] = None  # noqa: UP045
+        self._latest_position_source: Optional[GatewayFullPositionSnapshot] = None  # noqa: UP045
         self._last_observation_id: Optional[str] = None  # noqa: UP045
         self._last_observation_digest: Optional[str] = None  # noqa: UP045
         self._last_completed_at: Optional[datetime] = None  # noqa: UP045
@@ -442,6 +453,96 @@ class GatewayAccountSessionWorker:
         except GatewayCertificationFactsError as exc:
             raise GatewayAccountSessionWorkerError(exc.code) from None
 
+    def read_full_position_snapshot_receipt(self) -> GatewayFullPositionSnapshotReceipt:
+        """Issue a non-wire receipt for this owner's current full position snapshot.
+
+        A bare serialized account.snapshot, including its completeness flags,
+        cannot be converted into this receipt. The provider must have returned
+        the trusted full-query result for the same current session generation.
+        """
+
+        generation = self._active_fact_generation()
+        source = self._latest_position_source
+        observation = self._latest_observation
+        snapshot = self._latest_snapshot
+        if source is None or observation is None or snapshot is None:
+            raise GatewayAccountSessionWorkerError("POSITION_SNAPSHOT_PROOF_UNAVAILABLE")
+        self._validate_full_position_source(source, observation, generation)
+        observed_at_ns = source.observed_at_ns
+        valid_until_ns = min(
+            source.valid_until_ns,
+            observed_at_ns + int(self._max_staleness * 1_000_000_000),
+        )
+        if valid_until_ns <= int(self._wall_clock() * 1_000_000_000):
+            raise GatewayAccountSessionWorkerError("POSITION_SNAPSHOT_PROOF_STALE")
+        receipt = GatewayFullPositionSnapshotReceipt(
+            _issuer=self,
+            _snapshot=snapshot,
+            _source=source,
+            account_key=self._account_key,
+            observation=observation,
+            session_generation=generation,
+            snapshot_cursor=snapshot.cursor,
+            valid_until_ns=valid_until_ns,
+        )
+        self._assert_current_position_snapshot_receipt(receipt)
+        return receipt
+
+    def _assert_current_position_snapshot_receipt(
+        self, receipt: GatewayFullPositionSnapshotReceipt
+    ) -> None:
+        self._check_owner()
+        if (
+            type(receipt) is not GatewayFullPositionSnapshotReceipt
+            or receipt._issuer is not self
+            or receipt._snapshot is not self._latest_snapshot
+            or receipt._source is not self._latest_position_source
+            or receipt.observation is not self._latest_observation
+            or receipt.account_key is not self._account_key
+        ):
+            raise GatewayAccountSessionWorkerError("POSITION_SNAPSHOT_RECEIPT_STALE")
+        generation = self._active_fact_generation()
+        if (
+            receipt.session_generation != generation
+            or self._latest_snapshot is None
+            or receipt.snapshot_cursor != self._latest_snapshot.cursor
+        ):
+            raise GatewayAccountSessionWorkerError("POSITION_SNAPSHOT_RECEIPT_STALE")
+        self._validate_full_position_source(
+            receipt._source, receipt.observation, generation
+        )
+        if receipt.valid_until_ns <= int(self._wall_clock() * 1_000_000_000):
+            raise GatewayAccountSessionWorkerError("POSITION_SNAPSHOT_RECEIPT_STALE")
+
+    def _validate_full_position_source(
+        self,
+        source: GatewayFullPositionSnapshot,
+        observation: AccountObservation,
+        generation: str,
+    ) -> None:
+        try:
+            valid = (
+                type(source) is GatewayFullPositionSnapshot
+                and source.observation is observation
+                and source.account_key_id == self._account_key.account_key_id
+                and source.session_generation == generation
+                and source.observation.account_key == self._account_key
+                and source.observation.positions_complete is True
+                and source.query_scope == "ALL_ACCOUNT_POSITIONS"
+                and source.filters == ()
+                and source.permission_scope == "ACCOUNT_FULL"
+                and source.pagination_exhausted is True
+                and source.positions_sha256 == position_rows_sha256(observation)
+                and source.resource_coverage_sha256 == resource_coverage_sha256(observation)
+                and source.observed_at_ns
+                == utc_timestamp_ns(observation.completed_at_utc)
+                and source.valid_until_ns > source.observed_at_ns
+            )
+        except GatewayPositionSnapshotError:
+            valid = False
+        if not valid:
+            raise GatewayAccountSessionWorkerError("POSITION_SNAPSHOT_SOURCE_INVALID")
+
     def _active_fact_generation(self) -> str:
         self._check_owner()
         generation = self._generation
@@ -465,10 +566,16 @@ class GatewayAccountSessionWorker:
             if generation is None or not self._connect_attempted:
                 raise GatewayAccountSessionWorkerError("SESSION_NOT_ACTIVE")
             self._assert_current_generation_owned(generation)
-            observation = self._provider.read_account(
+            provider_result = self._provider.read_account(
                 generation=generation,
                 timeout=self._request_timeout,
             )
+            if type(provider_result) is GatewayFullPositionSnapshot:
+                position_source: Optional[GatewayFullPositionSnapshot] = provider_result
+                observation = provider_result.observation
+            else:
+                position_source = None
+                observation = provider_result
             end_monotonic = self._monotonic_now()
             self._assert_current_generation_owned(generation)
             if end_monotonic < start_monotonic:
@@ -480,6 +587,8 @@ class GatewayAccountSessionWorker:
                 raise GatewayAccountSessionWorkerError("MONOTONIC_CLOCK_REGRESSED")
             phase = "observation_validation"
             row_times, completed_at = self._validate_observation(observation, now=logical_wall)
+            if position_source is not None:
+                self._validate_full_position_source(position_source, observation, generation)
             if any("open_orders" in policy.fact_kinds for policy in self._view_policies) and (
                 observation.open_orders is None or not observation.open_orders_complete
             ):
@@ -494,6 +603,18 @@ class GatewayAccountSessionWorker:
             if observation.observation_id == self._last_observation_id:
                 if digest != self._last_observation_digest:
                     raise GatewayAccountSessionWorkerError("OBSERVATION_ID_REUSED")
+                previous_source_digest = (
+                    None
+                    if self._latest_position_source is None
+                    else _canonical_json(self._latest_position_source.source_payload())
+                )
+                current_source_digest = (
+                    None
+                    if position_source is None
+                    else _canonical_json(position_source.source_payload())
+                )
+                if previous_source_digest != current_source_digest:
+                    raise GatewayAccountSessionWorkerError("POSITION_SOURCE_ID_REUSED")
                 if self._latest_snapshot is None:
                     raise GatewayAccountSessionWorkerError("CURRENT_BASELINE_MISSING")
                 self._next_refresh_monotonic = end_monotonic + self._refresh_interval
@@ -542,6 +663,7 @@ class GatewayAccountSessionWorker:
             self._cursor = snapshot.cursor
             self._latest_snapshot = snapshot
             self._latest_observation = observation
+            self._latest_position_source = position_source
             self._last_observation_id = observation.observation_id
             self._last_observation_digest = digest
             self._last_completed_at = completed_at
@@ -744,6 +866,7 @@ class GatewayAccountSessionWorker:
         self._generation = None
         self._cursor = 0
         self._latest_observation = None
+        self._latest_position_source = None
         self._last_observation_id = None
         self._last_observation_digest = None
         self._last_completed_at = None
