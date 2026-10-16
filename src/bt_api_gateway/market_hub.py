@@ -35,6 +35,7 @@ from bt_api_base.market_protocol import (
     MARKET_EVENT_OPERATION,
     MARKET_EVENT_SCHEMA,
     MARKET_EVENT_SCHEMA_VERSION,
+    MarketProviderEvent,
     MarketSubscriptionKey,
 )
 from bt_api_base.service_protocol import (
@@ -75,6 +76,8 @@ MAX_MARKET_EVENT_BYTES = 256 * 1024
 MAX_MARKET_READ_PAGE_BYTES = 896 * 1024
 MAX_MARKET_REPLAY_EVENTS = 10_000
 MAX_MARKET_HISTORY_TIMEOUT_SECONDS = 300.0
+DEFAULT_MARKET_PROVIDER_POLL_LIMIT = 32
+MAX_MARKET_PROVIDER_POLL_LIMIT = 256
 
 _UTC_TIMESTAMP_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$")
 _MAPPING_PROXY_TYPE = type(MappingProxyType({}))
@@ -94,7 +97,7 @@ class GatewayMarketServiceError(GatewayMarketHubError):
 
 
 class MarketProvider(Protocol):
-    """Synchronous provider edge owned and invoked on the hub's owner thread.
+    """Synchronous subscription edge owned by the hub's owner thread.
 
     A provider implementation must either return a handle for an acquired
     subscription or raise before acquiring one. If it cannot establish that
@@ -103,9 +106,10 @@ class MarketProvider(Protocol):
 
     A successful call must return a non-``None`` handle. Raising or returning
     ``None`` means acquisition did not happen; the hub cannot safely recover a
-    handle that the provider acquired but failed to return. The provider must
-    emit events only after acquisition returns, and retain the supplied
-    generation with every queued event so old callbacks can be rejected.
+    handle that the provider acquired but failed to return. Manual-publish
+    providers may deliver events through ``GatewayMarketHub.publish`` on the
+    owner thread. Providers with worker-thread callbacks may instead implement
+    ``MarketProviderPolling`` and queue observations for ``maintain`` to drain.
     """
 
     def subscribe(self, key: MarketSubscriptionKey, *, generation: str) -> object:
@@ -117,6 +121,23 @@ class MarketProvider(Protocol):
         ``False`` or an exception means the hub retains the exact handle and
         retries it later. The provider must accept that same handle again even
         if the previous call already stopped its upstream subscription.
+        """
+
+
+class MarketProviderPolling(Protocol):
+    """Optional nonblocking queue-drain capability for a market provider.
+
+    Implementations retain the Hub-supplied generation with every queued
+    observation. The Hub calls ``poll`` on its owner thread with a finite
+    per-call limit; callbacks running on other threads must enqueue immutable
+    observations and must not publish directly.
+    """
+
+    def poll(self, handle: object, *, limit: int) -> tuple[MarketProviderEvent, ...]:
+        """Return at most ``limit`` already-queued observations without blocking.
+
+        An empty tuple means the queue is currently drained. The Hub does not
+        synthesize events when this optional capability is absent.
         """
 
 
@@ -211,6 +232,7 @@ class GatewayMarketHub:
         service_scope: WireScope,
         max_replay_events: int = 1_000,
         max_replay_bytes: int = 256 * 1024,
+        max_provider_events_per_maintain: int = DEFAULT_MARKET_PROVIDER_POLL_LIMIT,
         publisher: Optional[Callable[[WireEnvelope], object]] = None,  # noqa: UP045
         epoch_factory: Optional[Callable[[], str]] = None,  # noqa: UP045 -- Python 3.9 support.
         history_provider: Optional[MarketHistoryProvider] = None,  # noqa: UP045
@@ -226,6 +248,11 @@ class GatewayMarketHub:
             raise GatewayMarketHubError("INVALID_REPLAY_LIMIT")
         if type(max_replay_bytes) is not int or max_replay_bytes <= 0:
             raise GatewayMarketHubError("INVALID_REPLAY_LIMIT")
+        if (
+            type(max_provider_events_per_maintain) is not int
+            or not 1 <= max_provider_events_per_maintain <= MAX_MARKET_PROVIDER_POLL_LIMIT
+        ):
+            raise GatewayMarketHubError("INVALID_PROVIDER_POLL_LIMIT")
         if publisher is not None and not callable(publisher):
             raise GatewayMarketHubError("INVALID_PUBLISHER")
         if epoch_factory is not None and not callable(epoch_factory):
@@ -243,18 +270,32 @@ class GatewayMarketHub:
         _validate_service_wire_scope(service_identity, service_scope)
 
         self._provider = provider
+        provider_poll = getattr(provider, "poll", None)
+        self._provider_poller = provider_poll if callable(provider_poll) else None
         self._key_universe = frozenset(copied_keys)
         self._principal_allowed_keys = MappingProxyType(copied_acl)
         self._service_identity = service_identity
         self._service_scope = service_scope
         self._max_replay_events = max_replay_events
         self._max_replay_bytes = max_replay_bytes
+        self._max_provider_events_per_maintain = max_provider_events_per_maintain
         self._publisher = publisher
         self._epoch_factory = epoch_factory or (lambda: uuid.uuid4().hex)
         self._history_provider = history_provider
         self._history_timeout_seconds = normalized_history_timeout
         self._owner_thread_id = threading.get_ident()
         self._closing = False
+        self._provider_poll_cursor = 0
+        self._source_diagnostics = {
+            "provider_poll_calls": 0,
+            "provider_events_polled": 0,
+            "provider_events_published": 0,
+            "stale_generation_events_dropped": 0,
+            "provider_poll_failures": 0,
+            "provider_invalid_batches": 0,
+            "provider_invalid_events": 0,
+            "provider_event_rejections": 0,
+        }
         self._streams: dict[MarketSubscriptionKey, _MarketStream] = {}
         self._stream_by_id: dict[str, MarketSubscriptionKey] = {}
         self._registration_ref_count = 0
@@ -345,6 +386,11 @@ class GatewayMarketHub:
                 "exported_keys": len(self._key_universe),
             }
         )
+
+    @property
+    def source_diagnostics(self) -> Mapping[str, int]:
+        """Finite counters for owner-thread provider polling and projection."""
+        return MappingProxyType(dict(self._source_diagnostics))
 
     def validate_audience(
         self,
@@ -518,6 +564,7 @@ class GatewayMarketHub:
             for stream in self._streams.values()
             if stream.handle is not None and not stream.registrations
         )
+        self._drain_provider_events()
         return MappingProxyType(
             {
                 "pruned_registrations": pruned,
@@ -525,6 +572,84 @@ class GatewayMarketHub:
                 "pending_releases": pending,
             }
         )
+
+    def _drain_provider_events(self) -> None:
+        """Poll active provider handles fairly under a strict per-maintain cap."""
+        poller = self._provider_poller
+        if poller is None:
+            return
+        streams = tuple(
+            stream
+            for stream in self._streams.values()
+            if (
+                stream.handle is not None
+                and stream.registrations
+                and not stream.starting
+                and not stream.releasing
+                and not stream.pending_release
+                and stream.generation is not None
+            )
+        )
+        if not streams:
+            self._provider_poll_cursor = 0
+            return
+
+        poll_limit = self._max_provider_events_per_maintain
+        cursor = self._provider_poll_cursor % len(streams)
+        exhausted: set[int] = set()
+        calls = 0
+        returned_events = 0
+        while calls < poll_limit and returned_events < poll_limit and len(exhausted) < len(streams):
+            stream_index = None
+            for offset in range(len(streams)):
+                candidate = (cursor + offset) % len(streams)
+                if candidate not in exhausted:
+                    stream_index = candidate
+                    break
+            if stream_index is None:
+                break
+
+            stream = streams[stream_index]
+            cursor = (stream_index + 1) % len(streams)
+            self._provider_poll_cursor = cursor
+            calls += 1
+            self._source_diagnostics["provider_poll_calls"] += 1
+            try:
+                batch = poller(stream.handle, limit=1)
+            except Exception:
+                self._source_diagnostics["provider_poll_failures"] += 1
+                exhausted.add(stream_index)
+                continue
+            if type(batch) is not tuple or len(batch) > 1:
+                self._source_diagnostics["provider_invalid_batches"] += 1
+                exhausted.add(stream_index)
+                continue
+            if not batch:
+                exhausted.add(stream_index)
+                continue
+
+            event = batch[0]
+            returned_events += 1
+            self._source_diagnostics["provider_events_polled"] += 1
+            if type(event) is not MarketProviderEvent:
+                self._source_diagnostics["provider_invalid_events"] += 1
+                continue
+            try:
+                self.publish(
+                    stream.key,
+                    event.data,
+                    event.observed_at_utc,
+                    generation=event.generation,
+                )
+            except GatewayMarketHubError as error:
+                if error.code == "STALE_SOURCE_GENERATION":
+                    self._source_diagnostics["stale_generation_events_dropped"] += 1
+                else:
+                    self._source_diagnostics["provider_event_rejections"] += 1
+            except Exception:
+                self._source_diagnostics["provider_event_rejections"] += 1
+            else:
+                self._source_diagnostics["provider_events_published"] += 1
 
     def publish(
         self,
@@ -1260,5 +1385,6 @@ __all__ = [
     "MAX_MARKET_REPLAY_EVENTS",
     "MAX_TOTAL_MARKET_REPLAY_BYTES",
     "MarketProvider",
+    "MarketProviderPolling",
     "MarketHistoryProvider",
 ]

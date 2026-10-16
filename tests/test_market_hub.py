@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 from itertools import count
+import threading
 from typing import Any
 
 import pytest
-from bt_api_base.market_protocol import MarketInstrumentKey, MarketSubscriptionKey
+from bt_api_base.market_protocol import (
+    MarketInstrumentKey,
+    MarketProviderEvent,
+    MarketSubscriptionKey,
+)
 from bt_api_base.service_protocol import WireIdentity, WireRole, WireScope, encode_envelope
 
 from bt_api_gateway.market_hub import (
@@ -28,6 +33,8 @@ class CountedProvider:
         self.unsubscribed: list[object] = []
         self.active_handles: set[object] = set()
         self.generations: dict[MarketSubscriptionKey, str] = {}
+        self.pending_events: dict[object, list[MarketProviderEvent]] = {}
+        self.poll_calls: list[tuple[object, int, int]] = []
         self.fail_unsubscribe = 0
 
     def subscribe(self, key: MarketSubscriptionKey, *, generation: str) -> object:
@@ -35,6 +42,7 @@ class CountedProvider:
         self.subscribed.append((key, handle))
         self.active_handles.add(handle)
         self.generations[key] = generation
+        self.pending_events[handle] = []
         return handle
 
     def unsubscribe(self, handle: object) -> bool:
@@ -46,6 +54,17 @@ class CountedProvider:
             self.fail_unsubscribe -= 1
             return False
         return True
+
+    def poll(self, handle: object, *, limit: int) -> tuple[MarketProviderEvent, ...]:
+        self.poll_calls.append((handle, limit, threading.get_ident()))
+        events = self.pending_events.setdefault(handle, [])
+        batch = tuple(events[:limit])
+        del events[:limit]
+        return batch
+
+    def enqueue(self, key: MarketSubscriptionKey, event: MarketProviderEvent) -> None:
+        handle = next(handle for subscribed_key, handle in self.subscribed if subscribed_key == key)
+        self.pending_events[handle].append(event)
 
 
 def _key(**changes: Any) -> MarketSubscriptionKey:
@@ -91,6 +110,7 @@ def _hub(
     *,
     max_replay_events: int = 1_000,
     max_replay_bytes: int = 256 * 1024,
+    max_provider_events_per_maintain: int = 32,
     publisher: Any = None,
 ) -> tuple[GatewayMarketHub, CountedProvider, list[Any]]:
     exported = keys or (_key(),)
@@ -105,6 +125,7 @@ def _hub(
         service_scope=_scope(),
         max_replay_events=max_replay_events,
         max_replay_bytes=max_replay_bytes,
+        max_provider_events_per_maintain=max_provider_events_per_maintain,
         epoch_factory=lambda: f"epoch-{next(epochs)}",
     )
     hub.set_publisher(publisher or published.append)
@@ -123,6 +144,65 @@ def _publish(
         f"2026-10-14T10:00:{n:02d}Z",
         generation=provider.generations[key],
     )
+
+
+def test_manual_publish_provider_without_poll_remains_supported() -> None:
+    key = _key()
+
+    class ManualPublishProvider:
+        def __init__(self) -> None:
+            self.generation: str | None = None
+
+        def subscribe(self, _key: MarketSubscriptionKey, *, generation: str) -> object:
+            self.generation = generation
+            return object()
+
+        def unsubscribe(self, _handle: object) -> bool:
+            return True
+
+    provider = ManualPublishProvider()
+    published: list[Any] = []
+    hub = GatewayMarketHub(
+        provider,
+        key_universe=(key,),
+        principal_allowed_keys={"principal:a": (key,)},
+        service_identity=_identity(),
+        service_scope=_scope(),
+    )
+    hub.set_publisher(published.append)
+    hub.subscribe("principal:a", key, "registration:a")
+
+    result = hub.maintain({"registration:a"})
+    assert result == {
+        "pruned_registrations": 0,
+        "released_upstreams": 0,
+        "pending_releases": 0,
+    }
+    assert published == []
+    assert dict(hub.source_diagnostics) == {
+        "provider_poll_calls": 0,
+        "provider_events_polled": 0,
+        "provider_events_published": 0,
+        "stale_generation_events_dropped": 0,
+        "provider_poll_failures": 0,
+        "provider_invalid_batches": 0,
+        "provider_invalid_events": 0,
+        "provider_event_rejections": 0,
+    }
+
+    assert provider.generation is not None
+    hub.publish(
+        key,
+        {"symbol": key.instrument.native_symbol, "price": 101.5},
+        "2026-10-16T10:00:01Z",
+        generation=provider.generation,
+    )
+
+    (event,) = published
+    assert event.payload == {
+        "key": key.to_dict(),
+        "data": {"symbol": "TST-USD", "price": 101.5},
+    }
 
 
 def test_two_registration_refs_share_one_provider_start_and_last_release() -> None:
@@ -452,6 +532,102 @@ def test_explicit_maintenance_prunes_only_owner_declared_inactive_refs() -> None
     assert result["pruned_registrations"] == 1
     assert result["released_upstreams"] == 1
     assert len(provider.unsubscribed) == 1
+
+
+def test_maintain_publishes_provider_events_on_owner_thread_with_existing_wire_shape() -> None:
+    key = _key()
+    hub, provider, published = _hub()
+    owner_thread = threading.get_ident()
+    hub.subscribe("principal:a", key, "registration:a")
+    provider.enqueue(
+        key,
+        MarketProviderEvent(
+            generation=provider.generations[key],
+            observed_at_utc="2026-10-16T10:00:01Z",
+            data={"symbol": "TST-USD", "price": 101.5},
+        ),
+    )
+
+    result = hub.maintain({"registration:a"})
+
+    event = published[0]
+    assert result == {
+        "pruned_registrations": 0,
+        "released_upstreams": 0,
+        "pending_releases": 0,
+    }
+    assert event.header.schema_id == "sdk.market.event"
+    assert event.header.operation == "market.event"
+    assert event.payload == {"key": key.to_dict(), "data": {"symbol": "TST-USD", "price": 101.5}}
+    assert "generation" not in event.payload
+    assert provider.poll_calls == [
+        (provider.subscribed[0][1], 1, owner_thread),
+        (provider.subscribed[0][1], 1, owner_thread),
+    ]
+    assert dict(hub.source_diagnostics) == {
+        "provider_poll_calls": 2,
+        "provider_events_polled": 1,
+        "provider_events_published": 1,
+        "stale_generation_events_dropped": 0,
+        "provider_poll_failures": 0,
+        "provider_invalid_batches": 0,
+        "provider_invalid_events": 0,
+        "provider_event_rejections": 0,
+    }
+
+
+def test_maintain_uses_a_finite_round_robin_provider_poll_budget() -> None:
+    first = _key()
+    second = _key(source_ref="source:second")
+    hub, provider, published = _hub(
+        (first, second), max_provider_events_per_maintain=4
+    )
+    hub.subscribe("principal:a", first, "registration:a")
+    hub.subscribe("principal:a", second, "registration:b")
+    for key in (first, second):
+        for index in range(10):
+            provider.enqueue(
+                key,
+                MarketProviderEvent(
+                    generation=provider.generations[key],
+                    observed_at_utc=f"2026-10-16T10:00:{index:02d}Z",
+                    data={"price": index + 1},
+                ),
+            )
+
+    hub.maintain({"registration:a", "registration:b"})
+
+    first_handle = provider.subscribed[0][1]
+    second_handle = provider.subscribed[1][1]
+    assert len(published) == 4
+    assert [handle for handle, limit, _thread in provider.poll_calls] == [
+        first_handle,
+        second_handle,
+        first_handle,
+        second_handle,
+    ]
+    assert all(limit == 1 for _handle, limit, _thread in provider.poll_calls)
+    assert dict(hub.source_diagnostics)["provider_events_polled"] == 4
+
+
+def test_maintain_drops_stale_generation_events_before_replay_or_publication() -> None:
+    key = _key()
+    hub, provider, published = _hub()
+    hub.subscribe("principal:a", key, "registration:a")
+    provider.enqueue(
+        key,
+        MarketProviderEvent(
+            generation="previous-acquisition-generation",
+            observed_at_utc="2026-10-16T10:00:01Z",
+            data={"price": 101.5},
+        ),
+    )
+
+    hub.maintain({"registration:a"})
+
+    assert published == []
+    assert hub.head(key)["head"] == 0
+    assert dict(hub.source_diagnostics)["stale_generation_events_dropped"] == 1
 
 
 def test_replay_event_is_bounded_and_wire_payload_has_only_key_and_data() -> None:

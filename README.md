@@ -45,6 +45,22 @@ sharing, or proof of a coherent provider account snapshot.
 The network transport (including the ZMQ adapter) remains a separate
 package and must authenticate clients before it creates a `GatewayPrincipal`.
 
+## Market hub provider event delivery
+
+`GatewayMarketHub` requires providers to implement `subscribe` and
+`unsubscribe`. Event polling is a separate optional `MarketProviderPolling`
+capability. Existing providers without a callable `poll` remain compatible:
+they may publish through `GatewayMarketHub.publish` on the hub's owner thread,
+and `maintain` does not invent events for them.
+
+Polling providers enqueue immutable `MarketProviderEvent` values in their
+worker-thread callbacks and implement nonblocking `poll(handle, limit=...)`.
+The hub calls that method only from owner-thread `maintain`, with a bounded
+per-call and per-maintenance budget. Each event carries an acquisition
+generation that the hub checks before retaining or publishing; the generation
+is not part of the public `sdk.market.event` payload. Providers must not call
+`publish` from a callback thread.
+
 ## Durable consumer progress
 
 `GatewayEventJournal.read_for_consumer` returns a bounded snapshot/replay page

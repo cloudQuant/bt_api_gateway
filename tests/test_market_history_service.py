@@ -42,6 +42,10 @@ class SubscriptionProvider:
         self.unsubscribed.append(handle)
         return True
 
+    def poll(self, handle: object, *, limit: int) -> tuple[Any, ...]:
+        del handle, limit
+        return ()
+
 
 class HistoryProvider:
     def __init__(self, result: object = None, error: Exception | None = None) -> None:
