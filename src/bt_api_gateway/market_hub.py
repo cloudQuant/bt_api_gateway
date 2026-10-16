@@ -237,6 +237,10 @@ class GatewayMarketHub:
         epoch_factory: Optional[Callable[[], str]] = None,  # noqa: UP045 -- Python 3.9 support.
         history_provider: Optional[MarketHistoryProvider] = None,  # noqa: UP045
         history_timeout_seconds: Optional[float] = None,  # noqa: UP045
+        history_key_universe: Optional[Collection[MarketSubscriptionKey]] = None,  # noqa: UP045
+        principal_allowed_history_keys: Optional[
+            Mapping[str, Collection[MarketSubscriptionKey]]
+        ] = None,  # noqa: UP045
     ) -> None:
         if not callable(getattr(provider, "subscribe", None)) or not callable(
             getattr(provider, "unsubscribe", None)
@@ -267,6 +271,13 @@ class GatewayMarketHub:
         if len(copied_keys) * max_replay_bytes > MAX_TOTAL_MARKET_REPLAY_BYTES:
             raise GatewayMarketHubError("TOTAL_REPLAY_BUDGET_EXCEEDED")
         copied_acl = _copy_market_acl(principal_allowed_keys, copied_keys)
+        copied_history_keys, copied_history_acl = _copy_market_history_acl(
+            history_provider,
+            copied_keys,
+            copied_acl,
+            history_key_universe,
+            principal_allowed_history_keys,
+        )
         _validate_service_wire_scope(service_identity, service_scope)
 
         self._provider = provider
@@ -283,6 +294,8 @@ class GatewayMarketHub:
         self._epoch_factory = epoch_factory or (lambda: uuid.uuid4().hex)
         self._history_provider = history_provider
         self._history_timeout_seconds = normalized_history_timeout
+        self._history_key_universe = frozenset(copied_history_keys)
+        self._principal_allowed_history_keys = MappingProxyType(copied_history_acl)
         self._owner_thread_id = threading.get_ident()
         self._closing = False
         self._provider_poll_cursor = 0
@@ -351,6 +364,18 @@ class GatewayMarketHub:
     def history_enabled(self) -> bool:
         """Whether a trusted historical data provider was configured."""
         return self._history_provider is not None
+
+    @property
+    def history_key_universe(self) -> frozenset[MarketSubscriptionKey]:
+        """The separately authorized set of keys accepted by ``market.history``."""
+        return self._history_key_universe
+
+    @property
+    def principal_allowed_history_keys(
+        self,
+    ) -> Mapping[str, frozenset[MarketSubscriptionKey]]:
+        """The copied per-principal ACL for historical requests."""
+        return self._principal_allowed_history_keys
 
     @property
     def ready(self) -> bool:
@@ -836,7 +861,7 @@ class GatewayMarketHub:
             raise GatewayMarketHubError("HISTORY_NOT_CONFIGURED")
         if type(request) is not MarketHistoryRequest:
             raise GatewayMarketHubError("INVALID_HISTORY_REQUEST")
-        self._authorize_key(principal_ref, request.key)
+        self._authorize_history_key(principal_ref, request.key)
 
         started = time.monotonic()
         try:
@@ -917,6 +942,20 @@ class GatewayMarketHub:
         if key not in allowed:
             raise GatewayMarketHubError("MARKET_KEY_DENIED")
         return stream
+
+    def _authorize_history_key(
+        self, principal_ref: str, key: MarketSubscriptionKey
+    ) -> None:
+        _require_reference(principal_ref, "INVALID_PRINCIPAL_REF")
+        allowed = self._principal_allowed_history_keys.get(principal_ref)
+        if allowed is None:
+            raise GatewayMarketHubError("UNKNOWN_PRINCIPAL")
+        if type(key) is not MarketSubscriptionKey:
+            raise GatewayMarketHubError("INVALID_MARKET_KEY")
+        if key not in self._history_key_universe:
+            raise GatewayMarketHubError("HISTORY_KEY_NOT_EXPORTED")
+        if key not in allowed:
+            raise GatewayMarketHubError("MARKET_KEY_DENIED")
 
     def _stream(self, key: MarketSubscriptionKey) -> _MarketStream:
         if type(key) is not MarketSubscriptionKey:
@@ -1208,6 +1247,56 @@ def _copy_market_acl(
             raise GatewayMarketHubError("INCOMPLETE_MARKET_AUDIENCE")
         copied[principal_ref] = allowed
     return copied
+
+
+def _copy_market_history_acl(
+    provider: Optional[MarketHistoryProvider],  # noqa: UP045 -- Python 3.9 support.
+    stream_keys: tuple[MarketSubscriptionKey, ...],
+    stream_acl: Mapping[str, frozenset[MarketSubscriptionKey]],
+    history_keys: Optional[Collection[MarketSubscriptionKey]],  # noqa: UP045
+    history_acl: Optional[
+        Mapping[str, Collection[MarketSubscriptionKey]]
+    ],  # noqa: UP045
+) -> tuple[tuple[MarketSubscriptionKey, ...], dict[str, frozenset[MarketSubscriptionKey]]]:
+    """Copy history-only keys without adding them to the live stream audience.
+
+    Existing direct Hub callers that configure a history provider without an
+    explicit history audience retain the original shared-key behavior. New
+    operator compositions pass both history-only fields so a bar entitlement
+    cannot also become a live-subscription entitlement.
+    """
+    if provider is None:
+        if history_keys is not None or history_acl is not None:
+            raise GatewayMarketHubError("HISTORY_ACL_WITHOUT_PROVIDER")
+        return (), {}
+    if history_keys is None and history_acl is None:
+        return stream_keys, dict(stream_acl)
+    if history_keys is None or history_acl is None:
+        raise GatewayMarketHubError("INCOMPLETE_HISTORY_ACL")
+
+    copied_keys = _copy_key_universe(history_keys)
+    if len(copied_keys) > MAX_MARKET_KEY_UNIVERSE:
+        raise GatewayMarketHubError("HISTORY_KEY_UNIVERSE_TOO_LARGE")
+    if any(key.channel != "bar" for key in copied_keys):
+        raise GatewayMarketHubError("INVALID_HISTORY_KEY_UNIVERSE")
+    if frozenset(copied_keys).intersection(stream_keys):
+        raise GatewayMarketHubError("HISTORY_KEY_OVERLAPS_STREAM_UNIVERSE")
+    if not isinstance(history_acl, Mapping) or set(history_acl) != set(stream_acl):
+        raise GatewayMarketHubError("INVALID_HISTORY_ACL")
+
+    universe = frozenset(copied_keys)
+    copied_acl: dict[str, frozenset[MarketSubscriptionKey]] = {}
+    for principal_ref, allowed_keys in history_acl.items():
+        _require_reference(principal_ref, "INVALID_HISTORY_ACL")
+        if type(allowed_keys) not in (tuple, list, set, frozenset):
+            raise GatewayMarketHubError("INVALID_HISTORY_ACL")
+        allowed = frozenset(allowed_keys)
+        if any(type(key) is not MarketSubscriptionKey for key in allowed):
+            raise GatewayMarketHubError("INVALID_HISTORY_ACL")
+        if not allowed <= universe:
+            raise GatewayMarketHubError("INCOMPLETE_HISTORY_AUDIENCE")
+        copied_acl[principal_ref] = allowed
+    return copied_keys, copied_acl
 
 
 def _copy_principal_refs(values: Collection[str]) -> tuple[str, ...]:

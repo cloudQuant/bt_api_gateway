@@ -226,6 +226,64 @@ def test_history_fetch_uses_exact_request_without_live_subscription_or_cache() -
     assert hub.readiness["active_upstreams"] == 0
 
 
+def test_history_acl_is_separate_from_stream_subscription_acl() -> None:
+    stream_key = _key(channel="tickers", timeframe=None)
+    history_key = _key()
+    request = _request(key=history_key)
+    history = HistoryProvider(_page(request))
+    stream_provider = SubscriptionProvider()
+    hub = GatewayMarketHub(
+        stream_provider,
+        key_universe=(stream_key,),
+        principal_allowed_keys={
+            "principal:alpha": (stream_key,),
+            "principal:beta": (stream_key,),
+        },
+        service_identity=WireIdentity(
+            role=WireRole.SERVICE,
+            principal_ref="service:market",
+            actor_ref="actor:gateway",
+        ),
+        service_scope=WireScope(execution_domain_ref="domain:paper"),
+        publisher=lambda _event: True,
+        history_provider=history,
+        history_timeout_seconds=1.0,
+        history_key_universe=(history_key,),
+        principal_allowed_history_keys={
+            "principal:alpha": (history_key,),
+            "principal:beta": (),
+        },
+    )
+    service = GatewayMarketService(
+        hub,
+        registrations={
+            "registration:alpha": GatewayMarketRegistration(
+                principal_ref="principal:alpha",
+                execution_domain_ref="domain:paper",
+            ),
+            "registration:beta": GatewayMarketRegistration(
+                principal_ref="principal:beta",
+                execution_domain_ref="domain:paper",
+            ),
+        },
+    )
+
+    assert _call(service, request, registration_id="registration:alpha") == _page(request).to_dict()
+    assert not stream_provider.subscribed
+    with pytest.raises(GatewayMarketHubError, match="MARKET_KEY_NOT_EXPORTED"):
+        service.handle(
+            "market.subscribe",
+            principal_ref="principal:alpha",
+            scope=WireScope(execution_domain_ref="domain:paper"),
+            arguments={"key": history_key.to_dict()},
+            registration_id="registration:alpha",
+        )
+    with pytest.raises(GatewayMarketServiceError, match="MARKET_KEY_DENIED"):
+        _call(service, request, principal_ref="principal:beta", registration_id="registration:beta")
+    assert len(history.calls) == 1
+    assert not stream_provider.subscribed
+
+
 def test_exact_history_request_fields_are_required_before_provider_call() -> None:
     provider = HistoryProvider(_page())
     _, service, _ = _runtime(history_provider=provider, history_timeout_seconds=1.0)
@@ -277,7 +335,7 @@ def test_exact_history_request_fields_are_required_before_provider_call() -> Non
             WireScope(execution_domain_ref="domain:paper"),
             "registration:1",
             _key(entitlement_ref="entitlement:other"),
-            "MARKET_KEY_NOT_EXPORTED",
+            "HISTORY_KEY_NOT_EXPORTED",
         ),
     ],
 )
