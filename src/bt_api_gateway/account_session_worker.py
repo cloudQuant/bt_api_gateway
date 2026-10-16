@@ -61,6 +61,32 @@ _STATE_SCHEMA_VERSION_LEGACY = 1
 _STATE_SCHEMA_VERSION_OPEN_ORDERS = 2
 _MAX_TRACKED_ROWS = 3 * MAX_ACCOUNT_ROWS + 1
 _STATE_METADATA_RESERVE_BYTES = 4096
+_INSTRUMENT_METADATA_ERROR_CODES = frozenset(
+    {
+        "ACCOUNT_GENERATION_INVALID",
+        "EXCHANGE_ID_INVALID",
+        "FEED_BINDING_INVALID",
+        "INSTRUMENT_ID_INVALID",
+        "INSTRUMENT_QUERY_FAILED",
+        "INSTRUMENT_QUERY_LATE",
+        "INSTRUMENT_QUERY_UNPROVEN",
+        "MARKET_BINDING_INVALID",
+        "OWNER_THREAD_REQUIRED",
+        "PRICE_LIMITS_INVALID",
+        "PRICE_LIMITS_PARTIAL",
+        "PRICE_TICK_INVALID",
+        "PRICE_TICK_UNAVAILABLE",
+        "PRODUCT_CLASS_INVALID",
+        "PRODUCT_CLASS_UNAVAILABLE",
+        "QUOTE_SESSION_CHANGED",
+        "QUOTE_SOURCE_UNAVAILABLE",
+        "QUOTE_SOURCE_UNTRUSTED",
+        "TIMEOUT_INVALID",
+        "TRADER_SESSION_CHANGED",
+        "TRADER_SESSION_UNREADY",
+        "VOLUME_MULTIPLE_INVALID",
+    }
+)
 
 
 class GatewayAccountSessionWorkerError(RuntimeError):
@@ -237,6 +263,21 @@ class GatewayAccountSessionWorker:
         """Canonical trusted projections published with each full snapshot."""
 
         return self._view_policies
+
+    @property
+    def instrument_metadata_available(self) -> bool:
+        """Whether the trusted provider chain exposes the CTP metadata read.
+
+        This is derived from the provider object constructed by the injected
+        GatewaySessionOwner factory. It is not a manifest or client setting.
+        The read itself still verifies an exact sealed CTP result and current
+        account/market sessions.
+        """
+
+        try:
+            return callable(getattr(self._provider, "read_instrument_metadata", None))
+        except Exception:
+            return False
 
     @property
     def state(self) -> str:
@@ -460,6 +501,53 @@ class GatewayAccountSessionWorker:
             )
         except GatewayCertificationFactsError as exc:
             raise GatewayAccountSessionWorkerError(exc.code) from None
+
+    def read_instrument_metadata(
+        self,
+        *,
+        instrument_id: str,
+        exchange_id: str,
+    ) -> object:
+        """Read one typed CTP instrument row under this ready owner generation."""
+
+        generation = self._active_fact_generation()
+        reader = getattr(self._provider, "read_instrument_metadata", None)
+        if not callable(reader):
+            raise GatewayAccountSessionWorkerError("PROVIDER_FACT_UNAVAILABLE")
+        start_monotonic = self._monotonic_now()
+        self._assert_current_generation_owned(generation)
+        try:
+            result = reader(
+                instrument_id=instrument_id,
+                exchange_id=exchange_id,
+                generation=generation,
+                timeout=self._request_timeout,
+            )
+        except GatewayAccountSessionWorkerError as exc:
+            code = exc.code if exc.code in _INSTRUMENT_METADATA_ERROR_CODES else "PROVIDER_FACT_READ_FAILED"
+            raise GatewayAccountSessionWorkerError(code) from None
+        except Exception:
+            raise GatewayAccountSessionWorkerError("PROVIDER_FACT_READ_FAILED") from None
+        finish_monotonic = self._monotonic_now()
+        self._assert_current_generation_owned(generation)
+        if finish_monotonic < start_monotonic:
+            raise GatewayAccountSessionWorkerError("MONOTONIC_CLOCK_REGRESSED")
+        if finish_monotonic - start_monotonic > self._request_timeout:
+            raise GatewayAccountSessionWorkerError("PROVIDER_RESPONSE_LATE")
+        try:
+            from bt_api_ctp.instrument_metadata import (
+                CtpInstrumentMetadata,
+                _is_current_ctp_instrument_metadata,
+            )
+        except Exception:
+            raise GatewayAccountSessionWorkerError("PROVIDER_FACT_UNAVAILABLE") from None
+        if (
+            type(result) is not CtpInstrumentMetadata
+            or not _is_current_ctp_instrument_metadata(result)
+            or result.account_session_generation != generation
+        ):
+            raise GatewayAccountSessionWorkerError("PROVIDER_FACT_UNAVAILABLE")
+        return result
 
     def read_full_position_snapshot_receipt(self) -> GatewayFullPositionSnapshotReceipt:
         """Issue a non-wire receipt for this owner's current full position snapshot.

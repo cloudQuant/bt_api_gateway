@@ -55,12 +55,39 @@ _CERTIFICATION_FACT_ERROR_CODES = frozenset(
         "WORKER_WRONG_THREAD",
     }
 )
+_INSTRUMENT_METADATA_ERROR_CODES = frozenset(
+    {
+        "ACCOUNT_GENERATION_INVALID",
+        "EXCHANGE_ID_INVALID",
+        "FEED_BINDING_INVALID",
+        "INSTRUMENT_ID_INVALID",
+        "INSTRUMENT_QUERY_FAILED",
+        "INSTRUMENT_QUERY_LATE",
+        "INSTRUMENT_QUERY_UNPROVEN",
+        "MARKET_BINDING_INVALID",
+        "OWNER_THREAD_REQUIRED",
+        "PRICE_LIMITS_INVALID",
+        "PRICE_LIMITS_PARTIAL",
+        "PRICE_TICK_INVALID",
+        "PRICE_TICK_UNAVAILABLE",
+        "PRODUCT_CLASS_INVALID",
+        "PRODUCT_CLASS_UNAVAILABLE",
+        "QUOTE_SESSION_CHANGED",
+        "QUOTE_SOURCE_UNAVAILABLE",
+        "QUOTE_SOURCE_UNTRUSTED",
+        "TIMEOUT_INVALID",
+        "TRADER_SESSION_CHANGED",
+        "TRADER_SESSION_UNREADY",
+        "VOLUME_MULTIPLE_INVALID",
+    }
+)
 
 SUPPORTED_OPERATIONS = frozenset(
     {
         "account.ack",
         "account.configuration",
         "account.head",
+        "account.instrument_metadata",
         "account.progress",
         "account.read_after",
         "account.server_time_probe",
@@ -249,6 +276,14 @@ class GatewayReadService:
             self._view_policies = MappingProxyType({})
         self._state_worker = state_worker
 
+    @property
+    def supported_operations(self) -> frozenset[str]:
+        """Advertise metadata only when the trusted provider owns its source."""
+
+        if self._state_worker is None or not self._state_worker.instrument_metadata_available:
+            return SUPPORTED_OPERATIONS - {"account.instrument_metadata"}
+        return SUPPORTED_OPERATIONS
+
     def handle(
         self,
         operation: str,
@@ -267,7 +302,7 @@ class GatewayReadService:
         accepted through wire ``arguments``.
         """
 
-        if type(operation) is not str or operation not in SUPPORTED_OPERATIONS:
+        if type(operation) is not str or operation not in self.supported_operations:
             raise GatewayServiceError("UNSUPPORTED_OPERATION")
         if type(principal_ref) is not str:
             raise GatewayServiceError("INVALID_PRINCIPAL_REF")
@@ -281,6 +316,33 @@ class GatewayReadService:
             raise GatewayServiceError("INVALID_ARGUMENTS")
         if any(type(key) is not str for key in arguments):
             raise GatewayServiceError("INVALID_ARGUMENTS")
+
+        if operation == "account.instrument_metadata":
+            _reject_unknown_arguments(arguments, frozenset({"instrument_id", "exchange_id"}))
+            if set(arguments) != {"instrument_id", "exchange_id"}:
+                raise GatewayServiceError("INVALID_ARGUMENTS")
+            # Scope resolution is only routing. Check the same durable journal
+            # ACL used for account snapshots before querying the CTP provider.
+            self._journal.read_after(
+                principal,
+                account.journal_account_scope,
+                journal_strategy_scope,
+                cursor=None,
+                limit=1,
+            )
+            if self._state_worker is None:
+                raise GatewayServiceError("PROVIDER_FACT_UNAVAILABLE")
+            try:
+                metadata = self._state_worker.read_instrument_metadata(
+                    instrument_id=arguments["instrument_id"],  # type: ignore[arg-type]
+                    exchange_id=arguments["exchange_id"],  # type: ignore[arg-type]
+                )
+                return MappingProxyType({"metadata": metadata.to_dict()})  # type: ignore[attr-defined]
+            except Exception as exc:
+                code = getattr(exc, "code", None)
+                if type(code) is not str or code not in _INSTRUMENT_METADATA_ERROR_CODES | _CERTIFICATION_FACT_ERROR_CODES:
+                    code = "PROVIDER_FACT_READ_FAILED"
+                raise GatewayServiceError(code) from None
 
         if operation in {"account.configuration", "account.server_time_probe"}:
             _reject_unknown_arguments(arguments, frozenset())
