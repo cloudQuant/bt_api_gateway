@@ -1,0 +1,799 @@
+"""Cross-process provider quota admission for one trusted Gateway owner.
+
+The SQLite file is a local coordination journal, not account state. All
+processes that share a provider quota domain on one host must use the same
+file and the same ``quota_domain_ref``. The file must live on local storage;
+network filesystems and independent per-node copies do not provide a shared
+quota owner. Only opaque identifiers and quota events are persisted; provider
+credentials never enter this module.
+
+Each grant consumes one slot even if the provider call later fails. Ordinary
+work is limited to ``capacity_per_window - reserved_capacity``. Cancellation,
+reconciliation, and accepted-group actions may use the reserved slots. The
+same admission API is intended for later Risk/CTP callers, so those paths can
+share one quota owner rather than creating independent limiters.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
+import re
+import sqlite3
+import time
+import uuid
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+from types import MappingProxyType
+from typing import Optional
+
+from bt_api_base.exceptions import RateLimitError
+
+_SAFE_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_CRITICAL_OPERATIONS = frozenset(
+    {"cancel", "reconcile", "accepted_group_action"}
+)
+_OPTIONAL_PROVIDER_READS = frozenset(
+    {"read_account_configuration", "read_exchange_server_time"}
+)
+_NANOSECONDS = 1_000_000_000
+_MAX_QUEUE = 65_536
+_MAX_CAPACITY = 1_000_000
+_MAX_PROVIDER_CALL_TIMEOUT_SECONDS = 86_400.0
+
+
+class GatewayQuotaOperation(str, Enum):
+    """Finite provider operation classes understood by the quota owner."""
+
+    LOGIN = "login"
+    RECONNECT = "reconnect"
+    SUBSCRIBE = "subscribe"
+    QUERY = "query"
+    CTP_QUERY = "ctp_query"
+    CANCEL = "cancel"
+    RECONCILE = "reconcile"
+    ACCEPTED_GROUP_ACTION = "accepted_group_action"
+
+
+class GatewayQuotaAdmissionError(RuntimeError):
+    """Value-free admission failure safe to pass through service boundaries."""
+
+    _CODES = frozenset(
+        {
+            "INVALID_CONFIGURATION",
+            "DOMAIN_CONFIGURATION_MISMATCH",
+            "INVALID_SUBJECT",
+            "INVALID_OPERATION",
+            "INVALID_DEADLINE",
+            "DEADLINE_EXCEEDED",
+            "QUEUE_FULL",
+            "OWNER_UNAVAILABLE",
+            "CLOCK_EPOCH_RESET",
+            "INVALID_RATE_LIMIT_BACKOFF",
+        }
+    )
+
+    def __init__(self, code: str) -> None:
+        self.code = code if type(code) is str and code in self._CODES else "OWNER_UNAVAILABLE"
+        super().__init__(self.code)
+
+
+@dataclass(frozen=True, slots=True)
+class GatewayQuotaSubject:
+    """Non-secret fairness identity for one account/strategy/instrument."""
+
+    account_ref: str
+    strategy_ref: Optional[str] = None  # noqa: UP045 -- Gateway package supports Python 3.9.
+    instrument_ref: Optional[str] = None  # noqa: UP045 -- Gateway package supports Python 3.9.
+
+    def __post_init__(self) -> None:
+        if not _valid_ref(self.account_ref):
+            raise GatewayQuotaAdmissionError("INVALID_SUBJECT")
+        if self.strategy_ref is not None and not _valid_ref(self.strategy_ref):
+            raise GatewayQuotaAdmissionError("INVALID_SUBJECT")
+        if self.instrument_ref is not None and not _valid_ref(self.instrument_ref):
+            raise GatewayQuotaAdmissionError("INVALID_SUBJECT")
+
+
+@dataclass(frozen=True, slots=True)
+class GatewayQuotaGrant:
+    """Finite receipt for a consumed provider quota slot."""
+
+    grant_id: str
+    operation: GatewayQuotaOperation
+    sequence: int
+    granted_monotonic_ns: int
+    subject_digest: str
+
+
+class GatewayQuotaAdmission:
+    """Bounded fair sliding-window admission shared by local processes.
+
+    ``quota_domain_ref`` is a trusted, non-secret deployment label for the
+    provider's shared account/API-key/IP/session budget. A distinct provider
+    quota domain must use a distinct reference. Processes coordinate through
+    the same local SQLite file; an unavailable file fails closed.
+    """
+
+    __slots__ = (
+        "_database_path",
+        "_domain_digest",
+        "_capacity",
+        "_window_ns",
+        "_reserved_capacity",
+        "_max_queue",
+        "_max_queue_per_subject",
+        "_max_backoff_ns",
+        "_max_queue_wait_ns",
+        "_poll_interval_seconds",
+    )
+
+    def __init__(
+        self,
+        database_path: str | os.PathLike[str],
+        quota_domain_ref: str,
+        *,
+        capacity_per_window: int,
+        window_seconds: float,
+        reserved_capacity: int = 0,
+        max_queue: int = 1024,
+        max_queue_per_subject: int = 32,
+        max_backoff_seconds: float = 300.0,
+        max_queue_wait_seconds: float = 60.0,
+        poll_interval_seconds: float = 0.025,
+    ) -> None:
+        try:
+            if (
+                type(quota_domain_ref) is not str
+                or not _valid_ref(quota_domain_ref)
+                or type(capacity_per_window) is not int
+                or not 1 <= capacity_per_window <= _MAX_CAPACITY
+                or type(reserved_capacity) is not int
+                or not 0 <= reserved_capacity < capacity_per_window
+                or type(max_queue) is not int
+                or not 1 <= max_queue <= _MAX_QUEUE
+                or type(max_queue_per_subject) is not int
+                or not 1 <= max_queue_per_subject <= max_queue
+            ):
+                raise ValueError
+            window_ns = _seconds_to_ns(window_seconds, minimum=0.01, maximum=86_400.0)
+            max_backoff_ns = _seconds_to_ns(
+                max_backoff_seconds, minimum=0.01, maximum=86_400.0
+            )
+            max_queue_wait_ns = _seconds_to_ns(
+                max_queue_wait_seconds, minimum=0.01, maximum=300.0
+            )
+            if (
+                isinstance(poll_interval_seconds, bool)
+                or not isinstance(poll_interval_seconds, (int, float))
+                or not math.isfinite(float(poll_interval_seconds))
+                or not 0.001 <= float(poll_interval_seconds) <= 0.25
+            ):
+                raise ValueError
+            if not isinstance(database_path, (str, os.PathLike)):
+                raise ValueError
+            raw_path = os.fspath(database_path)
+            if type(raw_path) is not str or not raw_path or raw_path == ":memory:":
+                raise ValueError
+            if raw_path.startswith(("\\\\", "//")):
+                raise ValueError
+            path = Path(os.path.abspath(raw_path))
+            if not path.parent.is_dir():
+                raise ValueError
+            if path.exists() and not path.is_file():
+                raise ValueError
+        except GatewayQuotaAdmissionError:
+            raise
+        except Exception:
+            raise GatewayQuotaAdmissionError("INVALID_CONFIGURATION") from None
+
+        self._database_path = str(path)
+        self._domain_digest = hashlib.sha256(quota_domain_ref.encode("ascii")).hexdigest()
+        self._capacity = capacity_per_window
+        self._window_ns = window_ns
+        self._reserved_capacity = reserved_capacity
+        self._max_queue = max_queue
+        self._max_queue_per_subject = max_queue_per_subject
+        self._max_backoff_ns = max_backoff_ns
+        self._max_queue_wait_ns = max_queue_wait_ns
+        self._poll_interval_seconds = float(poll_interval_seconds)
+        self._initialize()
+
+    def admit(
+        self,
+        subject: GatewayQuotaSubject,
+        operation: GatewayQuotaOperation,
+        deadline_monotonic_ns: int,
+    ) -> GatewayQuotaGrant:
+        """Wait fairly for one slot, returning before the business deadline."""
+
+        if type(subject) is not GatewayQuotaSubject:
+            raise GatewayQuotaAdmissionError("INVALID_SUBJECT")
+        if type(operation) is not GatewayQuotaOperation:
+            raise GatewayQuotaAdmissionError("INVALID_OPERATION")
+        if type(deadline_monotonic_ns) is not int:
+            raise GatewayQuotaAdmissionError("INVALID_DEADLINE")
+        subject_digest = _subject_digest(subject)
+        request_id = uuid.uuid4().hex
+        granted = False
+        try:
+            with self._transaction(deadline_monotonic_ns) as connection:
+                now = self._clock_locked(connection, time.monotonic_ns())
+                if deadline_monotonic_ns <= now:
+                    raise GatewayQuotaAdmissionError("DEADLINE_EXCEEDED")
+                if deadline_monotonic_ns - now > self._max_queue_wait_ns:
+                    raise GatewayQuotaAdmissionError("INVALID_DEADLINE")
+                self._prune_locked(connection, now)
+                now = self._clock_locked(connection, time.monotonic_ns())
+                if now >= deadline_monotonic_ns:
+                    raise GatewayQuotaAdmissionError("DEADLINE_EXCEEDED")
+                total = self._scalar(
+                    connection,
+                    "SELECT COUNT(*) FROM waiters WHERE domain_digest = ?",
+                    (self._domain_digest,),
+                )
+                per_subject = self._scalar(
+                    connection,
+                    "SELECT COUNT(*) FROM waiters WHERE domain_digest = ? AND subject_digest = ?",
+                    (self._domain_digest, subject_digest),
+                )
+                if total >= self._max_queue or per_subject >= self._max_queue_per_subject:
+                    raise GatewayQuotaAdmissionError("QUEUE_FULL")
+                now = self._clock_locked(connection, time.monotonic_ns())
+                if now >= deadline_monotonic_ns:
+                    raise GatewayQuotaAdmissionError("DEADLINE_EXCEEDED")
+                row = connection.execute(
+                    "SELECT next_ticket FROM quota_domains WHERE domain_digest = ?",
+                    (self._domain_digest,),
+                ).fetchone()
+                ticket = int(row[0])
+                connection.execute(
+                    "INSERT INTO waiters "
+                    "(domain_digest, request_id, subject_digest, operation, deadline_ns, ticket) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        self._domain_digest,
+                        request_id,
+                        subject_digest,
+                        operation.value,
+                        deadline_monotonic_ns,
+                        ticket,
+                    ),
+                )
+                connection.execute(
+                    "UPDATE quota_domains SET next_ticket = next_ticket + 1 "
+                    "WHERE domain_digest = ?",
+                    (self._domain_digest,),
+                )
+
+            while True:
+                wait_seconds = self._poll_interval_seconds
+                with self._transaction(deadline_monotonic_ns) as connection:
+                    now = self._clock_locked(connection, time.monotonic_ns())
+                    self._prune_locked(connection, now)
+                    now = self._clock_locked(connection, time.monotonic_ns())
+                    if now >= deadline_monotonic_ns:
+                        raise GatewayQuotaAdmissionError("DEADLINE_EXCEEDED")
+                    own = connection.execute(
+                        "SELECT subject_digest FROM waiters "
+                        "WHERE domain_digest = ? AND request_id = ?",
+                        (self._domain_digest, request_id),
+                    ).fetchone()
+                    if own is None:
+                        raise GatewayQuotaAdmissionError("CLOCK_EPOCH_RESET")
+
+                    domain = connection.execute(
+                        "SELECT backoff_until_ns, grant_sequence FROM quota_domains "
+                        "WHERE domain_digest = ?",
+                        (self._domain_digest,),
+                    ).fetchone()
+                    backoff_until_ns = int(domain[0])
+                    if backoff_until_ns > now:
+                        wait_seconds = min(
+                            wait_seconds,
+                            (backoff_until_ns - now) / _NANOSECONDS,
+                        )
+                    else:
+                        grant_count = self._scalar(
+                            connection,
+                            "SELECT COUNT(*) FROM grants WHERE domain_digest = ?",
+                            (self._domain_digest,),
+                        )
+                        rows = connection.execute(
+                            "SELECT w.request_id, w.subject_digest, w.operation, w.ticket, "
+                            "COALESCE(s.last_served_sequence, 0) "
+                            "FROM waiters AS w LEFT JOIN quota_subjects AS s "
+                            "ON s.domain_digest = w.domain_digest "
+                            "AND s.subject_digest = w.subject_digest "
+                            "WHERE w.domain_digest = ? ORDER BY w.ticket",
+                            (self._domain_digest,),
+                        ).fetchall()
+                        subject_heads: dict[str, tuple[object, ...]] = {}
+                        for row in rows:
+                            subject_heads.setdefault(str(row[1]), tuple(row))
+
+                        eligible: list[tuple[object, ...]] = []
+                        regular_limit = self._capacity - self._reserved_capacity
+                        for row in subject_heads.values():
+                            is_reserved = str(row[2]) in _CRITICAL_OPERATIONS
+                            allowed = (
+                                grant_count < self._capacity
+                                if is_reserved
+                                else grant_count < regular_limit
+                            )
+                            if allowed:
+                                eligible.append(row)
+                        candidate = min(
+                            eligible,
+                            key=lambda row: (int(row[4]), int(row[3])),
+                            default=None,
+                        )
+                        if candidate is not None and str(candidate[0]) == request_id:
+                            now = self._clock_locked(connection, time.monotonic_ns())
+                            if now >= deadline_monotonic_ns:
+                                raise GatewayQuotaAdmissionError("DEADLINE_EXCEEDED")
+                            sequence = int(domain[1]) + 1
+                            grant_id = uuid.uuid4().hex
+                            connection.execute(
+                                "INSERT INTO grants "
+                                "(grant_id, domain_digest, subject_digest, operation, "
+                                "granted_ns, sequence) VALUES (?, ?, ?, ?, ?, ?)",
+                                (
+                                    grant_id,
+                                    self._domain_digest,
+                                    subject_digest,
+                                    operation.value,
+                                    now,
+                                    sequence,
+                                ),
+                            )
+                            connection.execute(
+                                "INSERT INTO quota_subjects "
+                                "(domain_digest, subject_digest, last_served_sequence) "
+                                "VALUES (?, ?, ?) ON CONFLICT(domain_digest, subject_digest) "
+                                "DO UPDATE SET last_served_sequence = excluded.last_served_sequence",
+                                (self._domain_digest, subject_digest, sequence),
+                            )
+                            connection.execute(
+                                "DELETE FROM waiters WHERE domain_digest = ? AND request_id = ?",
+                                (self._domain_digest, request_id),
+                            )
+                            connection.execute(
+                                "UPDATE quota_domains SET grant_sequence = ? "
+                                "WHERE domain_digest = ?",
+                                (sequence, self._domain_digest),
+                            )
+                            connection.execute(
+                                "DELETE FROM quota_subjects WHERE domain_digest = ? "
+                                "AND last_served_sequence < ? AND subject_digest NOT IN "
+                                "(SELECT subject_digest FROM waiters WHERE domain_digest = ?)",
+                                (
+                                    self._domain_digest,
+                                    max(0, sequence - self._max_queue * 16),
+                                    self._domain_digest,
+                                ),
+                            )
+                            granted = True
+                            return GatewayQuotaGrant(
+                                grant_id=grant_id,
+                                operation=operation,
+                                sequence=sequence,
+                                granted_monotonic_ns=now,
+                                subject_digest=subject_digest,
+                            )
+                remaining_seconds = (deadline_monotonic_ns - time.monotonic_ns()) / _NANOSECONDS
+                if remaining_seconds <= 0:
+                    raise GatewayQuotaAdmissionError("DEADLINE_EXCEEDED")
+                time.sleep(min(wait_seconds, remaining_seconds))
+        finally:
+            if not granted:
+                self._remove_waiter(request_id, deadline_monotonic_ns)
+
+    def defer_after_rate_limit(
+        self, retry_after_seconds: Optional[float] = None  # noqa: UP045 -- Python 3.9.
+    ) -> None:
+        """Apply provider-confirmed 429 backoff to every process in this domain."""
+
+        if retry_after_seconds is None:
+            retry_ns = self._max_backoff_ns
+        else:
+            try:
+                if isinstance(retry_after_seconds, bool) or not isinstance(
+                    retry_after_seconds, (int, float)
+                ):
+                    raise ValueError
+                requested_seconds = float(retry_after_seconds)
+                if not math.isfinite(requested_seconds) or requested_seconds < 0.001:
+                    raise ValueError
+                retry_seconds = min(
+                    requested_seconds, self._max_backoff_ns / _NANOSECONDS
+                )
+                retry_ns = int(retry_seconds * _NANOSECONDS)
+            except (OverflowError, TypeError, ValueError):
+                raise GatewayQuotaAdmissionError("INVALID_RATE_LIMIT_BACKOFF") from None
+        with self._transaction() as connection:
+            now = self._clock_locked(connection, time.monotonic_ns())
+            connection.execute(
+                "UPDATE quota_domains SET backoff_until_ns = MAX(backoff_until_ns, ?) "
+                "WHERE domain_digest = ?",
+                (now + retry_ns, self._domain_digest),
+            )
+
+    def status(self) -> Mapping[str, int | float]:
+        """Return bounded owner metrics without account/domain identifiers."""
+
+        with self._transaction() as connection:
+            now = self._clock_locked(connection, time.monotonic_ns())
+            self._prune_locked(connection, now)
+            grants = self._scalar(
+                connection,
+                "SELECT COUNT(*) FROM grants WHERE domain_digest = ?",
+                (self._domain_digest,),
+            )
+            waiters = self._scalar(
+                connection,
+                "SELECT COUNT(*) FROM waiters WHERE domain_digest = ?",
+                (self._domain_digest,),
+            )
+            row = connection.execute(
+                "SELECT backoff_until_ns FROM quota_domains WHERE domain_digest = ?",
+                (self._domain_digest,),
+            ).fetchone()
+            return MappingProxyType(
+                {
+                    "capacity_per_window": self._capacity,
+                    "reserved_capacity": self._reserved_capacity,
+                    "grants_in_window": grants,
+                    "pending_waiters": waiters,
+                    "backoff_remaining_seconds": max(0.0, (int(row[0]) - now) / _NANOSECONDS),
+                }
+            )
+
+    @property
+    def pending_waiter_count(self) -> int:
+        return int(self.status()["pending_waiters"])
+
+    def _initialize(self) -> None:
+        try:
+            with self._connection() as connection:
+                connection.executescript(
+                    "CREATE TABLE IF NOT EXISTS quota_domains ("
+                    "domain_digest TEXT PRIMARY KEY, capacity INTEGER NOT NULL, "
+                    "window_ns INTEGER NOT NULL, reserved_capacity INTEGER NOT NULL, "
+                    "max_queue INTEGER NOT NULL, max_queue_per_subject INTEGER NOT NULL, "
+                    "max_backoff_ns INTEGER NOT NULL, max_queue_wait_ns INTEGER NOT NULL, "
+                    "last_mono_ns INTEGER NOT NULL, backoff_until_ns INTEGER NOT NULL, "
+                    "next_ticket INTEGER NOT NULL, grant_sequence INTEGER NOT NULL);"
+                    "CREATE TABLE IF NOT EXISTS waiters ("
+                    "domain_digest TEXT NOT NULL, request_id TEXT NOT NULL, "
+                    "subject_digest TEXT NOT NULL, operation TEXT NOT NULL, "
+                    "deadline_ns INTEGER NOT NULL, ticket INTEGER NOT NULL, "
+                    "PRIMARY KEY(domain_digest, request_id), "
+                    "UNIQUE(domain_digest, ticket));"
+                    "CREATE INDEX IF NOT EXISTS quota_waiters_order "
+                    "ON waiters(domain_digest, ticket);"
+                    "CREATE INDEX IF NOT EXISTS quota_waiters_subject "
+                    "ON waiters(domain_digest, subject_digest, ticket);"
+                    "CREATE TABLE IF NOT EXISTS quota_subjects ("
+                    "domain_digest TEXT NOT NULL, subject_digest TEXT NOT NULL, "
+                    "last_served_sequence INTEGER NOT NULL, "
+                    "PRIMARY KEY(domain_digest, subject_digest));"
+                    "CREATE TABLE IF NOT EXISTS grants ("
+                    "grant_id TEXT PRIMARY KEY, domain_digest TEXT NOT NULL, "
+                    "subject_digest TEXT NOT NULL, operation TEXT NOT NULL, "
+                    "granted_ns INTEGER NOT NULL, sequence INTEGER NOT NULL, "
+                    "UNIQUE(domain_digest, sequence));"
+                    "CREATE INDEX IF NOT EXISTS quota_grants_window "
+                    "ON grants(domain_digest, granted_ns);"
+                )
+                now = time.monotonic_ns()
+                connection.execute(
+                    "INSERT OR IGNORE INTO quota_domains "
+                    "(domain_digest, capacity, window_ns, reserved_capacity, max_queue, "
+                    "max_queue_per_subject, max_backoff_ns, max_queue_wait_ns, last_mono_ns, "
+                    "backoff_until_ns, next_ticket, grant_sequence) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, 0)",
+                    (
+                        self._domain_digest,
+                        self._capacity,
+                        self._window_ns,
+                        self._reserved_capacity,
+                        self._max_queue,
+                        self._max_queue_per_subject,
+                        self._max_backoff_ns,
+                        self._max_queue_wait_ns,
+                        now,
+                    ),
+                )
+                row = connection.execute(
+                    "SELECT capacity, window_ns, reserved_capacity, max_queue, "
+                    "max_queue_per_subject, max_backoff_ns, max_queue_wait_ns "
+                    "FROM quota_domains WHERE domain_digest = ?",
+                    (self._domain_digest,),
+                ).fetchone()
+                expected = (
+                    self._capacity,
+                    self._window_ns,
+                    self._reserved_capacity,
+                    self._max_queue,
+                    self._max_queue_per_subject,
+                    self._max_backoff_ns,
+                    self._max_queue_wait_ns,
+                )
+                if tuple(row) != expected:
+                    raise GatewayQuotaAdmissionError("DOMAIN_CONFIGURATION_MISMATCH")
+        except GatewayQuotaAdmissionError:
+            raise
+        except Exception:
+            raise GatewayQuotaAdmissionError("OWNER_UNAVAILABLE") from None
+
+    @contextmanager
+    def _transaction(
+        self, deadline_monotonic_ns: Optional[int] = None  # noqa: UP045 -- Python 3.9.
+    ) -> Iterator[sqlite3.Connection]:
+        if deadline_monotonic_ns is None:
+            timeout_seconds = 1.0
+        else:
+            timeout_seconds = (
+                deadline_monotonic_ns - time.monotonic_ns()
+            ) / _NANOSECONDS
+            if timeout_seconds <= 0:
+                raise GatewayQuotaAdmissionError("DEADLINE_EXCEEDED")
+        try:
+            with self._connection(timeout_seconds=timeout_seconds) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    yield connection
+                    connection.commit()
+                except BaseException:
+                    connection.rollback()
+                    raise
+        except GatewayQuotaAdmissionError:
+            raise
+        except sqlite3.OperationalError as exc:
+            if deadline_monotonic_ns is not None and time.monotonic_ns() >= deadline_monotonic_ns:
+                raise GatewayQuotaAdmissionError("DEADLINE_EXCEEDED") from None
+            if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                raise GatewayQuotaAdmissionError("OWNER_UNAVAILABLE") from None
+            raise GatewayQuotaAdmissionError("OWNER_UNAVAILABLE") from None
+        except Exception:
+            raise GatewayQuotaAdmissionError("OWNER_UNAVAILABLE") from None
+
+    @contextmanager
+    def _connection(self, *, timeout_seconds: float = 1.0) -> Iterator[sqlite3.Connection]:
+        try:
+            connection = sqlite3.connect(
+                self._database_path, timeout=timeout_seconds, isolation_level=None
+            )
+            busy_timeout_ms = max(0, int(timeout_seconds * 1000.0))
+            connection.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
+            try:
+                yield connection
+            finally:
+                connection.close()
+        except GatewayQuotaAdmissionError:
+            raise
+        except sqlite3.OperationalError:
+            raise
+        except Exception:
+            raise GatewayQuotaAdmissionError("OWNER_UNAVAILABLE") from None
+
+    def _clock_locked(self, connection: sqlite3.Connection, observed_now: int) -> int:
+        row = connection.execute(
+            "SELECT last_mono_ns, backoff_until_ns FROM quota_domains "
+            "WHERE domain_digest = ?",
+            (self._domain_digest,),
+        ).fetchone()
+        if row is None:
+            raise GatewayQuotaAdmissionError("OWNER_UNAVAILABLE")
+        previous_now, backoff_until = int(row[0]), int(row[1])
+        if observed_now < previous_now:
+            # A monotonic-clock epoch change is fail-closed: prior grants are
+            # held for a complete fresh window and stale waiters are discarded.
+            connection.execute(
+                "UPDATE grants SET granted_ns = ? WHERE domain_digest = ?",
+                (observed_now, self._domain_digest),
+            )
+            connection.execute(
+                "DELETE FROM waiters WHERE domain_digest = ?", (self._domain_digest,)
+            )
+            backoff = (
+                observed_now + self._max_backoff_ns
+                if backoff_until > previous_now
+                else observed_now
+            )
+            connection.execute(
+                "UPDATE quota_domains SET last_mono_ns = ?, backoff_until_ns = ? "
+                "WHERE domain_digest = ?",
+                (observed_now, backoff, self._domain_digest),
+            )
+            return observed_now
+        connection.execute(
+            "UPDATE quota_domains SET last_mono_ns = ? WHERE domain_digest = ?",
+            (observed_now, self._domain_digest),
+        )
+        return observed_now
+
+    def _prune_locked(self, connection: sqlite3.Connection, now: int) -> None:
+        connection.execute(
+            "DELETE FROM grants WHERE domain_digest = ? AND granted_ns <= ?",
+            (self._domain_digest, now - self._window_ns),
+        )
+        connection.execute(
+            "DELETE FROM waiters WHERE domain_digest = ? AND deadline_ns <= ?",
+            (self._domain_digest, now),
+        )
+
+    def _remove_waiter(self, request_id: str, deadline_monotonic_ns: int) -> None:
+        if time.monotonic_ns() >= deadline_monotonic_ns:
+            # The persisted deadline lets a later owner prune this row without
+            # extending the caller's already-expired business operation.
+            return
+        try:
+            with self._transaction(deadline_monotonic_ns) as connection:
+                connection.execute(
+                    "DELETE FROM waiters WHERE domain_digest = ? AND request_id = ?",
+                    (self._domain_digest, request_id),
+                )
+        except GatewayQuotaAdmissionError:
+            # The waiter has a persisted deadline and is pruned by a later call.
+            pass
+
+    @staticmethod
+    def _scalar(
+        connection: sqlite3.Connection, query: str, parameters: tuple[object, ...]
+    ) -> int:
+        row = connection.execute(query, parameters).fetchone()
+        return int(row[0])
+
+
+class GatewayQuotaProviderSession:
+    """Apply shared admission to the fixed read-only provider session surface."""
+
+    __slots__ = ("_provider", "_admission", "_subject", "_connect_count")
+
+    def __init__(
+        self,
+        provider: object,
+        admission: GatewayQuotaAdmission,
+        subject: GatewayQuotaSubject,
+    ) -> None:
+        if (
+            not callable(getattr(provider, "connect", None))
+            or not callable(getattr(provider, "read_account", None))
+            or not callable(getattr(provider, "close", None))
+            or type(admission) is not GatewayQuotaAdmission
+            or type(subject) is not GatewayQuotaSubject
+        ):
+            raise GatewayQuotaAdmissionError("INVALID_CONFIGURATION")
+        self._provider = provider
+        self._admission = admission
+        self._subject = subject
+        self._connect_count = 0
+
+    def connect(self, *, account_key: object, generation: str, timeout: float) -> object:
+        operation = (
+            GatewayQuotaOperation.LOGIN
+            if self._connect_count == 0
+            else GatewayQuotaOperation.RECONNECT
+        )
+        self._connect_count += 1
+        return self._call(
+            "connect",
+            operation,
+            account_key=account_key,
+            generation=generation,
+            timeout=timeout,
+        )
+
+    def read_account(self, *, generation: str, timeout: float) -> object:
+        return self._call(
+            "read_account",
+            GatewayQuotaOperation.QUERY,
+            generation=generation,
+            timeout=timeout,
+        )
+
+    def close(self) -> Optional[bool]:  # noqa: UP045 -- Gateway package supports Python 3.9.
+        return self._provider.close()  # type: ignore[attr-defined]
+
+    def defer_after_rate_limit(
+        self, retry_after_seconds: Optional[float] = None  # noqa: UP045 -- Python 3.9.
+    ) -> None:
+        """Expose the trusted provider adapter's explicit 429 feedback hook."""
+
+        self._admission.defer_after_rate_limit(retry_after_seconds)
+
+    def __getattr__(self, name: str) -> object:
+        if name not in _OPTIONAL_PROVIDER_READS:
+            raise AttributeError(name)
+        method = getattr(self._provider, name, None)
+        if not callable(method):
+            raise AttributeError(name)
+
+        def read_fact(*, generation: str, timeout: float) -> object:
+            return self._call(
+                name,
+                GatewayQuotaOperation.QUERY,
+                generation=generation,
+                timeout=timeout,
+            )
+
+        return read_fact
+
+    def _call(
+        self,
+        method_name: str,
+        operation: GatewayQuotaOperation,
+        **arguments: object,
+    ) -> object:
+        timeout = arguments.get("timeout")
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+        ):
+            raise GatewayQuotaAdmissionError("INVALID_DEADLINE")
+        try:
+            timeout_seconds = float(timeout)
+        except (OverflowError, TypeError, ValueError):
+            raise GatewayQuotaAdmissionError("INVALID_DEADLINE") from None
+        if (
+            not math.isfinite(timeout_seconds)
+            or not 0.0 < timeout_seconds <= _MAX_PROVIDER_CALL_TIMEOUT_SECONDS
+        ):
+            raise GatewayQuotaAdmissionError("INVALID_DEADLINE")
+        deadline = time.monotonic_ns() + int(timeout_seconds * _NANOSECONDS)
+        self._admission.admit(self._subject, operation, deadline)
+        remaining = (deadline - time.monotonic_ns()) / _NANOSECONDS
+        if remaining <= 0:
+            raise GatewayQuotaAdmissionError("DEADLINE_EXCEEDED")
+        method = getattr(self._provider, method_name)
+        call_arguments = dict(arguments)
+        call_arguments["timeout"] = remaining
+        try:
+            return method(**call_arguments)
+        except RateLimitError as exc:
+            self._admission.defer_after_rate_limit(exc.retry_after)
+            raise
+
+    def __repr__(self) -> str:
+        return "<GatewayQuotaProviderSession>"
+
+
+def _subject_digest(subject: GatewayQuotaSubject) -> str:
+    payload = json.dumps(
+        [subject.account_ref, subject.strategy_ref, subject.instrument_ref],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _valid_ref(value: object) -> bool:
+    return type(value) is str and _SAFE_REF.fullmatch(value) is not None
+
+
+def _seconds_to_ns(value: object, *, minimum: float, maximum: float) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or not minimum <= float(value) <= maximum
+    ):
+        raise GatewayQuotaAdmissionError("INVALID_CONFIGURATION")
+    return int(float(value) * _NANOSECONDS)
+
+
+__all__ = [
+    "GatewayQuotaAdmission",
+    "GatewayQuotaAdmissionError",
+    "GatewayQuotaGrant",
+    "GatewayQuotaOperation",
+    "GatewayQuotaProviderSession",
+    "GatewayQuotaSubject",
+]
