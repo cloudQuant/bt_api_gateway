@@ -26,20 +26,26 @@ import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Optional
+from typing import Optional, Union
 
 from bt_api_base.exceptions import RateLimitError
+
+from .database_identity import GatewayDatabaseIdentityError, SQLiteFileIdentity
 
 _SAFE_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _CRITICAL_OPERATIONS = frozenset(
     {"close", "cancel", "reconcile", "accepted_group_action"}
 )
 _OPTIONAL_PROVIDER_READS = frozenset(
-    {"read_account_configuration", "read_exchange_server_time"}
+    {
+        "read_account_configuration",
+        "read_exchange_server_time",
+        "read_instrument_metadata",
+    }
 )
 _NANOSECONDS = 1_000_000_000
 _MAX_QUEUE = 65_536
@@ -77,6 +83,8 @@ class GatewayQuotaAdmissionError(RuntimeError):
             "OWNER_UNAVAILABLE",
             "CLOCK_EPOCH_RESET",
             "INVALID_RATE_LIMIT_BACKOFF",
+            "DOMAIN_IDENTITY_CHANGED",
+            "SESSION_OWNERSHIP_UNAVAILABLE",
         }
     )
 
@@ -137,6 +145,7 @@ class GatewayQuotaAdmission:
         "_max_backoff_ns",
         "_max_queue_wait_ns",
         "_poll_interval_seconds",
+        "_database_identity",
     )
 
     def __init__(
@@ -199,6 +208,7 @@ class GatewayQuotaAdmission:
             raise GatewayQuotaAdmissionError("INVALID_CONFIGURATION") from None
 
         self._database_path = str(path)
+        self._database_identity = SQLiteFileIdentity(path)
         self._domain_digest = hashlib.sha256(quota_domain_ref.encode("ascii")).hexdigest()
         self._capacity = capacity_per_window
         self._window_ns = window_ns
@@ -209,6 +219,62 @@ class GatewayQuotaAdmission:
         self._max_queue_wait_ns = max_queue_wait_ns
         self._poll_interval_seconds = float(poll_interval_seconds)
         self._initialize()
+
+    @property
+    def configuration_version(self) -> str:
+        """Opaque digest of the persisted domain settings bound by this owner."""
+
+        payload = {
+            "domain_digest": self._domain_digest,
+            "capacity": self._capacity,
+            "window_ns": self._window_ns,
+            "reserved_capacity": self._reserved_capacity,
+            "max_queue": self._max_queue,
+            "max_queue_per_subject": self._max_queue_per_subject,
+            "max_backoff_ns": self._max_backoff_ns,
+            "max_queue_wait_ns": self._max_queue_wait_ns,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("ascii")
+        ).hexdigest()
+
+    def assert_configuration(
+        self, deadline_monotonic_ns: Optional[int] = None  # noqa: UP045 -- Python 3.9.
+    ) -> str:
+        """Recheck persisted domain settings before dispatch, within its deadline."""
+
+        timeout_seconds = 1.0
+        if deadline_monotonic_ns is not None:
+            if type(deadline_monotonic_ns) is not int:
+                raise GatewayQuotaAdmissionError("INVALID_DEADLINE")
+            remaining_ns = deadline_monotonic_ns - time.monotonic_ns()
+            if remaining_ns <= 0:
+                raise GatewayQuotaAdmissionError("DEADLINE_EXCEEDED")
+            timeout_seconds = min(1.0, remaining_ns / _NANOSECONDS)
+        try:
+            with self._connection(timeout_seconds=timeout_seconds) as connection:
+                row = connection.execute(
+                    "SELECT capacity, window_ns, reserved_capacity, max_queue, "
+                    "max_queue_per_subject, max_backoff_ns, max_queue_wait_ns "
+                    "FROM quota_domains WHERE domain_digest = ?",
+                    (self._domain_digest,),
+                ).fetchone()
+        except GatewayQuotaAdmissionError:
+            raise
+        except Exception:
+            raise GatewayQuotaAdmissionError("OWNER_UNAVAILABLE") from None
+        expected = (
+            self._capacity,
+            self._window_ns,
+            self._reserved_capacity,
+            self._max_queue,
+            self._max_queue_per_subject,
+            self._max_backoff_ns,
+            self._max_queue_wait_ns,
+        )
+        if row is None or tuple(row) != expected:
+            raise GatewayQuotaAdmissionError("DOMAIN_CONFIGURATION_MISMATCH")
+        return self.configuration_version
 
     def admit(
         self,
@@ -585,22 +651,27 @@ class GatewayQuotaAdmission:
 
     @contextmanager
     def _connection(self, *, timeout_seconds: float = 1.0) -> Iterator[sqlite3.Connection]:
+        connection: Optional[sqlite3.Connection] = None  # noqa: UP045 -- Python 3.9.
         try:
+            self._database_identity.verify()
             connection = sqlite3.connect(
                 self._database_path, timeout=timeout_seconds, isolation_level=None
             )
+            self._database_identity.verify()
             busy_timeout_ms = max(0, int(timeout_seconds * 1000.0))
             connection.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
-            try:
-                yield connection
-            finally:
-                connection.close()
+            yield connection
         except GatewayQuotaAdmissionError:
             raise
+        except GatewayDatabaseIdentityError:
+            raise GatewayQuotaAdmissionError("DOMAIN_IDENTITY_CHANGED") from None
         except sqlite3.OperationalError:
             raise
         except Exception:
             raise GatewayQuotaAdmissionError("OWNER_UNAVAILABLE") from None
+        finally:
+            if connection is not None:
+                connection.close()
 
     def _clock_locked(self, connection: sqlite3.Connection, observed_now: int) -> int:
         row = connection.execute(
@@ -671,16 +742,110 @@ class GatewayQuotaAdmission:
         return int(row[0])
 
 
+@dataclass(frozen=True, slots=True)
+class GatewayQuotaDomainConfig:
+    """Explicit single-host shared SQLite settings for one provider quota domain.
+
+    Every account binding for the same API-key/IP/session budget must receive
+    this same trusted database path and domain reference. There is no implicit
+    per-host/per-account database default and no multi-host mode.
+    """
+
+    database_path: Union[str, os.PathLike] = field(repr=False)  # noqa: UP007 -- Python 3.9.
+    quota_domain_ref: str
+    capacity_per_window: int
+    window_seconds: float
+    reserved_capacity: int = 0
+    max_queue: int = 1024
+    max_queue_per_subject: int = 32
+    max_backoff_seconds: float = 300.0
+    max_queue_wait_seconds: float = 60.0
+    poll_interval_seconds: float = 0.025
+    deployment_mode: str = "single_host_shared_sqlite"
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.deployment_mode) is not str
+            or self.deployment_mode != "single_host_shared_sqlite"
+        ):
+            raise GatewayQuotaAdmissionError("INVALID_CONFIGURATION")
+        try:
+            if not isinstance(self.database_path, (str, os.PathLike)):
+                raise ValueError
+            raw = os.fspath(self.database_path)
+            if type(raw) is not str or not raw or not os.path.isabs(raw):
+                raise ValueError
+            if raw.startswith(("\\\\", "//")):
+                raise ValueError
+            canonical = Path(os.path.abspath(raw))
+            if not canonical.parent.is_dir() or (canonical.exists() and not canonical.is_file()):
+                raise ValueError
+            object.__setattr__(self, "database_path", canonical)
+        except Exception:
+            raise GatewayQuotaAdmissionError("INVALID_CONFIGURATION") from None
+
+
+@dataclass(frozen=True, slots=True)
+class GatewayQuotaDomainBinding:
+    """Trusted, explicit owner binding shared by account and dispatch paths."""
+
+    config: GatewayQuotaDomainConfig
+    _admission: GatewayQuotaAdmission = field(init=False, repr=False, compare=False)
+    _configuration_version: str = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if type(self.config) is not GatewayQuotaDomainConfig:
+            raise GatewayQuotaAdmissionError("INVALID_CONFIGURATION")
+        admission = GatewayQuotaAdmission(
+            self.config.database_path,
+            self.config.quota_domain_ref,
+            capacity_per_window=self.config.capacity_per_window,
+            window_seconds=self.config.window_seconds,
+            reserved_capacity=self.config.reserved_capacity,
+            max_queue=self.config.max_queue,
+            max_queue_per_subject=self.config.max_queue_per_subject,
+            max_backoff_seconds=self.config.max_backoff_seconds,
+            max_queue_wait_seconds=self.config.max_queue_wait_seconds,
+            poll_interval_seconds=self.config.poll_interval_seconds,
+        )
+        object.__setattr__(self, "_admission", admission)
+        object.__setattr__(self, "_configuration_version", admission.configuration_version)
+
+    @property
+    def admission(self) -> GatewayQuotaAdmission:
+        return self._admission
+
+    @property
+    def configuration_version(self) -> str:
+        return self._configuration_version
+
+    def assert_current(
+        self, deadline_monotonic_ns: Optional[int] = None  # noqa: UP045 -- Python 3.9.
+    ) -> None:
+        if self._admission.assert_configuration(deadline_monotonic_ns) != self._configuration_version:
+            raise GatewayQuotaAdmissionError("DOMAIN_CONFIGURATION_MISMATCH")
+
+
 class GatewayQuotaProviderSession:
     """Apply shared admission to the fixed read-only provider session surface."""
 
-    __slots__ = ("_provider", "_admission", "_subject", "_connect_count")
+    __slots__ = (
+        "_provider",
+        "_admission",
+        "_subject",
+        "_connect_count",
+        "_assert_session_owned",
+        "_assert_domain_current",
+    )
 
     def __init__(
         self,
         provider: object,
         admission: GatewayQuotaAdmission,
         subject: GatewayQuotaSubject,
+        *,
+        assert_session_owned: Optional[Callable[[], None]] = None,  # noqa: UP045 -- Python 3.9.
+        assert_domain_current: Optional[Callable[[Optional[int]], None]] = None,  # noqa: UP045
     ) -> None:
         if (
             not callable(getattr(provider, "connect", None))
@@ -688,12 +853,16 @@ class GatewayQuotaProviderSession:
             or not callable(getattr(provider, "close", None))
             or type(admission) is not GatewayQuotaAdmission
             or type(subject) is not GatewayQuotaSubject
+            or (assert_session_owned is not None and not callable(assert_session_owned))
+            or (assert_domain_current is not None and not callable(assert_domain_current))
         ):
             raise GatewayQuotaAdmissionError("INVALID_CONFIGURATION")
         self._provider = provider
         self._admission = admission
         self._subject = subject
         self._connect_count = 0
+        self._assert_session_owned = assert_session_owned
+        self._assert_domain_current = assert_domain_current
 
     def connect(self, *, account_key: object, generation: str, timeout: float) -> object:
         operation = (
@@ -738,6 +907,26 @@ class GatewayQuotaProviderSession:
         if not callable(method):
             raise AttributeError(name)
 
+        if name == "read_instrument_metadata":
+
+            def read_instrument_metadata(
+                *,
+                instrument_id: str,
+                exchange_id: str,
+                generation: str,
+                timeout: float,
+            ) -> object:
+                return self._call(
+                    name,
+                    GatewayQuotaOperation.CTP_QUERY,
+                    instrument_id=instrument_id,
+                    exchange_id=exchange_id,
+                    generation=generation,
+                    timeout=timeout,
+                )
+
+            return read_instrument_metadata
+
         def read_fact(*, generation: str, timeout: float) -> object:
             return self._call(
                 name,
@@ -772,12 +961,19 @@ class GatewayQuotaProviderSession:
         ):
             raise GatewayQuotaAdmissionError("INVALID_DEADLINE")
         deadline = time.monotonic_ns() + int(timeout_seconds * _NANOSECONDS)
+        self._assert_dispatch_ownership(deadline)
         self._admission.admit(self._subject, operation, deadline)
         remaining = (deadline - time.monotonic_ns()) / _NANOSECONDS
         if remaining <= 0:
             raise GatewayQuotaAdmissionError("DEADLINE_EXCEEDED")
         method = getattr(self._provider, method_name)
         call_arguments = dict(arguments)
+        # Admission can wait. Revalidate the account lease and persisted domain
+        # version immediately before the irreversible provider boundary.
+        self._assert_dispatch_ownership(deadline)
+        remaining = (deadline - time.monotonic_ns()) / _NANOSECONDS
+        if remaining <= 0:
+            raise GatewayQuotaAdmissionError("DEADLINE_EXCEEDED")
         call_arguments["timeout"] = remaining
         if on_dispatch is not None:
             on_dispatch()
@@ -786,6 +982,17 @@ class GatewayQuotaProviderSession:
         except RateLimitError as exc:
             self._admission.defer_after_rate_limit(exc.retry_after)
             raise
+
+    def _assert_dispatch_ownership(self, deadline_monotonic_ns: int) -> None:
+        if self._assert_session_owned is not None:
+            try:
+                self._assert_session_owned()
+            except Exception:
+                raise GatewayQuotaAdmissionError("SESSION_OWNERSHIP_UNAVAILABLE") from None
+        if self._assert_domain_current is None:
+            self._admission.assert_configuration(deadline_monotonic_ns)
+            return
+        self._assert_domain_current(deadline_monotonic_ns)
 
     def __repr__(self) -> str:
         return "<GatewayQuotaProviderSession>"
@@ -801,7 +1008,7 @@ class GatewayQuotaDispatchAdmission:
     receive only ``None`` on success and a value-free quota error on denial.
     """
 
-    __slots__ = ("_admission",)
+    __slots__ = ("_admission", "_assert_domain_current")
 
     _OPERATIONS = MappingProxyType(
         {
@@ -813,10 +1020,19 @@ class GatewayQuotaDispatchAdmission:
         }
     )
 
-    def __init__(self, admission: GatewayQuotaAdmission) -> None:
-        if type(admission) is not GatewayQuotaAdmission:
+    def __init__(
+        self,
+        admission: GatewayQuotaAdmission,
+        *,
+        assert_domain_current: Optional[Callable[[Optional[int]], None]] = None,  # noqa: UP045
+    ) -> None:
+        if (
+            type(admission) is not GatewayQuotaAdmission
+            or (assert_domain_current is not None and not callable(assert_domain_current))
+        ):
             raise GatewayQuotaAdmissionError("INVALID_CONFIGURATION")
         self._admission = admission
+        self._assert_domain_current = assert_domain_current
 
     def __call__(
         self,
@@ -849,8 +1065,18 @@ class GatewayQuotaDispatchAdmission:
             instrument_ref=instrument_ref,
             run_ref=run_ref,
         )
+        self._assert_current(deadline_monotonic_ns)
         self._admission.admit(subject, quota_operation, deadline_monotonic_ns)
+        self._assert_current(deadline_monotonic_ns)
+        if time.monotonic_ns() >= deadline_monotonic_ns:
+            raise GatewayQuotaAdmissionError("DEADLINE_EXCEEDED")
         return None
+
+    def _assert_current(self, deadline_monotonic_ns: int) -> None:
+        if self._assert_domain_current is None:
+            self._admission.assert_configuration(deadline_monotonic_ns)
+            return
+        self._assert_domain_current(deadline_monotonic_ns)
 
     def __repr__(self) -> str:
         return "<GatewayQuotaDispatchAdmission>"

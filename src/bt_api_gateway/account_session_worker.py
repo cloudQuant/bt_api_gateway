@@ -342,6 +342,14 @@ class GatewayAccountSessionWorker:
                 self._state = "failed"
             if isinstance(exc, GatewayAccountSessionWorkerError):
                 raise
+            if isinstance(exc, LocalAccountSessionGuardError):
+                code = (
+                    exc.code
+                    if exc.code
+                    in {"SESSION_ALREADY_OWNED", "SESSION_RECONCILIATION_REQUIRED"}
+                    else "SESSION_OWNERSHIP_UNAVAILABLE"
+                )
+                raise GatewayAccountSessionWorkerError(code) from None
             code = "PROVIDER_CONNECT_FAILED" if self._connect_attempted else "START_FAILED"
             if isinstance(exc, Exception):
                 raise GatewayAccountSessionWorkerError(code) from None
