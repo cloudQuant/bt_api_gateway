@@ -39,13 +39,31 @@ _ACCOUNT_SESSION_WORKER_PORTS = frozenset(
 )
 _DEFAULT_READ_LIMIT = 100
 _UNSAMPLED_SOURCE_CURSOR = object()
+_CERTIFICATION_FACT_ERROR_CODES = frozenset(
+    {
+        "CLOCK_INVALID",
+        "CLOCK_UNAVAILABLE",
+        "MONOTONIC_CLOCK_REGRESSED",
+        "PROVIDER_CONFIGURATION_INVALID",
+        "PROVIDER_FACT_READ_FAILED",
+        "PROVIDER_FACT_UNAVAILABLE",
+        "PROVIDER_RESPONSE_LATE",
+        "PROVIDER_SERVER_TIME_INVALID",
+        "PROVIDER_RESULT_GENERATION_STALE",
+        "SESSION_NOT_READY",
+        "SESSION_OWNERSHIP_LOST",
+        "WORKER_WRONG_THREAD",
+    }
+)
 
 SUPPORTED_OPERATIONS = frozenset(
     {
         "account.ack",
+        "account.configuration",
         "account.head",
         "account.progress",
         "account.read_after",
+        "account.server_time_probe",
         "account.snapshot",
     }
 )
@@ -263,6 +281,33 @@ class GatewayReadService:
             raise GatewayServiceError("INVALID_ARGUMENTS")
         if any(type(key) is not str for key in arguments):
             raise GatewayServiceError("INVALID_ARGUMENTS")
+
+        if operation in {"account.configuration", "account.server_time_probe"}:
+            _reject_unknown_arguments(arguments, frozenset())
+            # Resolving a wire scope is routing only. Perform the same journal
+            # ACL check as the ordinary account snapshot before touching the
+            # provider session.
+            self._journal.read_after(
+                principal,
+                account.journal_account_scope,
+                journal_strategy_scope,
+                cursor=None,
+                limit=1,
+            )
+            if self._state_worker is None:
+                raise GatewayServiceError("PROVIDER_FACT_UNAVAILABLE")
+            try:
+                observation = (
+                    self._state_worker.read_account_configuration()
+                    if operation == "account.configuration"
+                    else self._state_worker.read_exchange_server_time()
+                )
+            except Exception as exc:
+                code = getattr(exc, "code", None)
+                if type(code) is not str or code not in _CERTIFICATION_FACT_ERROR_CODES:
+                    code = "PROVIDER_FACT_READ_FAILED"
+                raise GatewayServiceError(code) from None
+            return MappingProxyType({"observation": observation.to_dict()})
 
         if operation == "account.read_after":
             _reject_unknown_arguments(

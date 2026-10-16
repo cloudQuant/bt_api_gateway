@@ -897,9 +897,11 @@ def test_supported_operations_are_finite_and_service_borrows_journal(tmp_path) -
         frozenset(
             {
                 "account.ack",
+                "account.configuration",
                 "account.head",
                 "account.progress",
                 "account.read_after",
+                "account.server_time_probe",
                 "account.snapshot",
             }
         )

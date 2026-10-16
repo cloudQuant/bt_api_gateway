@@ -18,6 +18,10 @@ from datetime import datetime
 from types import MappingProxyType
 from typing import Callable, Optional, Protocol
 
+from bt_api_base.account_certification_protocol import (
+    AccountConfigurationObservation,
+    ExchangeServerTimeObservation,
+)
 from bt_api_base.account_protocol import (
     MAX_ACCOUNT_ROWS,
     AccountKey,
@@ -25,6 +29,11 @@ from bt_api_base.account_protocol import (
     AccountResourceKey,
 )
 
+from .account_certification import (
+    GatewayCertificationFactsError,
+    collect_account_configuration,
+    collect_exchange_server_time,
+)
 from .account_view_projection import (
     AccountViewProjectionError,
     GatewayAccountViewPolicy,
@@ -398,6 +407,53 @@ class GatewayAccountSessionWorker:
         self._generation = None
         self._freshness_invalidated = True
         self._state = "closed"
+
+    def read_account_configuration(self) -> AccountConfigurationObservation:
+        """Collect one current, typed configuration fact from the active session."""
+
+        generation = self._active_fact_generation()
+        try:
+            return collect_account_configuration(
+                self._provider,
+                account_key_id=self._account_key.account_key_id,
+                generation=generation,
+                timeout=self._request_timeout,
+                assert_owned=lambda: self._assert_current_generation_owned(generation),
+                monotonic_clock=self._monotonic_clock,
+                wall_clock=self._clock,
+            )
+        except GatewayCertificationFactsError as exc:
+            raise GatewayAccountSessionWorkerError(exc.code) from None
+
+    def read_exchange_server_time(self) -> ExchangeServerTimeObservation:
+        """Collect provider server time without substituting a local clock sample."""
+
+        generation = self._active_fact_generation()
+        try:
+            return collect_exchange_server_time(
+                self._provider,
+                account_key_id=self._account_key.account_key_id,
+                generation=generation,
+                timeout=self._request_timeout,
+                assert_owned=lambda: self._assert_current_generation_owned(generation),
+                monotonic_clock=self._monotonic_clock,
+                wall_clock=self._clock,
+            )
+        except GatewayCertificationFactsError as exc:
+            raise GatewayAccountSessionWorkerError(exc.code) from None
+
+    def _active_fact_generation(self) -> str:
+        self._check_owner()
+        generation = self._generation
+        if (
+            self._state != "ready"
+            or generation is None
+            or not self._connect_attempted
+            or self.read_status().get("ready") is not True
+        ):
+            raise GatewayAccountSessionWorkerError("SESSION_NOT_READY")
+        self._assert_current_generation_owned(generation)
+        return generation
 
     def _refresh_impl(self) -> GatewayAccountSnapshot:
         self._freshness_invalidated = True
