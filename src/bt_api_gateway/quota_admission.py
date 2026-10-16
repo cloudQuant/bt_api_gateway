@@ -773,9 +773,11 @@ class GatewayQuotaProviderSession:
 class GatewayQuotaDispatchAdmission:
     """Adapt trusted Risk/CANCEL dispatch facts to the shared quota owner.
 
-    Callers pass server-resolved identity and a finite operation label. The
-    adapter consumes the grant internally so account-owner APIs receive only
-    ``None`` on success and a value-free quota error on denial.
+    Callers pass server-resolved identity and a finite operation label. A
+    strategy run supplies both strategy and run references; a trusted
+    account-scoped manual intent supplies neither, sharing an account quota
+    bucket. The adapter consumes the grant internally so account-owner APIs
+    receive only ``None`` on success and a value-free quota error on denial.
     """
 
     __slots__ = ("_admission",)
@@ -798,16 +800,17 @@ class GatewayQuotaDispatchAdmission:
     def __call__(
         self,
         account_ref: str,
-        strategy_ref: str,
-        run_ref: str,
+        strategy_ref: Optional[str],  # noqa: UP045 -- Gateway package supports Python 3.9.
+        run_ref: Optional[str],  # noqa: UP045 -- Gateway package supports Python 3.9.
         instrument_ref: Optional[str],  # noqa: UP045 -- Gateway package supports Python 3.9.
         operation: str,
         deadline_monotonic_ns: int,
     ) -> None:
         if (
             not _valid_ref(account_ref)
-            or not _valid_ref(strategy_ref)
-            or not _valid_ref(run_ref)
+            or (strategy_ref is None) != (run_ref is None)
+            or (strategy_ref is not None and not _valid_ref(strategy_ref))
+            or (run_ref is not None and not _valid_ref(run_ref))
         ):
             raise GatewayQuotaAdmissionError("INVALID_SUBJECT")
         if instrument_ref is not None and not _valid_ref(instrument_ref):

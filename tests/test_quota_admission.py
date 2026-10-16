@@ -101,3 +101,29 @@ def test_close_can_use_reserved_capacity_but_open_cannot(tmp_path: Path) -> None
             "SELECT operation FROM grants ORDER BY sequence"
         ).fetchall()
     assert operations == [("open",), ("close",)]
+
+
+def test_manual_account_bucket_requires_both_strategy_refs_absent(tmp_path: Path) -> None:
+    path = tmp_path / "manual-account-quota.sqlite3"
+    callback = GatewayQuotaDispatchAdmission(_owner(path))
+    deadline = time.monotonic_ns() + 2_000_000_000
+
+    assert callback("acct:manual", None, None, "BTC-PERP", "OPEN", deadline) is None
+    assert callback("acct:manual", None, None, "BTC-PERP", "CLOSE", deadline) is None
+
+    with sqlite3.connect(path) as connection:
+        rows = connection.execute(
+            "SELECT operation, subject_digest FROM grants ORDER BY sequence"
+        ).fetchall()
+
+    assert [row[0] for row in rows] == ["open", "close"]
+    assert rows[0][1] == rows[1][1]
+    assert len(rows[0][1]) == 64
+
+    with pytest.raises(GatewayQuotaAdmissionError) as missing_run:
+        callback("acct:manual", "strategy:1", None, "BTC-PERP", "OPEN", deadline)
+    assert missing_run.value.code == "INVALID_SUBJECT"
+
+    with pytest.raises(GatewayQuotaAdmissionError) as missing_strategy:
+        callback("acct:manual", None, "run:1", "BTC-PERP", "OPEN", deadline)
+    assert missing_strategy.value.code == "INVALID_SUBJECT"
