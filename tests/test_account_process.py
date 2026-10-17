@@ -44,9 +44,73 @@ def _native_free_factory(profile_ref: str) -> GatewayAccountSessionProcessBindin
     return GatewayAccountSessionProcessBinding(_ACCOUNT_KEY, _NativeFreeProvider())
 
 
-def _native_free_close_projector(provider: object, generation: str) -> dict[str, object]:
+def _native_free_close_projector(provider: object, generation: int) -> dict[str, object]:
     del provider, generation
     raise AssertionError("native-free providers have no native receipt")
+
+
+_NATIVE_PROJECTED_GENERATIONS: list[int] = []
+
+
+class _NativeOwnedProvider:
+    native_owner_created = True
+    native_connection_generation = _NATIVE_GENERATION
+
+    def connect(self, *, account_key: AccountKey, generation: str, timeout: float) -> None:
+        assert account_key == _ACCOUNT_KEY
+        assert generation == _GENERATION
+        assert timeout > 0
+
+    def read_account(self, *, generation: str, timeout: float) -> AccountObservation:
+        del generation, timeout
+        raise AssertionError("read is not part of this close receipt test")
+
+    def close(self) -> bool:
+        return True
+
+
+def _native_owned_factory(profile_ref: str) -> GatewayAccountSessionProcessBinding:
+    if profile_ref != "synthetic.native.v1":
+        raise GatewayAccountSessionProfileUnavailableError()
+    return GatewayAccountSessionProcessBinding(_ACCOUNT_KEY, _NativeOwnedProvider())
+
+
+def _native_owned_close_projector(
+    provider: object, expected_native_generation: int
+) -> dict[str, object]:
+    assert type(expected_native_generation) is int
+    assert expected_native_generation == _NATIVE_GENERATION
+    assert type(provider) is _NativeOwnedProvider
+    assert provider.native_connection_generation == expected_native_generation
+    _NATIVE_PROJECTED_GENERATIONS.append(expected_native_generation)
+    return {
+        "connection_generation": expected_native_generation,
+        "join_required": True,
+        "join_completed": True,
+        "native_released": True,
+        "thread_alive": False,
+        "timed_out": False,
+        "complete": True,
+    }
+
+
+class _ChildConnection:
+    def __init__(self, requests: list[dict[str, object]]) -> None:
+        self.incoming = deque(_encode_frame(request) for request in requests)
+        self.sent: list[dict[str, object]] = []
+        self.closed = False
+
+    def recv_bytes(self, maxlength: int) -> bytes:
+        raw = self.incoming.popleft()
+        if len(raw) > maxlength:
+            raise OSError("oversized")
+        return raw
+
+    def send_bytes(self, value: bytes) -> None:
+        self.sent.append(json.loads(value.decode("ascii")))
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class _NativeFreeProvider:
@@ -486,6 +550,63 @@ def test_native_close_ack_requires_exact_complete_generation_receipt() -> None:
     assert bad_provider.close() is False
     assert bad_provider.custody_retained
     assert bad_world.process.closed is False
+
+
+def test_native_child_close_projector_receives_acknowledged_native_generation() -> None:
+    _NATIVE_PROJECTED_GENERATIONS.clear()
+    requests = [
+        _envelope(
+            message_type="request",
+            request_id="a" * 32,
+            generation=_GENERATION,
+            operation="bootstrap",
+            status="request",
+            payload={"profile_ref": "synthetic.native.v1", "read_only": True},
+        ),
+        _envelope(
+            message_type="request",
+            request_id="b" * 32,
+            generation=_GENERATION,
+            operation="connect",
+            status="request",
+            payload={"timeout_seconds": 1.0},
+        ),
+        _envelope(
+            message_type="request",
+            request_id="c" * 32,
+            generation=_GENERATION,
+            operation="close",
+            status="request",
+            payload={"timeout_seconds": 1.0},
+        ),
+    ]
+    connection = _ChildConnection(requests)
+
+    serve_account_session_child(
+        connection,
+        provider_factory=_native_owned_factory,
+        close_receipt_projector=_native_owned_close_projector,
+    )
+
+    assert _NATIVE_PROJECTED_GENERATIONS == [_NATIVE_GENERATION]
+    assert [frame["status"] for frame in connection.sent] == ["ready", "connected", "closed"]
+    assert all(frame["generation"] == _GENERATION for frame in connection.sent)
+    close_payload = connection.sent[-1]["payload"]
+    assert close_payload == {
+        "native_owner_created": True,
+        "native_connection_generation": _NATIVE_GENERATION,
+        "native_stop_receipt": {
+            "connection_generation": _NATIVE_GENERATION,
+            "join_required": True,
+            "join_completed": True,
+            "native_released": True,
+            "thread_alive": False,
+            "timed_out": False,
+            "complete": True,
+        },
+        "close_confirmed": True,
+    }
+    assert connection.closed
 
 
 def test_close_retry_requires_a_completed_unconfirmed_reply() -> None:

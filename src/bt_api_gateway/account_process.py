@@ -603,7 +603,7 @@ def serve_account_session_child(
     connection: Any,
     *,
     provider_factory: Callable[[str], GatewayAccountSessionProcessBinding],
-    close_receipt_projector: Callable[[object, str], Mapping[str, object]] | None = None,
+    close_receipt_projector: Callable[[object, int], Mapping[str, object]] | None = None,
 ) -> None:
     """Serve one typed account-session connection inside a trusted child entry.
 
@@ -778,9 +778,9 @@ def serve_account_session_child(
                     if native_owner_created:
                         if close_receipt_projector is None:
                             raise ValueError("native receipt projector unavailable")
-                        raw_receipt = close_receipt_projector(provider, generation)
-                        if native_generation is None:
+                        if type(native_generation) is not int or native_generation <= 0:
                             raise ValueError("native generation missing")
+                        raw_receipt = close_receipt_projector(provider, native_generation)
                         receipt = _validate_stop_receipt(raw_receipt, native_generation)
                     close_payload = {
                         "native_owner_created": native_owner_created,
