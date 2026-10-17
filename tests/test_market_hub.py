@@ -536,6 +536,234 @@ def test_strategy_registration_preserves_account_binding_without_stream_partitio
     assert hub.readiness["active_registrations"] == 2
 
 
+def test_market_bootstrap_many_preflights_all_keys_then_returns_each_cursor() -> None:
+    first = _key(instrument={"instrument_id": "instrument-a", "native_symbol": "A-USD"})
+    second = _key(instrument={"instrument_id": "instrument-b", "native_symbol": "B-USD"})
+    hub, provider, _published = _hub(keys=(first, second), principals=("principal:a",))
+    registration = GatewayMarketRegistration(
+        principal_ref="principal:a",
+        execution_domain_ref="domain:paper",
+        strategy_ref="strategy:a",
+        run_id="run:a",
+    )
+    service = GatewayMarketService(hub, registrations={"registration:a": registration})
+
+    result = service.handle(
+        "market.bootstrap_many",
+        principal_ref="principal:a",
+        scope=_scope(strategy_ref="strategy:a", run_id="run:a"),
+        arguments={
+            "subscriptions": [
+                {"key": first.to_dict()},
+                {"key": second.to_dict()},
+            ]
+        },
+        registration_id="registration:a",
+    )
+
+    assert result["status"] == "active"
+    items = result["items"]
+    assert len(items) == 2
+    assert [item["subscription"]["stream_id"] for item in items] == [
+        first.stream_id,
+        second.stream_id,
+    ]
+    assert [item["snapshot"]["stream_id"] for item in items] == [
+        first.stream_id,
+        second.stream_id,
+    ]
+    assert [item["head"]["head"] for item in items] == [0, 0]
+    assert all(hub.registration_active(key, "registration:a") for key in (first, second))
+    assert [key for key, _handle in provider.subscribed] == [first, second]
+
+
+def test_market_bootstrap_many_denies_unexported_second_key_without_side_effects() -> None:
+    first = _key(instrument={"instrument_id": "instrument-a", "native_symbol": "A-USD"})
+    unexported = _key(
+        instrument={"instrument_id": "instrument-outside", "native_symbol": "OUTSIDE-USD"}
+    )
+    hub, provider, _published = _hub(keys=(first,), principals=("principal:a",))
+    registration = GatewayMarketRegistration("principal:a", "domain:paper")
+    service = GatewayMarketService(hub, registrations={"registration:a": registration})
+
+    result = service.handle(
+        "market.bootstrap_many",
+        principal_ref="principal:a",
+        scope=_scope(),
+        arguments={
+            "subscriptions": [
+                {"key": first.to_dict()},
+                {"key": unexported.to_dict()},
+            ]
+        },
+        registration_id="registration:a",
+    )
+
+    assert result == {"status": "rejected", "code": "MARKET_KEY_NOT_EXPORTED"}
+    assert provider.subscribed == []
+    assert hub.readiness["active_registrations"] == 0
+
+
+def test_market_bootstrap_many_returns_rejected_after_confirmed_partial_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _key(instrument={"instrument_id": "instrument-a", "native_symbol": "A-USD"})
+    second = _key(instrument={"instrument_id": "instrument-b", "native_symbol": "B-USD"})
+    hub, provider, _published = _hub(
+        keys=(first, second), principals=("principal:a",)
+    )
+    registration = GatewayMarketRegistration("principal:a", "domain:paper")
+    service = GatewayMarketService(hub, registrations={"registration:a": registration})
+    snapshot = hub.snapshot
+    calls = 0
+
+    def fail_second_snapshot(key: MarketSubscriptionKey):
+        nonlocal calls
+        calls += 1
+        if key == second:
+            raise RuntimeError("synthetic snapshot serialization failure")
+        return snapshot(key)
+
+    monkeypatch.setattr(hub, "snapshot", fail_second_snapshot)
+    result = service.handle(
+        "market.bootstrap_many",
+        principal_ref="principal:a",
+        scope=_scope(),
+        arguments={
+            "subscriptions": [
+                {"key": first.to_dict()},
+                {"key": second.to_dict()},
+            ]
+        },
+        registration_id="registration:a",
+    )
+
+    assert result == {"status": "rejected", "code": "BOOTSTRAP_FAILED"}
+    assert calls == 2
+    assert provider.active_handles == set()
+    assert len(provider.unsubscribed) == 2
+    assert hub.readiness["active_registrations"] == 0
+    hub.close()
+
+
+def test_market_bootstrap_many_reports_partial_provider_failure_as_unknown() -> None:
+    first = _key(instrument={"instrument_id": "instrument-a", "native_symbol": "A-USD"})
+    second = _key(instrument={"instrument_id": "instrument-b", "native_symbol": "B-USD"})
+
+    class FailSecondProvider(CountedProvider):
+        def subscribe(self, key: MarketSubscriptionKey, *, generation: str) -> object:
+            if key == second:
+                raise OSError("synthetic provider setup uncertainty")
+            return super().subscribe(key, generation=generation)
+
+    provider = FailSecondProvider()
+    hub, _provider, _published = _hub(
+        keys=(first, second), principals=("principal:a",), provider=provider
+    )
+    registration = GatewayMarketRegistration("principal:a", "domain:paper")
+    service = GatewayMarketService(hub, registrations={"registration:a": registration})
+
+    result = service.handle(
+        "market.bootstrap_many",
+        principal_ref="principal:a",
+        scope=_scope(),
+        arguments={
+            "subscriptions": [
+                {"key": first.to_dict()},
+                {"key": second.to_dict()},
+            ]
+        },
+        registration_id="registration:a",
+    )
+
+    assert result == {
+        "status": "unknown",
+        "code": "BATCH_SUBSCRIBE_OUTCOME_UNKNOWN",
+        "uncertain_stream_ids": (second.stream_id,),
+    }
+    assert hub.registration_active(first, "registration:a") is False
+    assert hub.registration_active(second, "registration:a") is False
+    assert provider.active_handles == set()
+    assert len(provider.unsubscribed) == 1
+    with pytest.raises(GatewayMarketHubError, match="PROVIDER_SUBSCRIBE_OUTCOME_UNKNOWN"):
+        hub.subscribe("principal:a", second, "registration:a")
+    with pytest.raises(GatewayMarketHubError, match="PROVIDER_SUBSCRIBE_OUTCOME_UNKNOWN"):
+        service.handle(
+            "market.unsubscribe",
+            principal_ref="principal:a",
+            scope=_scope(),
+            arguments={"key": second.to_dict()},
+            registration_id="registration:a",
+        )
+
+
+def test_market_bootstrap_many_distinguishes_confirmed_and_uncertain_descriptor_rollback() -> None:
+    key = _key()
+    registration = GatewayMarketRegistration("principal:a", "domain:paper")
+
+    provider = DescribingProvider()
+    hub, _provider, _published = _hub(
+        keys=(key,), principals=("principal:a",), provider=provider
+    )
+    service = GatewayMarketService(hub, registrations={"registration:a": registration})
+    arguments = {
+        "subscriptions": [
+            {"key": key.to_dict(), "require_source_descriptor": True}
+        ]
+    }
+    rejected = service.handle(
+        "market.bootstrap_many",
+        principal_ref="principal:a",
+        scope=_scope(),
+        arguments=arguments,
+        registration_id="registration:a",
+    )
+    assert rejected == {
+        "status": "rejected",
+        "code": "MARKET_SOURCE_DESCRIPTOR_UNAVAILABLE",
+    }
+    assert provider.active_handles == set()
+    assert len(provider.unsubscribed) == 1
+    assert hub.readiness["active_registrations"] == 0
+    hub.close()
+
+    class FailOnceReleaseProvider(DescribingProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_release = True
+
+        def unsubscribe(self, handle: object) -> bool:
+            self.unsubscribed.append(handle)
+            if self.fail_release:
+                self.fail_release = False
+                return False
+            self.active_handles.discard(handle)
+            return True
+
+    uncertain_provider = FailOnceReleaseProvider()
+    uncertain_hub, _provider, _published = _hub(
+        keys=(key,), principals=("principal:a",), provider=uncertain_provider
+    )
+    uncertain_service = GatewayMarketService(
+        uncertain_hub, registrations={"registration:a": registration}
+    )
+    unknown = uncertain_service.handle(
+        "market.bootstrap_many",
+        principal_ref="principal:a",
+        scope=_scope(),
+        arguments=arguments,
+        registration_id="registration:a",
+    )
+    assert unknown == {
+        "status": "unknown",
+        "code": "BATCH_SUBSCRIBE_OUTCOME_UNKNOWN",
+        "uncertain_stream_ids": (key.stream_id,),
+    }
+    assert uncertain_hub.readiness["active_registrations"] == 0
+    assert len(uncertain_provider.active_handles) == 1
+    uncertain_hub.close()
+    assert uncertain_provider.active_handles == set()
+
 def test_registration_binding_is_idempotent_but_cannot_be_rebound() -> None:
     hub, _, _ = _hub()
     service = GatewayMarketService(hub)

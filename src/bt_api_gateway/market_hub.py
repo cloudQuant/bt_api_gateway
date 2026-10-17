@@ -54,6 +54,7 @@ from bt_api_base.service_protocol import (
 
 MARKET_OPERATIONS = frozenset(
     {
+        "market.bootstrap_many",
         "market.subscribe",
         "market.unsubscribe",
         "market.snapshot",
@@ -217,6 +218,7 @@ class _MarketStream:
     handle: Optional[object] = None  # noqa: UP045 -- Python 3.9 support.
     registrations: set[str] = field(default_factory=set)
     starting: bool = False
+    start_uncertain: bool = False
     releasing: bool = False
     pending_release: bool = False
     needs_new_epoch: bool = False
@@ -490,6 +492,8 @@ class GatewayMarketHub:
             raise GatewayMarketHubError("INVALID_SOURCE_DESCRIPTOR_REQUEST")
         if stream.starting or stream.releasing:
             raise GatewayMarketHubError("STREAM_TRANSITION_IN_PROGRESS", retryable=True)
+        if stream.start_uncertain:
+            raise GatewayMarketHubError("PROVIDER_SUBSCRIBE_OUTCOME_UNKNOWN", retryable=True)
 
         already_subscribed = registration_id in stream.registrations
         if already_subscribed:
@@ -525,10 +529,15 @@ class GatewayMarketHub:
             try:
                 handle = self._provider.subscribe(key, generation=generation)
             except Exception:
+                # A provider may have accepted a connection before reporting
+                # failure. With no returned handle, this Hub cannot prove a
+                # later retry would not create a duplicate upstream stream.
+                stream.start_uncertain = True
                 raise GatewayMarketHubError("PROVIDER_SUBSCRIBE_FAILED", retryable=True) from None
             finally:
                 stream.starting = False
             if handle is None:
+                stream.start_uncertain = True
                 raise GatewayMarketHubError("INVALID_PROVIDER_HANDLE", retryable=True)
             stream.handle = handle
             stream.generation = generation
@@ -576,6 +585,8 @@ class GatewayMarketHub:
         _require_reference(registration_id, "INVALID_REGISTRATION")
         if stream.starting or stream.releasing:
             raise GatewayMarketHubError("STREAM_TRANSITION_IN_PROGRESS", retryable=True)
+        if stream.start_uncertain:
+            raise GatewayMarketHubError("PROVIDER_SUBSCRIBE_OUTCOME_UNKNOWN", retryable=True)
         if registration_id in stream.registrations:
             stream.registrations.remove(registration_id)
             self._registration_ref_count -= 1
@@ -967,6 +978,8 @@ class GatewayMarketHub:
         self._check_owner()
         if any(stream.starting for stream in self._streams.values()):
             raise GatewayMarketHubError("PROVIDER_START_IN_PROGRESS", retryable=True)
+        if any(stream.start_uncertain for stream in self._streams.values()):
+            raise GatewayMarketHubError("PROVIDER_SUBSCRIBE_OUTCOME_UNKNOWN", retryable=True)
         self._closing = True
         failed = 0
         for stream in self._streams.values():
@@ -1187,6 +1200,12 @@ class GatewayMarketService:
             raise GatewayMarketServiceError("UNSUPPORTED_OPERATION")
         self._resolve_registration(principal_ref, scope, registration_id)
         raw = _require_arguments(arguments)
+        if operation == "market.bootstrap_many":
+            return self._handle_bootstrap_many(
+                principal_ref=principal_ref,
+                registration_id=registration_id,
+                raw=raw,
+            )
         require_source_descriptor = False
         if operation == "market.subscribe":
             if set(raw) == {"key"}:
@@ -1255,6 +1274,162 @@ class GatewayMarketService:
         result = dict(batch)
         result["events"] = tuple(_envelope_mapping(event) for event in batch["events"])
         return MappingProxyType(result)
+
+    def _handle_bootstrap_many(
+        self,
+        *,
+        principal_ref: str,
+        registration_id: str,
+        raw: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        """Acquire a bounded set of public streams under one exact registration.
+
+        All authorization and capacity checks happen before the first provider
+        call. If a later acquisition or reply-size check fails, newly acquired
+        refs are released in reverse order. The result distinguishes a clean
+        rejection from any provider state whose cleanup cannot be confirmed.
+        """
+        _require_exact_arguments(raw, {"subscriptions"})
+        subscriptions = raw["subscriptions"]
+        if type(subscriptions) not in (tuple, list) or not 1 <= len(subscriptions) <= 20:
+            raise GatewayMarketServiceError("INVALID_BOOTSTRAP_BATCH")
+
+        parsed: list[tuple[MarketSubscriptionKey, bool, bool]] = []
+        seen: set[MarketSubscriptionKey] = set()
+        preflight_uncertain: set[str] = set()
+        try:
+            self._hub._ensure_open()
+            if self._hub._publisher is None:
+                raise GatewayMarketHubError("PUBLISHER_NOT_CONFIGURED")
+            if self._hub._registration_ref_count + len(subscriptions) > MAX_MARKET_REGISTRATION_REFS:
+                raise GatewayMarketHubError("REGISTRATION_REF_LIMIT_EXCEEDED")
+            for item in subscriptions:
+                if not isinstance(item, Mapping) or set(item) not in (
+                    {"key"},
+                    {"key", "require_source_descriptor"},
+                ):
+                    raise GatewayMarketServiceError("INVALID_BOOTSTRAP_BATCH")
+                requested_descriptor = item.get("require_source_descriptor", False)
+                if type(requested_descriptor) is not bool:
+                    raise GatewayMarketServiceError("INVALID_BOOTSTRAP_BATCH")
+                key = _parse_key(item["key"])
+                if key in seen:
+                    raise GatewayMarketServiceError("DUPLICATE_MARKET_KEY")
+                seen.add(key)
+                # Each item receives the same independently enforced public
+                # market ACL as a standalone market.subscribe call.
+                stream = self._hub._authorize_key(principal_ref, key)
+                if registration_id in stream.registrations:
+                    raise GatewayMarketServiceError("MARKET_ALREADY_SUBSCRIBED")
+                if stream.starting or stream.releasing:
+                    raise GatewayMarketServiceError("STREAM_TRANSITION_IN_PROGRESS")
+                if stream.start_uncertain:
+                    preflight_uncertain.add(key.stream_id)
+                # Descriptor rejection on a stream already held by another
+                # registration creates no new provider state for this caller.
+                had_shared_handle = stream.handle is not None and bool(stream.registrations)
+                parsed.append((key, requested_descriptor, had_shared_handle))
+        except GatewayMarketServiceError as exc:
+            return MappingProxyType({"status": "rejected", "code": exc.code})
+        except GatewayMarketHubError as exc:
+            return MappingProxyType({"status": "rejected", "code": exc.code})
+
+        if preflight_uncertain:
+            return MappingProxyType(
+                {
+                    "status": "unknown",
+                    "code": "BATCH_SUBSCRIBE_OUTCOME_UNKNOWN",
+                    "uncertain_stream_ids": tuple(sorted(preflight_uncertain)),
+                }
+            )
+
+        acquired: list[MarketSubscriptionKey] = []
+        uncertain: set[str] = set()
+        items: list[dict[str, object]] = []
+        failure_code: str | None = None
+        for key, require_source_descriptor, had_shared_handle in parsed:
+            try:
+                subscription = self._hub.subscribe(
+                    principal_ref,
+                    key,
+                    registration_id,
+                    require_source_descriptor=require_source_descriptor,
+                )
+                acquired.append(key)
+                snapshot = dict(self._hub.snapshot(key))
+                event = snapshot["event"]
+                snapshot["event"] = None if event is None else dict(_envelope_mapping(event))
+                head = dict(self._hub.head(key))
+                items.append(
+                    {
+                        "subscription": dict(subscription),
+                        "snapshot": snapshot,
+                        "head": head,
+                    }
+                )
+            except GatewayMarketHubError as exc:
+                failure_code = exc.code
+                # Provider acquisition and failed-release errors can leave a
+                # resource whose exact state cannot be inferred by the caller.
+                if exc.code in {
+                    "PROVIDER_SUBSCRIBE_FAILED",
+                    "PROVIDER_SUBSCRIBE_OUTCOME_UNKNOWN",
+                    "INVALID_PROVIDER_HANDLE",
+                    "PROVIDER_UNSUBSCRIBE_FAILED",
+                }:
+                    uncertain.add(key.stream_id)
+                elif exc.code == "MARKET_SOURCE_DESCRIPTOR_UNAVAILABLE" and not had_shared_handle:
+                    stream = self._hub._stream(key)
+                    if stream.start_uncertain or stream.handle is not None:
+                        # Hub.subscribe tried to release a newly acquired
+                        # provider handle before reporting the descriptor
+                        # failure. A retained handle means that release was
+                        # not confirmed, so the caller must retain uncertainty.
+                        uncertain.add(key.stream_id)
+                break
+            except Exception:
+                failure_code = "BOOTSTRAP_FAILED"
+                break
+
+        if failure_code is None:
+            reply: dict[str, object] = {"status": "active", "items": items}
+            try:
+                encoded_size = len(
+                    json.dumps(
+                        reply,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8", errors="strict")
+                )
+            except Exception:
+                failure_code = "INVALID_BOOTSTRAP_REPLY"
+                uncertain.update(key.stream_id for key in acquired)
+            else:
+                # Leave margin for the enclosing WireEnvelope and protocol
+                # headers; never let serialization fail after acquiring refs.
+                if encoded_size > MAX_WIRE_MESSAGE_BYTES - 8_192:
+                    failure_code = "BATCH_REPLY_TOO_LARGE"
+
+        if failure_code is None:
+            return MappingProxyType(reply)
+
+        for key in reversed(acquired):
+            try:
+                self._hub.unsubscribe(principal_ref, key, registration_id)
+            except GatewayMarketHubError:
+                uncertain.add(key.stream_id)
+            except Exception:
+                uncertain.add(key.stream_id)
+        if uncertain:
+            return MappingProxyType(
+                {
+                    "status": "unknown",
+                    "code": "BATCH_SUBSCRIBE_OUTCOME_UNKNOWN",
+                    "uncertain_stream_ids": tuple(sorted(uncertain)),
+                }
+            )
+        return MappingProxyType({"status": "rejected", "code": failure_code})
 
     @staticmethod
     def _validate_registration(
