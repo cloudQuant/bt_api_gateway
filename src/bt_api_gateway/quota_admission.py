@@ -17,6 +17,7 @@ owner rather than creating independent limiters.
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 import math
 import os
@@ -51,6 +52,26 @@ _NANOSECONDS = 1_000_000_000
 _MAX_QUEUE = 65_536
 _MAX_CAPACITY = 1_000_000
 _MAX_PROVIDER_CALL_TIMEOUT_SECONDS = 86_400.0
+
+
+def _is_sqlite_busy(exc: sqlite3.OperationalError) -> bool:
+    """Identify SQLite lock-acquisition conflicts across supported runtimes."""
+
+    error_code = getattr(exc, "sqlite_errorcode", None)
+    busy_codes = {
+        getattr(sqlite3, "SQLITE_BUSY", 5),
+        getattr(sqlite3, "SQLITE_LOCKED", 6),
+    }
+    if isinstance(error_code, int):
+        return (error_code & 0xFF) in busy_codes
+    # Python 3.9 exposes no sqlite_errorcode attribute. Keep only SQLite's
+    # canonical lock messages as a compatibility fallback, never a substring
+    # match against arbitrary operational errors.
+    return str(exc).lower() in {
+        "database is locked",
+        "database table is locked",
+        "database schema is locked",
+    }
 
 
 class GatewayQuotaOperation(str, Enum):
@@ -123,6 +144,290 @@ class GatewayQuotaGrant:
     granted_monotonic_ns: int
     subject_digest: str
     run_digest: Optional[str]
+
+
+@dataclass(frozen=True, slots=True)
+class _WaitWakeSnapshot:
+    """Immutable committed facts for calculating an advisory wake hint."""
+
+    waiters: tuple[tuple[object, ...], ...]
+    request_id: str
+    now_ns: int
+    base_wake_ns: int
+    grant_count: int
+    grant_sequence: int
+    capacity: int
+    reserved_capacity: int
+    projected_now_ns: int
+    deadline_monotonic_ns: int
+    poll_interval_ns: int
+    next_quota_event_ns: Optional[int]  # noqa: UP045 -- Gateway package supports Python 3.9.
+
+
+def _subject_queue_candidate(
+    queue: list[tuple[str, str, int, int]],
+    *,
+    grant_count: int,
+    capacity: int,
+    reserved_capacity: int,
+) -> Optional[tuple[str, str, int, int]]:  # noqa: UP045 -- Python 3.9.
+    """Select this subject's ticket head, with only the reserved critical bypass."""
+
+    if not queue:
+        return None
+
+    regular_limit = capacity - reserved_capacity
+    head = queue[0]
+    head_is_critical = head[1] in _CRITICAL_OPERATIONS
+    head_limit = capacity if head_is_critical else regular_limit
+    if grant_count < head_limit:
+        return head
+
+    # A regular head keeps its place whenever regular capacity is available.
+    # Only a blocked regular head may yield a subject turn to its earliest
+    # critical waiter, and only while the reserved part of total capacity is
+    # still available.
+    if head_is_critical or grant_count >= capacity:
+        return None
+    return next(
+        (row for row in queue[1:] if row[1] in _CRITICAL_OPERATIONS),
+        None,
+    )
+
+
+def _virtual_waiter_rank(
+    waiters: list[tuple[object, ...]],
+    request_id: str,
+    *,
+    grant_count: int,
+    grant_sequence: int,
+    capacity: int,
+    reserved_capacity: int,
+    projected_now_ns: int,
+    include_overflow: bool = False,
+) -> tuple[Optional[int], Optional[int]]:  # noqa: UP045 -- Python 3.9.
+    """Return an advisory rank using the same subject-head selector as admission.
+
+    The durable snapshot is held fixed while virtual service turns advance the
+    global sequence. By default it simulates only the target operation's
+    currently open burst and stops at its quota threshold. With
+    ``include_overflow``, it continues with a bounded advisory queue-turn rank
+    at the projected eligibility snapshot; those turns only stagger rechecks
+    and never represent or authorize future grants. Expiry times are projected
+    by the caller from persisted grants; every wake still rechecks SQLite
+    under the writer transaction.
+    """
+
+    target_row = next(
+        (row for row in waiters if str(row[0]) == request_id),
+        None,
+    )
+    if target_row is None or int(target_row[5]) <= projected_now_ns:
+        return None, None
+
+    target_operation = str(target_row[2])
+    target_limit = (
+        capacity
+        if target_operation in _CRITICAL_OPERATIONS
+        else capacity - reserved_capacity
+    )
+    if grant_count >= target_limit:
+        return None, None
+
+    queues: dict[str, list[tuple[str, str, int, int]]] = {}
+    last_served: dict[str, int] = {}
+    for row in waiters:
+        if int(row[5]) <= projected_now_ns:
+            continue
+        request = str(row[0])
+        subject = str(row[1])
+        operation = str(row[2])
+        ticket = int(row[3])
+        last_served.setdefault(subject, int(row[4]))
+        deadline = int(row[5])
+        queues.setdefault(subject, []).append((request, operation, ticket, deadline))
+
+    for queue in queues.values():
+        queue.sort(key=lambda row: row[2])
+
+    regular_limit = capacity - reserved_capacity
+
+    def eligible_heads(count: int) -> list[tuple[int, int, str]]:
+        result: list[tuple[int, int, str]] = []
+        for subject, queue in queues.items():
+            selected = _subject_queue_candidate(
+                queue,
+                grant_count=count,
+                capacity=capacity,
+                reserved_capacity=reserved_capacity,
+            )
+            if selected is not None:
+                heapq.heappush(result, (last_served[subject], selected[2], subject))
+        return result
+
+    heads = eligible_heads(grant_count)
+
+    virtual_sequence = grant_sequence
+    rank = 0
+    projected_grants = grant_count
+    predecessor_deadline: Optional[int] = None  # noqa: UP045 -- Python 3.9.
+    overflow_mode = False
+    overflow_eligibility_count = max(0, target_limit - 1)
+    # Only simulate the currently open burst for this request. In particular,
+    # a regular request must not be ranked behind critical turns that would
+    # consume reserved-only capacity after the regular threshold closes.
+    while True:
+        if projected_grants >= target_limit and not overflow_mode:
+            if not include_overflow:
+                break
+            overflow_mode = True
+            # Preserve each subject's position after the actual open burst,
+            # then rank the queue at the target operation's next-slot
+            # boundary. This keeps a critical request from being placed
+            # behind regular-only heads while only reserved capacity can
+            # reopen, and keeps regular requests within their own threshold.
+            # The rank is only a wake hint; no grant or capacity change is
+            # assumed.
+            heads = eligible_heads(overflow_eligibility_count)
+        if not heads:
+            break
+
+        _, selected_ticket, subject = heapq.heappop(heads)
+        eligibility_count = (
+            overflow_eligibility_count if overflow_mode else projected_grants
+        )
+        current = _subject_queue_candidate(
+            queues[subject],
+            grant_count=eligibility_count,
+            capacity=capacity,
+            reserved_capacity=reserved_capacity,
+        )
+        if current is None:
+            continue
+        if current[2] != selected_ticket:
+            # A quota threshold changed since this subject was inserted in
+            # the heap. Re-key its newly eligible ticket without consuming a
+            # virtual service turn.
+            heapq.heappush(
+                heads, (last_served[subject], current[2], subject)
+            )
+            continue
+        if current[0] == request_id:
+            return rank, predecessor_deadline
+
+        if predecessor_deadline is None or current[3] < predecessor_deadline:
+            predecessor_deadline = current[3]
+        rank += 1
+        virtual_sequence += 1
+        if not overflow_mode:
+            projected_grants += 1
+        last_served[subject] = virtual_sequence
+        queues[subject].remove(current)
+        if not overflow_mode and projected_grants == regular_limit:
+            # The regular threshold changes every subject's selected ticket:
+            # rebuild once so blocked regular heads can yield only to their
+            # own earliest critical waiter.
+            heads = eligible_heads(projected_grants)
+        else:
+            next_waiter = _subject_queue_candidate(
+                queues[subject],
+                grant_count=(
+                    overflow_eligibility_count if overflow_mode else projected_grants
+                ),
+                capacity=capacity,
+                reserved_capacity=reserved_capacity,
+            )
+            if next_waiter is not None:
+                heapq.heappush(
+                    heads, (last_served[subject], next_waiter[2], subject)
+                )
+
+    return None, predecessor_deadline
+
+
+def _virtual_waiter_wake_rank(
+    waiters: list[tuple[object, ...]],
+    request_id: str,
+    *,
+    grant_count: int,
+    grant_sequence: int,
+    capacity: int,
+    reserved_capacity: int,
+    projected_now_ns: int,
+) -> tuple[Optional[int], Optional[int]]:  # noqa: UP045 -- Python 3.9.
+    """Use exact open-burst rank, then advisory queue-turn rank for overflow."""
+
+    return _virtual_waiter_rank(
+        waiters,
+        request_id,
+        grant_count=grant_count,
+        grant_sequence=grant_sequence,
+        capacity=capacity,
+        reserved_capacity=reserved_capacity,
+        projected_now_ns=projected_now_ns,
+        include_overflow=True,
+    )
+
+
+def _ranked_wake_ns(
+    now_ns: int,
+    base_wake_ns: int,
+    rank: Optional[int],  # noqa: UP045 -- Python 3.9.
+    predecessor_deadline_ns: Optional[int],  # noqa: UP045 -- Python 3.9.
+    deadline_monotonic_ns: int,
+    poll_interval_ns: int,
+    next_quota_event_ns: Optional[int],  # noqa: UP045 -- Python 3.9.
+) -> int:
+    """Spread advisory polls without letting capacity expiry erase the rank."""
+
+    wake_ns = base_wake_ns + (
+        poll_interval_ns if rank is None else rank * poll_interval_ns
+    )
+    wake_ns = min(wake_ns, deadline_monotonic_ns)
+    if predecessor_deadline_ns is not None:
+        wake_ns = min(wake_ns, predecessor_deadline_ns)
+    # A known positive expiry only increases capacity; it does not invalidate
+    # the queue-turn hint. Keep the stagger so every queued caller does not
+    # wake on each closely spaced expiry. The writer transaction reselects
+    # and rechecks all durable state after the scheduled wake.
+    if (
+        rank is None
+        and next_quota_event_ns is not None
+        and next_quota_event_ns > base_wake_ns
+    ):
+        wake_ns = min(wake_ns, next_quota_event_ns)
+    return max(now_ns, wake_ns)
+
+
+def _wake_ns_from_snapshot(snapshot: _WaitWakeSnapshot) -> int:
+    """Calculate an absolute wake hint after the writer transaction closes."""
+
+    try:
+        rank, predecessor_deadline_ns = _virtual_waiter_wake_rank(
+            snapshot.waiters,
+            snapshot.request_id,
+            grant_count=snapshot.grant_count,
+            grant_sequence=snapshot.grant_sequence,
+            capacity=snapshot.capacity,
+            reserved_capacity=snapshot.reserved_capacity,
+            projected_now_ns=snapshot.projected_now_ns,
+        )
+        wake_at_ns = _ranked_wake_ns(
+            snapshot.now_ns,
+            snapshot.base_wake_ns,
+            rank,
+            predecessor_deadline_ns,
+            snapshot.deadline_monotonic_ns,
+            snapshot.poll_interval_ns,
+            snapshot.next_quota_event_ns,
+        )
+        return wake_at_ns
+    except GatewayQuotaAdmissionError:
+        raise
+    except Exception:
+        # Before this computation moved past transaction scope, _transaction
+        # normalized unexpected helper failures to the same finite error.
+        raise GatewayQuotaAdmissionError("OWNER_UNAVAILABLE") from None
 
 
 class GatewayQuotaAdmission:
@@ -347,10 +652,31 @@ class GatewayQuotaAdmission:
 
             while True:
                 wait_seconds = self._poll_interval_seconds
+                wake_at_ns: Optional[int] = None  # noqa: UP045 -- Python 3.9.
+                wake_snapshot: Optional[_WaitWakeSnapshot] = None  # noqa: UP045 -- Python 3.9.
+                pending_grant: Optional[GatewayQuotaGrant] = None  # noqa: UP045 -- Python 3.9.
+                clock_epoch_reset = False
+
+                def mark_clock_epoch_reset() -> None:
+                    nonlocal clock_epoch_reset
+                    clock_epoch_reset = True
+
                 with self._transaction(deadline_monotonic_ns) as connection:
-                    now = self._clock_locked(connection, time.monotonic_ns())
+                    now = self._clock_locked(
+                        connection,
+                        time.monotonic_ns(),
+                        on_epoch_reset=mark_clock_epoch_reset,
+                    )
+                    if clock_epoch_reset:
+                        continue
                     self._prune_locked(connection, now)
-                    now = self._clock_locked(connection, time.monotonic_ns())
+                    now = self._clock_locked(
+                        connection,
+                        time.monotonic_ns(),
+                        on_epoch_reset=mark_clock_epoch_reset,
+                    )
+                    if clock_epoch_reset:
+                        continue
                     if now >= deadline_monotonic_ns:
                         raise GatewayQuotaAdmissionError("DEADLINE_EXCEEDED")
                     own = connection.execute(
@@ -367,48 +693,164 @@ class GatewayQuotaAdmission:
                         (self._domain_digest,),
                     ).fetchone()
                     backoff_until_ns = int(domain[0])
-                    if backoff_until_ns > now:
-                        wait_seconds = min(
-                            wait_seconds,
-                            (backoff_until_ns - now) / _NANOSECONDS,
+                    grant_count = self._scalar(
+                        connection,
+                        "SELECT COUNT(*) FROM grants WHERE domain_digest = ?",
+                        (self._domain_digest,),
+                    )
+                    rows = connection.execute(
+                        "SELECT w.request_id, w.subject_digest, w.operation, w.ticket, "
+                        "COALESCE(s.last_served_sequence, 0), w.deadline_ns "
+                        "FROM waiters AS w LEFT JOIN quota_subjects AS s "
+                        "ON s.domain_digest = w.domain_digest "
+                        "AND s.subject_digest = w.subject_digest "
+                        "WHERE w.domain_digest = ? ORDER BY w.ticket",
+                        (self._domain_digest,),
+                    ).fetchall()
+                    threshold = (
+                        self._capacity
+                        if operation.value in _CRITICAL_OPERATIONS
+                        else self._capacity - self._reserved_capacity
+                    )
+                    if threshold <= 0:
+                        wait_seconds = max(
+                            0.0,
+                            (deadline_monotonic_ns - now) / _NANOSECONDS,
+                        )
+                    elif grant_count >= threshold:
+                        needed_to_expire = grant_count - threshold + 1
+                        quota_slot_row = connection.execute(
+                            "SELECT granted_ns FROM grants WHERE domain_digest = ? "
+                            "ORDER BY granted_ns LIMIT 1 OFFSET ?",
+                            (self._domain_digest, needed_to_expire - 1),
+                        ).fetchone()
+                        if quota_slot_row is not None:
+                            quota_available_ns = (
+                                int(quota_slot_row[0]) + self._window_ns
+                            )
+                            base_wake_ns = max(quota_available_ns, backoff_until_ns)
+                            projected_grant_count = self._scalar(
+                                connection,
+                                "SELECT COUNT(*) FROM grants WHERE domain_digest = ? "
+                                "AND granted_ns > ?",
+                                (
+                                    self._domain_digest,
+                                    base_wake_ns - self._window_ns,
+                                ),
+                            )
+                            next_grant_after_wake = connection.execute(
+                                "SELECT MIN(granted_ns) FROM grants WHERE domain_digest = ? "
+                                "AND granted_ns > ?",
+                                (
+                                    self._domain_digest,
+                                    base_wake_ns - self._window_ns,
+                                ),
+                            ).fetchone()[0]
+                            next_quota_event_ns = (
+                                int(next_grant_after_wake) + self._window_ns
+                                if next_grant_after_wake is not None
+                                else None
+                            )
+                            wake_snapshot = _WaitWakeSnapshot(
+                                waiters=tuple(rows),
+                                request_id=request_id,
+                                now_ns=now,
+                                base_wake_ns=base_wake_ns,
+                                grant_count=projected_grant_count,
+                                grant_sequence=int(domain[1]),
+                                capacity=self._capacity,
+                                reserved_capacity=self._reserved_capacity,
+                                projected_now_ns=base_wake_ns,
+                                deadline_monotonic_ns=deadline_monotonic_ns,
+                                poll_interval_ns=int(
+                                    self._poll_interval_seconds * _NANOSECONDS
+                                ),
+                                next_quota_event_ns=next_quota_event_ns,
+                            )
+                        else:
+                            # Conservatively keep the normal cadence if the
+                            # active-grant projection is unexpectedly short.
+                            wait_seconds = self._poll_interval_seconds
+                    elif backoff_until_ns > now:
+                        projected_grant_count = self._scalar(
+                            connection,
+                            "SELECT COUNT(*) FROM grants WHERE domain_digest = ? "
+                            "AND granted_ns > ?",
+                            (
+                                self._domain_digest,
+                                backoff_until_ns - self._window_ns,
+                            ),
+                        )
+                        next_grant_after_backoff = connection.execute(
+                            "SELECT MIN(granted_ns) FROM grants WHERE domain_digest = ? "
+                            "AND granted_ns > ?",
+                            (
+                                self._domain_digest,
+                                backoff_until_ns - self._window_ns,
+                            ),
+                        ).fetchone()[0]
+                        next_quota_event_ns = (
+                            int(next_grant_after_backoff) + self._window_ns
+                            if next_grant_after_backoff is not None
+                            else None
+                        )
+                        wake_snapshot = _WaitWakeSnapshot(
+                            waiters=tuple(rows),
+                            request_id=request_id,
+                            now_ns=now,
+                            base_wake_ns=backoff_until_ns,
+                            grant_count=projected_grant_count,
+                            grant_sequence=int(domain[1]),
+                            capacity=self._capacity,
+                            reserved_capacity=self._reserved_capacity,
+                            projected_now_ns=backoff_until_ns,
+                            deadline_monotonic_ns=deadline_monotonic_ns,
+                            poll_interval_ns=int(
+                                self._poll_interval_seconds * _NANOSECONDS
+                            ),
+                            next_quota_event_ns=next_quota_event_ns,
                         )
                     else:
-                        grant_count = self._scalar(
-                            connection,
-                            "SELECT COUNT(*) FROM grants WHERE domain_digest = ?",
-                            (self._domain_digest,),
-                        )
-                        rows = connection.execute(
-                            "SELECT w.request_id, w.subject_digest, w.operation, w.ticket, "
-                            "COALESCE(s.last_served_sequence, 0) "
-                            "FROM waiters AS w LEFT JOIN quota_subjects AS s "
-                            "ON s.domain_digest = w.domain_digest "
-                            "AND s.subject_digest = w.subject_digest "
-                            "WHERE w.domain_digest = ? ORDER BY w.ticket",
-                            (self._domain_digest,),
-                        ).fetchall()
-                        subject_heads: dict[str, tuple[object, ...]] = {}
+                        subject_waiters: dict[
+                            str, list[tuple[str, str, int, int]]
+                        ] = {}
+                        rows_by_request: dict[str, tuple[object, ...]] = {}
                         for row in rows:
-                            subject_heads.setdefault(str(row[1]), tuple(row))
+                            request_key = str(row[0])
+                            subject_key = str(row[1])
+                            rows_by_request[request_key] = tuple(row)
+                            subject_waiters.setdefault(subject_key, []).append(
+                                (
+                                    request_key,
+                                    str(row[2]),
+                                    int(row[3]),
+                                    int(row[5]),
+                                )
+                            )
 
                         eligible: list[tuple[object, ...]] = []
-                        regular_limit = self._capacity - self._reserved_capacity
-                        for row in subject_heads.values():
-                            is_reserved = str(row[2]) in _CRITICAL_OPERATIONS
-                            allowed = (
-                                grant_count < self._capacity
-                                if is_reserved
-                                else grant_count < regular_limit
+                        for queue in subject_waiters.values():
+                            selected = _subject_queue_candidate(
+                                queue,
+                                grant_count=grant_count,
+                                capacity=self._capacity,
+                                reserved_capacity=self._reserved_capacity,
                             )
-                            if allowed:
-                                eligible.append(row)
+                            if selected is not None:
+                                eligible.append(rows_by_request[selected[0]])
                         candidate = min(
                             eligible,
                             key=lambda row: (int(row[4]), int(row[3])),
                             default=None,
                         )
                         if candidate is not None and str(candidate[0]) == request_id:
-                            now = self._clock_locked(connection, time.monotonic_ns())
+                            now = self._clock_locked(
+                                connection,
+                                time.monotonic_ns(),
+                                on_epoch_reset=mark_clock_epoch_reset,
+                            )
+                            if clock_epoch_reset:
+                                continue
                             if now >= deadline_monotonic_ns:
                                 raise GatewayQuotaAdmissionError("DEADLINE_EXCEEDED")
                             sequence = int(domain[1]) + 1
@@ -454,8 +896,7 @@ class GatewayQuotaAdmission:
                                     self._domain_digest,
                                 ),
                             )
-                            granted = True
-                            return GatewayQuotaGrant(
+                            pending_grant = GatewayQuotaGrant(
                                 grant_id=grant_id,
                                 operation=operation,
                                 sequence=sequence,
@@ -463,10 +904,56 @@ class GatewayQuotaAdmission:
                                 subject_digest=subject_digest,
                                 run_digest=run_digest,
                             )
-                remaining_seconds = (deadline_monotonic_ns - time.monotonic_ns()) / _NANOSECONDS
-                if remaining_seconds <= 0:
+                        else:
+                            next_grant = connection.execute(
+                                "SELECT MIN(granted_ns) FROM grants WHERE domain_digest = ?",
+                                (self._domain_digest,),
+                            ).fetchone()[0]
+                            next_quota_event_ns = (
+                                int(next_grant) + self._window_ns
+                                if next_grant is not None
+                                else None
+                            )
+                            wake_snapshot = _WaitWakeSnapshot(
+                                waiters=tuple(rows),
+                                request_id=request_id,
+                                now_ns=now,
+                                base_wake_ns=now,
+                                grant_count=grant_count,
+                                grant_sequence=int(domain[1]),
+                                capacity=self._capacity,
+                                reserved_capacity=self._reserved_capacity,
+                                projected_now_ns=now,
+                                deadline_monotonic_ns=deadline_monotonic_ns,
+                                poll_interval_ns=int(
+                                    self._poll_interval_seconds * _NANOSECONDS
+                                ),
+                                next_quota_event_ns=next_quota_event_ns,
+                            )
+                if pending_grant is not None:
+                    # Only treat the waiter as granted once COMMIT has
+                    # returned successfully. A late successful commit keeps
+                    # its quota record but is not returned as usable capacity.
+                    granted = True
+                    if time.monotonic_ns() >= deadline_monotonic_ns:
+                        raise GatewayQuotaAdmissionError("DEADLINE_EXCEEDED")
+                    return pending_grant
+                if wake_snapshot is not None:
+                    # The hint is derived only from the immutable committed
+                    # snapshot. The next loop iteration performs a fresh
+                    # writer-transaction recheck before any grant.
+                    wake_at_ns = _wake_ns_from_snapshot(wake_snapshot)
+                fresh_now_ns = time.monotonic_ns()
+                remaining_ns = deadline_monotonic_ns - fresh_now_ns
+                if remaining_ns <= 0:
                     raise GatewayQuotaAdmissionError("DEADLINE_EXCEEDED")
-                time.sleep(min(wait_seconds, remaining_seconds))
+                if wake_at_ns is None:
+                    sleep_ns = min(
+                        int(wait_seconds * _NANOSECONDS), remaining_ns
+                    )
+                else:
+                    sleep_ns = min(max(0, wake_at_ns - fresh_now_ns), remaining_ns)
+                time.sleep(sleep_ns / _NANOSECONDS)
         finally:
             if not granted:
                 self._remove_waiter(request_id, deadline_monotonic_ns)
@@ -621,33 +1108,102 @@ class GatewayQuotaAdmission:
     def _transaction(
         self, deadline_monotonic_ns: Optional[int] = None  # noqa: UP045 -- Python 3.9.
     ) -> Iterator[sqlite3.Connection]:
-        if deadline_monotonic_ns is None:
-            timeout_seconds = 1.0
-        else:
-            timeout_seconds = (
-                deadline_monotonic_ns - time.monotonic_ns()
-            ) / _NANOSECONDS
-            if timeout_seconds <= 0:
-                raise GatewayQuotaAdmissionError("DEADLINE_EXCEEDED")
-        try:
-            with self._connection(timeout_seconds=timeout_seconds) as connection:
-                connection.execute("BEGIN IMMEDIATE")
-                try:
-                    yield connection
-                    connection.commit()
-                except BaseException:
-                    connection.rollback()
-                    raise
-        except GatewayQuotaAdmissionError:
-            raise
-        except sqlite3.OperationalError as exc:
-            if deadline_monotonic_ns is not None and time.monotonic_ns() >= deadline_monotonic_ns:
-                raise GatewayQuotaAdmissionError("DEADLINE_EXCEEDED") from None
-            if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+        while True:
+            if deadline_monotonic_ns is None:
+                timeout_seconds = 1.0
+            else:
+                remaining_ns = deadline_monotonic_ns - time.monotonic_ns()
+                if remaining_ns <= 0:
+                    raise GatewayQuotaAdmissionError("DEADLINE_EXCEEDED")
+                # A request must not sit inside SQLite's busy handler for its
+                # whole business deadline. A failed BEGIN is retried outside
+                # SQLite at the existing owner polling cadence.
+                timeout_seconds = min(
+                    self._poll_interval_seconds, remaining_ns / _NANOSECONDS
+                )
+
+            retry_begin = False
+            transaction_started = False
+            try:
+                with self._connection(timeout_seconds=timeout_seconds) as connection:
+                    try:
+                        connection.execute("BEGIN IMMEDIATE")
+                        transaction_started = True
+                    except sqlite3.OperationalError as exc:
+                        if deadline_monotonic_ns is None or not _is_sqlite_busy(exc):
+                            raise
+                        retry_begin = True
+                    if not retry_begin:
+                        committed = False
+                        try:
+                            if (
+                                deadline_monotonic_ns is not None
+                                and time.monotonic_ns() >= deadline_monotonic_ns
+                            ):
+                                raise GatewayQuotaAdmissionError("DEADLINE_EXCEEDED")
+                            yield connection
+                            if deadline_monotonic_ns is not None:
+                                remaining_ns = (
+                                    deadline_monotonic_ns - time.monotonic_ns()
+                                )
+                                if remaining_ns <= 0:
+                                    raise GatewayQuotaAdmissionError(
+                                        "DEADLINE_EXCEEDED"
+                                    )
+                                busy_timeout_ms = int(
+                                    min(
+                                        timeout_seconds,
+                                        remaining_ns / _NANOSECONDS,
+                                    )
+                                    * 1000
+                                )
+                                connection.execute(
+                                    f"PRAGMA busy_timeout = {busy_timeout_ms}"
+                                )
+                                if time.monotonic_ns() >= deadline_monotonic_ns:
+                                    raise GatewayQuotaAdmissionError(
+                                        "DEADLINE_EXCEEDED"
+                                    )
+                            connection.commit()
+                            committed = True
+                        except BaseException:
+                            if not committed:
+                                connection.rollback()
+                            raise
+                        if (
+                            deadline_monotonic_ns is not None
+                            and time.monotonic_ns() >= deadline_monotonic_ns
+                        ):
+                            # COMMIT succeeded. Keep its durable quota row and
+                            # report only that the business deadline elapsed.
+                            raise GatewayQuotaAdmissionError("DEADLINE_EXCEEDED")
+            except GatewayQuotaAdmissionError:
+                raise
+            except sqlite3.OperationalError as exc:
+                if (
+                    deadline_monotonic_ns is not None
+                    and not transaction_started
+                    and time.monotonic_ns() >= deadline_monotonic_ns
+                ):
+                    raise GatewayQuotaAdmissionError("DEADLINE_EXCEEDED") from None
+                # Only BUSY/LOCKED from BEGIN is retryable. Errors from the
+                # transaction body or commit remain terminal and are never
+                # replayed.
+                if _is_sqlite_busy(exc):
+                    raise GatewayQuotaAdmissionError("OWNER_UNAVAILABLE") from None
                 raise GatewayQuotaAdmissionError("OWNER_UNAVAILABLE") from None
-            raise GatewayQuotaAdmissionError("OWNER_UNAVAILABLE") from None
-        except Exception:
-            raise GatewayQuotaAdmissionError("OWNER_UNAVAILABLE") from None
+            except Exception:
+                raise GatewayQuotaAdmissionError("OWNER_UNAVAILABLE") from None
+
+            if not retry_begin:
+                return
+            assert deadline_monotonic_ns is not None
+            remaining_ns = deadline_monotonic_ns - time.monotonic_ns()
+            if remaining_ns <= 0:
+                raise GatewayQuotaAdmissionError("DEADLINE_EXCEEDED")
+            time.sleep(
+                min(self._poll_interval_seconds, remaining_ns / _NANOSECONDS)
+            )
 
     @contextmanager
     def _connection(self, *, timeout_seconds: float = 1.0) -> Iterator[sqlite3.Connection]:
@@ -673,7 +1229,13 @@ class GatewayQuotaAdmission:
             if connection is not None:
                 connection.close()
 
-    def _clock_locked(self, connection: sqlite3.Connection, observed_now: int) -> int:
+    def _clock_locked(
+        self,
+        connection: sqlite3.Connection,
+        observed_now: int,
+        *,
+        on_epoch_reset: Optional[Callable[[], None]] = None,  # noqa: UP045 -- Python 3.9.
+    ) -> int:
         row = connection.execute(
             "SELECT last_mono_ns, backoff_until_ns FROM quota_domains "
             "WHERE domain_digest = ?",
@@ -683,6 +1245,8 @@ class GatewayQuotaAdmission:
             raise GatewayQuotaAdmissionError("OWNER_UNAVAILABLE")
         previous_now, backoff_until = int(row[0]), int(row[1])
         if observed_now < previous_now:
+            if on_epoch_reset is not None:
+                on_epoch_reset()
             # A monotonic-clock epoch change is fail-closed: prior grants are
             # held for a complete fresh window and stale waiters are discarded.
             connection.execute(
