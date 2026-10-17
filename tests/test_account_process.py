@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections import deque
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
 
@@ -50,6 +51,7 @@ def _native_free_close_projector(provider: object, generation: int) -> dict[str,
 
 
 _NATIVE_PROJECTED_GENERATIONS: list[int] = []
+_PARTIAL_NATIVE_PROVIDERS: list[_PartialConnectNativeProvider] = []
 
 
 class _NativeOwnedProvider:
@@ -92,6 +94,123 @@ def _native_owned_close_projector(
         "timed_out": False,
         "complete": True,
     }
+
+
+class _PartialNativeConnectError(Exception):
+    code = "NATIVE_CONNECT_INTERRUPTED"
+
+
+class _PartialConnectNativeProvider:
+    def __init__(
+        self, *, close_failures: int = 0, owner_after_close: bool = True
+    ) -> None:
+        self.close_failures_remaining = close_failures
+        self.owner_after_close = owner_after_close
+        self._native_owner_created: bool | None = None
+        self._native_object: object | None = None
+        self.close_native_objects: list[object] = []
+        self.last_native_stop_receipt: dict[str, object] | None = None
+
+    @property
+    def native_owner_created(self) -> bool | None:
+        return self._native_owner_created
+
+    @property
+    def native_connection_generation(self) -> int | None:
+        if self._native_owner_created is True or self._native_owner_created is None:
+            return _NATIVE_GENERATION if self._native_object is not None else None
+        return None
+
+    def connect(self, *, account_key: AccountKey, generation: str, timeout: float) -> None:
+        assert account_key == _ACCOUNT_KEY
+        assert generation == _GENERATION
+        assert timeout > 0
+        # A native object exists, but the provider deliberately cannot yet
+        # report its ownership state after this interrupted startup.
+        self._native_object = object()
+        self._native_owner_created = None
+        raise _PartialNativeConnectError()
+
+    def read_account(self, *, generation: str, timeout: float) -> AccountObservation:
+        del generation, timeout
+        raise AssertionError("partial-connect provider is not readable")
+
+    def close(self) -> bool:
+        if self._native_object is None:
+            return False
+        self.close_native_objects.append(self._native_object)
+        if self.close_failures_remaining:
+            self.close_failures_remaining -= 1
+            return False
+        self._native_owner_created = self.owner_after_close
+        if self.owner_after_close:
+            self.last_native_stop_receipt = {
+                "connection_generation": _NATIVE_GENERATION,
+                "join_required": True,
+                "join_completed": True,
+                "native_released": True,
+                "thread_alive": False,
+                "timed_out": False,
+                "complete": True,
+            }
+        return True
+
+
+def _partial_native_factory(profile_ref: str) -> GatewayAccountSessionProcessBinding:
+    if profile_ref != "synthetic.partial-native.v1":
+        raise GatewayAccountSessionProfileUnavailableError()
+    provider = _PartialConnectNativeProvider()
+    _PARTIAL_NATIVE_PROVIDERS.append(provider)
+    return GatewayAccountSessionProcessBinding(_ACCOUNT_KEY, provider)
+
+
+def _partial_native_retry_factory(profile_ref: str) -> GatewayAccountSessionProcessBinding:
+    if profile_ref != "synthetic.partial-native-retry.v1":
+        raise GatewayAccountSessionProfileUnavailableError()
+    provider = _PartialConnectNativeProvider(close_failures=1)
+    _PARTIAL_NATIVE_PROVIDERS.append(provider)
+    return GatewayAccountSessionProcessBinding(_ACCOUNT_KEY, provider)
+
+
+def _partial_native_unresolved_factory(profile_ref: str) -> GatewayAccountSessionProcessBinding:
+    if profile_ref != "synthetic.partial-native-unresolved.v1":
+        raise GatewayAccountSessionProfileUnavailableError()
+    provider = _PartialConnectNativeProvider(owner_after_close=False)
+    _PARTIAL_NATIVE_PROVIDERS.append(provider)
+    return GatewayAccountSessionProcessBinding(_ACCOUNT_KEY, provider)
+
+
+def _partial_native_close_projector(
+    provider: object, expected_native_generation: int
+) -> dict[str, object]:
+    assert type(expected_native_generation) is int
+    assert expected_native_generation == _NATIVE_GENERATION
+    assert type(provider) is _PartialConnectNativeProvider
+    assert provider.native_owner_created is True
+    assert provider.native_connection_generation == expected_native_generation
+    assert provider.last_native_stop_receipt is not None
+    return dict(provider.last_native_stop_receipt)
+
+
+def _partial_native_requests(profile_ref: str, *, close_count: int) -> list[dict[str, object]]:
+    operations = ["bootstrap", "connect", *(["close"] * close_count)]
+    requests: list[dict[str, object]] = []
+    for index, operation in enumerate(operations, start=1):
+        requests.append(
+            _envelope(
+                message_type="request",
+                request_id=f"{index:032x}",
+                generation=_GENERATION,
+                operation=operation,
+                status="request",
+                payload=(
+                    {"profile_ref": profile_ref, "read_only": True}
+                    if operation == "bootstrap"
+                    else {"timeout_seconds": 1.0}
+                ),
+            )
+        )
+    return requests
 
 
 class _ChildConnection:
@@ -167,6 +286,7 @@ class _FakeWorld:
         self.eof_ready = False
         self.close_receipt: dict[str, object] | None = None
         self.close_unconfirmed_remaining = 0
+        self.connect_error_code: str | None = None
         self.mutate_generation = False
         self.oversize_bootstrap = False
         self.profile_unavailable = False
@@ -189,13 +309,17 @@ class _FakeWorld:
                 status = "ready"
                 payload = {"account_key_id": _ACCOUNT_KEY.account_key_id}
         elif operation == "connect":
-            status = "connected"
-            payload = {
-                "native_owner_created": self.close_receipt is not None,
-                "native_connection_generation": _NATIVE_GENERATION
-                if self.close_receipt is not None
-                else None,
-            }
+            if self.connect_error_code is not None:
+                status = "operation_failed"
+                payload = {"error_code": self.connect_error_code}
+            else:
+                status = "connected"
+                payload = {
+                    "native_owner_created": self.close_receipt is not None,
+                    "native_connection_generation": _NATIVE_GENERATION
+                    if self.close_receipt is not None
+                    else None,
+                }
         elif operation == "read_account":
             status = "account_read"
             payload = {"kind": "discarded-late-result"}
@@ -609,6 +733,123 @@ def test_native_child_close_projector_receives_acknowledged_native_generation() 
     assert connection.closed
 
 
+@pytest.mark.parametrize(
+    ("close_failures", "factory", "profile_ref"),
+    [
+        (0, _partial_native_factory, "synthetic.partial-native.v1"),
+        (
+            1,
+            _partial_native_retry_factory,
+            "synthetic.partial-native-retry.v1",
+        ),
+    ],
+)
+def test_partial_connect_unknown_owner_closes_same_provider_and_requires_receipt(
+    close_failures: int,
+    factory: Any,
+    profile_ref: str,
+) -> None:
+    _PARTIAL_NATIVE_PROVIDERS.clear()
+    close_count = close_failures + 1
+    connection = _ChildConnection(
+        _partial_native_requests(profile_ref, close_count=close_count)
+    )
+
+    serve_account_session_child(
+        connection,
+        provider_factory=factory,
+        close_receipt_projector=_partial_native_close_projector,
+    )
+
+    assert len(_PARTIAL_NATIVE_PROVIDERS) == 1
+    provider = _PARTIAL_NATIVE_PROVIDERS[0]
+    assert type(provider) is _PartialConnectNativeProvider
+    assert len(provider.close_native_objects) == close_count
+    assert provider._native_object is not None
+    assert all(item is provider._native_object for item in provider.close_native_objects)
+    expected_statuses = ["ready", "operation_failed"]
+    expected_statuses.extend(["close_unconfirmed"] * close_failures)
+    expected_statuses.append("closed")
+    assert [frame["status"] for frame in connection.sent] == expected_statuses
+    assert connection.sent[1]["payload"] == {"error_code": "NATIVE_CONNECT_INTERRUPTED"}
+    for frame in connection.sent[2:-1]:
+        assert frame["payload"] == {"error_code": "PROVIDER_CLOSE_UNCONFIRMED"}
+    assert connection.sent[-1]["payload"] == {
+        "native_owner_created": True,
+        "native_connection_generation": _NATIVE_GENERATION,
+        "native_stop_receipt": {
+            "connection_generation": _NATIVE_GENERATION,
+            "join_required": True,
+            "join_completed": True,
+            "native_released": True,
+            "thread_alive": False,
+            "timed_out": False,
+            "complete": True,
+        },
+        "close_confirmed": True,
+    }
+    assert connection.closed
+
+
+def test_partial_connect_never_closes_as_native_free_after_unknown_owner() -> None:
+    _PARTIAL_NATIVE_PROVIDERS.clear()
+    connection = _ChildConnection(
+        _partial_native_requests(
+            "synthetic.partial-native-unresolved.v1", close_count=2
+        )
+    )
+
+    serve_account_session_child(
+        connection,
+        provider_factory=_partial_native_unresolved_factory,
+        close_receipt_projector=_partial_native_close_projector,
+    )
+
+    assert len(_PARTIAL_NATIVE_PROVIDERS) == 1
+    provider = _PARTIAL_NATIVE_PROVIDERS[0]
+    # The fake pipe reports EOF after the two explicit requests, which also
+    # exercises the child's existing best-effort close on parent disappearance.
+    assert len(provider.close_native_objects) == 3
+    assert all(item is provider._native_object for item in provider.close_native_objects)
+    assert [frame["status"] for frame in connection.sent] == [
+        "ready",
+        "operation_failed",
+        "close_unconfirmed",
+        "close_unconfirmed",
+    ]
+    assert all(
+        frame["payload"] == {"error_code": "NATIVE_OWNER_STATE_UNAVAILABLE"}
+        for frame in connection.sent[-2:]
+    )
+    assert connection.closed
+
+
+def test_parent_accepts_exact_owner_receipt_when_connect_ack_is_unavailable() -> None:
+    receipt = {
+        "connection_generation": _NATIVE_GENERATION,
+        "join_required": True,
+        "join_completed": True,
+        "native_released": True,
+        "thread_alive": False,
+        "timed_out": False,
+        "complete": True,
+    }
+    world = _FakeWorld()
+    world.connect_error_code = "NATIVE_CONNECT_INTERRUPTED"
+    world.close_receipt = receipt
+    provider = _provider(world)
+
+    with pytest.raises(GatewayAccountSessionProcessError):
+        provider.connect(account_key=_ACCOUNT_KEY, generation=_GENERATION, timeout=1.0)
+
+    assert provider._connect_ack is None
+    assert provider.close() is True
+    diagnostic = provider.process_diagnostics
+    assert diagnostic["native_owner_created"] is True
+    assert diagnostic["native_connection_generation"] == _NATIVE_GENERATION
+    assert diagnostic["native_stop_receipt"] == receipt
+
+
 def test_close_retry_requires_a_completed_unconfirmed_reply() -> None:
     world = _FakeWorld()
     world.close_unconfirmed_remaining = 1
@@ -622,6 +863,89 @@ def test_close_retry_requires_a_completed_unconfirmed_reply() -> None:
     assert provider.close() is True
     assert [item["operation"] for item in world.requests].count("close") == 2
     assert not provider.custody_retained
+
+
+def test_process_diagnostics_preserve_only_finite_close_response_facts() -> None:
+    receipt = {
+        "connection_generation": _NATIVE_GENERATION,
+        "join_required": True,
+        "join_completed": True,
+        "native_released": True,
+        "thread_alive": False,
+        "timed_out": False,
+        "complete": True,
+    }
+    world = _FakeWorld()
+    world.close_receipt = receipt
+    world.close_unconfirmed_remaining = 1
+    provider = _provider(world)
+    provider.connect(account_key=_ACCOUNT_KEY, generation=_GENERATION, timeout=1.0)
+
+    assert provider.close() is False
+    diagnostic = provider.process_diagnostics
+    assert set(diagnostic) == {
+        "state",
+        "custody_retained",
+        "poisoned",
+        "pending_operation",
+        "last_response_operation",
+        "last_response_status",
+        "error_code",
+        "native_owner_created",
+        "native_connection_generation",
+        "native_stop_receipt",
+    }
+    assert dict(diagnostic) == {
+        "state": "close_retryable",
+        "custody_retained": True,
+        "poisoned": False,
+        "pending_operation": None,
+        "last_response_operation": "close",
+        "last_response_status": "close_unconfirmed",
+        "error_code": "PROVIDER_CLOSE_UNCONFIRMED",
+        "native_owner_created": True,
+        "native_connection_generation": _NATIVE_GENERATION,
+        "native_stop_receipt": None,
+    }
+    assert _ACCOUNT_KEY.account_id not in repr(diagnostic)
+    with pytest.raises(TypeError):
+        diagnostic["state"] = "closed"  # type: ignore[index]
+
+    assert provider.close() is True
+    closed = provider.process_diagnostics
+    assert closed["state"] == "closed"
+    assert closed["custody_retained"] is False
+    assert closed["last_response_status"] == "closed"
+    assert closed["error_code"] is None
+    projected_receipt = closed["native_stop_receipt"]
+    assert projected_receipt == receipt
+    assert isinstance(projected_receipt, Mapping)
+    with pytest.raises(TypeError):
+        projected_receipt["complete"] = False  # type: ignore[index]
+
+
+def test_process_diagnostics_preserve_finite_connect_error_code_only() -> None:
+    world = _FakeWorld()
+    world.connect_error_code = "NATIVE_LOGIN_REJECTED"
+    provider = _provider(world)
+
+    with pytest.raises(GatewayAccountSessionProcessError) as error:
+        provider.connect(account_key=_ACCOUNT_KEY, generation=_GENERATION, timeout=1.0)
+
+    assert error.value.code == "PROCESS_CONNECT_UNCERTAIN"
+    assert dict(provider.process_diagnostics) == {
+        "state": "unknown",
+        "custody_retained": True,
+        "poisoned": False,
+        "pending_operation": None,
+        "last_response_operation": "connect",
+        "last_response_status": "operation_failed",
+        "error_code": "NATIVE_LOGIN_REJECTED",
+        "native_owner_created": None,
+        "native_connection_generation": None,
+        "native_stop_receipt": None,
+    }
+    assert provider.close() is True
 
 
 def test_nested_child_callable_is_rejected_as_not_module_level() -> None:

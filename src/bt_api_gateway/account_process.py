@@ -27,6 +27,7 @@ import time
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Callable
 
 from bt_api_base.account_protocol import (
@@ -44,6 +45,49 @@ _MAX_TIMEOUT_SECONDS = 300.0
 _GENERATION_RE = re.compile(r"^[0-9a-f]{32}$")
 _PROFILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _ERROR_CODE_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+_MAX_DIAGNOSTIC_NATIVE_GENERATION = (1 << 63) - 1
+_DIAGNOSTIC_STATES = frozenset(
+    {
+        "new",
+        "starting",
+        "connected",
+        "close_retryable",
+        "profile_unavailable",
+        "unknown",
+        "closed",
+    }
+)
+_DIAGNOSTIC_OPERATIONS = frozenset({"bootstrap", "connect", "read_account", "close"})
+_DIAGNOSTIC_STATUSES = frozenset(
+    {
+        "bootstrap_rejected",
+        "bootstrap_uncertain",
+        "ready",
+        "profile_unavailable",
+        "connected",
+        "account_read",
+        "operation_failed",
+        "close_unconfirmed",
+        "closed",
+    }
+)
+_DIAGNOSTIC_ERROR_STATUSES = frozenset(
+    {
+        "bootstrap_rejected",
+        "bootstrap_uncertain",
+        "profile_unavailable",
+        "operation_failed",
+        "close_unconfirmed",
+    }
+)
+_DIAGNOSTIC_STATUS_BY_OPERATION = {
+    "bootstrap": frozenset(
+        {"bootstrap_rejected", "bootstrap_uncertain", "ready", "profile_unavailable"}
+    ),
+    "connect": frozenset({"connected", "operation_failed"}),
+    "read_account": frozenset({"account_read", "operation_failed"}),
+    "close": frozenset({"closed", "close_unconfirmed", "operation_failed"}),
+}
 _ENVELOPE_FIELDS = frozenset(
     {
         "protocol_version",
@@ -145,6 +189,9 @@ class GatewayAccountSessionProcessProvider:
         self._connect_ack: tuple[bool, int | None] | None = None
         self._close_ack: dict[str, object] | None = None
         self._eof_seen = False
+        self._last_response_operation: str | None = None
+        self._last_response_status: str | None = None
+        self._last_error_code: str | None = None
 
     @property
     def process_state(self) -> str:
@@ -164,6 +211,65 @@ class GatewayAccountSessionProcessProvider:
             self._process is not None
             or self._connection is not None
             or self._child_connection is not None
+        )
+
+    @property
+    def process_diagnostics(self) -> Mapping[str, object]:
+        """Return a finite, identity-free projection of accepted child responses.
+
+        This local operator projection intentionally omits account identifiers,
+        service generations, request identifiers, process IDs, endpoints, and
+        exception text. Receipt fields are included only after the existing
+        native-state and close-payload validators accept them.
+        """
+
+        state = self._state if self._state in _DIAGNOSTIC_STATES else "unknown"
+        operation = (
+            self._last_response_operation
+            if self._last_response_operation in _DIAGNOSTIC_OPERATIONS
+            else None
+        )
+        status = (
+            self._last_response_status
+            if self._last_response_status in _DIAGNOSTIC_STATUSES
+            else None
+        )
+        error_code = self._last_error_code
+
+        native_owner_created: bool | None = None
+        native_generation: int | None = None
+        native_stop_receipt: Mapping[str, object] | None = None
+        native_state = self._connect_ack
+        if self._close_ack is not None:
+            native_owner_created = self._close_ack["native_owner_created"]  # type: ignore[assignment]
+            candidate_generation = self._close_ack["native_connection_generation"]
+            candidate_receipt = self._close_ack["native_stop_receipt"]
+            if native_owner_created is True:
+                native_generation = _diagnostic_native_generation(candidate_generation)
+                if native_generation is not None and type(candidate_receipt) is dict:
+                    native_stop_receipt = MappingProxyType(dict(candidate_receipt))
+        elif native_state is not None:
+            native_owner_created = native_state[0]
+            native_generation = _diagnostic_native_generation(native_state[1])
+
+        pending = self._pending
+        return MappingProxyType(
+            {
+                "state": state,
+                "custody_retained": self.custody_retained,
+                "poisoned": self._poisoned,
+                "pending_operation": (
+                    pending.operation
+                    if pending is not None and pending.operation in _DIAGNOSTIC_OPERATIONS
+                    else None
+                ),
+                "last_response_operation": operation,
+                "last_response_status": status,
+                "error_code": error_code,
+                "native_owner_created": native_owner_created,
+                "native_connection_generation": native_generation,
+                "native_stop_receipt": native_stop_receipt,
+            }
         )
 
     def connect(self, *, account_key: AccountKey, generation: str, timeout: float) -> None:
@@ -510,7 +616,33 @@ class GatewayAccountSessionProcessProvider:
             self._state = "unknown"
             return None
         self._pending = None
+        self._record_response_diagnostics(response)
         return response
+
+    def _record_response_diagnostics(self, response: Mapping[str, object]) -> None:
+        operation = response.get("operation")
+        status = response.get("status")
+        if (
+            type(operation) is not str
+            or operation not in _DIAGNOSTIC_STATUS_BY_OPERATION
+            or type(status) is not str
+            or status not in _DIAGNOSTIC_STATUS_BY_OPERATION[operation]
+        ):
+            self._last_response_operation = None
+            self._last_response_status = None
+            self._last_error_code = None
+            return
+        self._last_response_operation = operation
+        self._last_response_status = status
+        self._last_error_code = None
+        if status not in _DIAGNOSTIC_ERROR_STATUSES:
+            return
+        payload = response.get("payload")
+        if type(payload) is not dict or set(payload) != {"error_code"}:
+            return
+        code = payload.get("error_code")
+        if type(code) is str and _ERROR_CODE_RE.fullmatch(code) is not None:
+            self._last_error_code = code
 
     def _finish_shutdown(self, deadline: float, *, expect_close_ack: bool) -> bool:
         process = self._process
@@ -754,14 +886,6 @@ def serve_account_session_child(
             elif operation == "close":
                 _command_timeout(payload)
                 try:
-                    if not native_state_known:
-                        _send_response(
-                            connection,
-                            request,
-                            "close_unconfirmed",
-                            {"error_code": "NATIVE_OWNER_STATE_UNAVAILABLE"},
-                        )
-                        continue
                     close_result = provider.close()
                     if close_result is not True:
                         _send_response(
@@ -771,9 +895,28 @@ def serve_account_session_child(
                             {"error_code": "PROVIDER_CLOSE_UNCONFIRMED"},
                         )
                         continue
-                    # Native ownership must be explicit.  This is deliberately
-                    # checked again after close; the sticky child values bind
-                    # the exact generation reported by connect.
+
+                    # If connect failed before its native state could be
+                    # observed, the provider may still own a partially-created
+                    # native client. Let that same provider close its exact
+                    # retained objects, then require an explicit post-close
+                    # owner and receipt. In particular, False/None after an
+                    # unknown startup is not proof that no native owner ever
+                    # existed.
+                    if not native_state_known:
+                        closed_owner_created, closed_native_generation = _native_owner_state(
+                            provider
+                        )
+                        if not closed_owner_created:
+                            raise GatewayAccountSessionProcessError(
+                                "NATIVE_OWNER_STATE_UNAVAILABLE"
+                            )
+                        native_owner_created = closed_owner_created
+                        native_generation = closed_native_generation
+                        native_state_known = True
+
+                    # Native ownership must be explicit. The receipt projector
+                    # binds the successful stop to the exact native generation.
                     receipt: dict[str, object] | None = None
                     if native_owner_created:
                         if close_receipt_projector is None:
@@ -1168,6 +1311,12 @@ def _finite_error_code(exc: Exception, fallback: str) -> str:
     if type(value) is str and _ERROR_CODE_RE.fullmatch(value) is not None:
         return value
     return fallback
+
+
+def _diagnostic_native_generation(value: object) -> int | None:
+    if type(value) is int and 0 < value <= _MAX_DIAGNOSTIC_NATIVE_GENERATION:
+        return value
+    return None
 
 
 __all__ = [
