@@ -103,6 +103,28 @@ class DescribingProvider(CountedProvider):
         )
 
 
+class EpochResetProvider(CountedProvider):
+    def __init__(self, *, acknowledgement: object = True) -> None:
+        super().__init__()
+        self.reset_required = True
+        self.acknowledgement = acknowledgement
+        self.reset_calls: list[tuple[str, object]] = []
+
+    def source_epoch_reset_required(self, handle: object) -> bool:
+        self.reset_calls.append(("required", handle))
+        return self.reset_required
+
+    def acknowledge_source_epoch_reset(self, handle: object, *, epoch: str) -> object:
+        self.reset_calls.append(("acknowledge", epoch))
+        if self.acknowledgement is True:
+            self.reset_required = False
+        return self.acknowledgement
+
+    def poll(self, handle: object, *, limit: int) -> tuple[MarketProviderEvent, ...]:
+        self.reset_calls.append(("poll", handle))
+        return super().poll(handle, limit=limit)
+
+
 def _key(**changes: Any) -> MarketSubscriptionKey:
     instrument_fields: dict[str, str] = {
         "provider": "synthetic",
@@ -251,6 +273,8 @@ def test_manual_publish_provider_without_poll_remains_supported() -> None:
         "provider_invalid_batches": 0,
         "provider_invalid_events": 0,
         "provider_event_rejections": 0,
+        "provider_epoch_resets": 0,
+        "provider_epoch_reset_failures": 0,
     }
 
     assert provider.generation is not None
@@ -379,6 +403,50 @@ def test_epoch_reset_is_explicit_and_old_cursor_gets_epoch_gap() -> None:
     fresh = _publish(hub, key, provider, 2)
     assert fresh.header.stream_epoch == new_epoch
     assert fresh.header.sequence == 1
+
+
+def test_provider_epoch_reset_handshake_precedes_poll_without_new_generation() -> None:
+    key = _key()
+    provider = EpochResetProvider()
+    hub, _, _ = _hub(provider=provider)
+    hub.subscribe("principal:a", key, "registration:a")
+    handle = provider.subscribed[0][1]
+    generation = provider.generations[key]
+    old_epoch = hub.head(key)["epoch"]
+
+    hub.maintain({"registration:a"})
+
+    assert provider.reset_calls[0] == ("required", handle)
+    assert provider.reset_calls[1][0] == "acknowledge"
+    new_epoch = provider.reset_calls[1][1]
+    assert type(new_epoch) is str and new_epoch != old_epoch
+    assert provider.reset_calls == [
+        ("required", handle),
+        ("acknowledge", new_epoch),
+    ]
+    assert provider.generations[key] == generation
+    assert hub.head(key)["epoch"] == new_epoch
+    assert hub.head(key)["head"] == 0
+
+    hub.maintain({"registration:a"})
+    assert provider.reset_calls[-1] == ("poll", handle)
+
+
+def test_provider_epoch_reset_requires_exact_true_ack_before_poll() -> None:
+    key = _key()
+    provider = EpochResetProvider(acknowledgement=1)
+    hub, _, _ = _hub(provider=provider)
+    hub.subscribe("principal:a", key, "registration:a")
+    handle = provider.subscribed[0][1]
+
+    hub.maintain({"registration:a"})
+
+    assert provider.reset_calls == [
+        ("required", handle),
+        ("acknowledge", hub.head(key)["epoch"]),
+    ]
+    assert hub.source_diagnostics["provider_epoch_reset_failures"] == 1
+    assert not any(call[0] == "poll" for call in provider.reset_calls)
 
 
 def test_failed_stop_is_confirmed_before_new_start_and_new_epoch() -> None:
@@ -1116,6 +1184,8 @@ def test_maintain_publishes_provider_events_on_owner_thread_with_existing_wire_s
         "provider_invalid_batches": 0,
         "provider_invalid_events": 0,
         "provider_event_rejections": 0,
+        "provider_epoch_resets": 0,
+        "provider_epoch_reset_failures": 0,
     }
 
 

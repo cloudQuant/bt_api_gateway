@@ -158,6 +158,21 @@ class MarketProviderPolling(Protocol):
         """
 
 
+class MarketProviderSourceEpochResetting(Protocol):
+    """Optional owner-thread handshake for a provider-confirmed source restart.
+
+    Both methods use exact booleans as a finite capability contract. The Hub
+    rotates its cursor before acknowledging a pending source transition, then
+    skips polling for that stream until a later maintain cycle.
+    """
+
+    def source_epoch_reset_required(self, handle: object) -> bool:
+        """Return exact ``True`` while this exact handle awaits a new epoch."""
+
+    def acknowledge_source_epoch_reset(self, handle: object, *, epoch: str) -> bool:
+        """Accept the exact Hub-generated epoch for the pending transition."""
+
+
 class MarketHistoryProvider(Protocol):
     """Synchronous read-only history edge with a provider-enforced timeout.
 
@@ -301,6 +316,13 @@ class GatewayMarketHub:
         self._provider = provider
         provider_poll = getattr(provider, "poll", None)
         self._provider_poller = provider_poll if callable(provider_poll) else None
+        reset_required = getattr(provider, "source_epoch_reset_required", None)
+        acknowledge_reset = getattr(provider, "acknowledge_source_epoch_reset", None)
+        self._provider_epoch_resetter = (
+            provider
+            if callable(reset_required) and callable(acknowledge_reset)
+            else None
+        )
         self._key_universe = frozenset(copied_keys)
         self._principal_allowed_keys = MappingProxyType(copied_acl)
         self._service_identity = service_identity
@@ -326,6 +348,8 @@ class GatewayMarketHub:
             "provider_invalid_batches": 0,
             "provider_invalid_events": 0,
             "provider_event_rejections": 0,
+            "provider_epoch_resets": 0,
+            "provider_epoch_reset_failures": 0,
         }
         self._streams: dict[MarketSubscriptionKey, _MarketStream] = {}
         self._stream_by_id: dict[str, MarketSubscriptionKey] = {}
@@ -693,6 +717,31 @@ class GatewayMarketHub:
             cursor = (stream_index + 1) % len(streams)
             self._provider_poll_cursor = cursor
             calls += 1
+            resetter = self._provider_epoch_resetter
+            if resetter is not None:
+                try:
+                    required = resetter.source_epoch_reset_required(stream.handle)
+                    if type(required) is not bool:
+                        self._source_diagnostics["provider_epoch_reset_failures"] += 1
+                        exhausted.add(stream_index)
+                        continue
+                    if required is True:
+                        new_epoch = self.reset_stream_epoch(stream.key)
+                        acknowledged = resetter.acknowledge_source_epoch_reset(
+                            stream.handle,
+                            epoch=new_epoch,
+                        )
+                        if type(acknowledged) is not bool or acknowledged is not True:
+                            self._source_diagnostics["provider_epoch_reset_failures"] += 1
+                            exhausted.add(stream_index)
+                            continue
+                        self._source_diagnostics["provider_epoch_resets"] += 1
+                        exhausted.add(stream_index)
+                        continue
+                except Exception:
+                    self._source_diagnostics["provider_epoch_reset_failures"] += 1
+                    exhausted.add(stream_index)
+                    continue
             self._source_diagnostics["provider_poll_calls"] += 1
             try:
                 batch = poller(stream.handle, limit=1)
@@ -1752,5 +1801,6 @@ __all__ = [
     "MAX_TOTAL_MARKET_REPLAY_BYTES",
     "MarketProvider",
     "MarketProviderPolling",
+    "MarketProviderSourceEpochResetting",
     "MarketHistoryProvider",
 ]
