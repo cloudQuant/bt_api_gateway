@@ -1,0 +1,78 @@
+{
+  "record_type": "load01_bounded_reply_gateway_child_round",
+  "round_id": "LOAD01-BOUNDED-REPLY-GATEWAY-R1",
+  "repository": "D:/bt_api_py/bt_api/bt_api_gateway",
+  "branch": "dev",
+  "base_head": "f70e085d62e06ecb20c8c0e35b8e2fd274a7438b",
+  "scope_status": "four accepted source/test paths and this round record",
+  "delivery_status": "SOURCE_COMPONENT_ACCEPTED_READY_FOR_SCOPED_COMMIT",
+  "commit_status": "uncommitted",
+  "behavior": "Optional market.read_after_bounded operation; strict market_hub opt-in; exact full-reply fit callback selects a continuous prefix while preserving legacy default operation/config shape.",
+  "files": [
+    {
+      "path": "src/bt_api_gateway/market_hub.py",
+      "role": "production_source",
+      "raw_size_bytes": 81664,
+      "raw_sha256": "03d620b059775e358ea09f7da16d9543fa05915be960b530dd564ef06ed40d6e",
+      "lf_size_bytes": 81664,
+      "lf_sha256": "03d620b059775e358ea09f7da16d9543fa05915be960b530dd564ef06ed40d6e"
+    },
+    {
+      "path": "src/bt_api_gateway/service_component.py",
+      "role": "production_source",
+      "raw_size_bytes": 40342,
+      "raw_sha256": "87dac9d8f62d271601ca3fa8bb370b46dfe3e812968e5ee7fe87e0b53ae34efb",
+      "lf_size_bytes": 40342,
+      "lf_sha256": "87dac9d8f62d271601ca3fa8bb370b46dfe3e812968e5ee7fe87e0b53ae34efb"
+    },
+    {
+      "path": "tests/test_market_hub.py",
+      "role": "focused_test",
+      "raw_size_bytes": 51289,
+      "raw_sha256": "9ff16a503190b47b8d718781e65d0b395397b60a969d8c48cfb20e7cc58d4d1a",
+      "lf_size_bytes": 51289,
+      "lf_sha256": "9ff16a503190b47b8d718781e65d0b395397b60a969d8c48cfb20e7cc58d4d1a"
+    },
+    {
+      "path": "tests/test_service_component.py",
+      "role": "focused_test",
+      "raw_size_bytes": 35006,
+      "raw_sha256": "06fcb2531f5332f10ae5653f4a51706830ac0f3f1aad60748003681b5d21679a",
+      "lf_size_bytes": 35006,
+      "lf_sha256": "06fcb2531f5332f10ae5653f4a51706830ac0f3f1aad60748003681b5d21679a"
+    }
+  ],
+  "focused_qa": {
+    "commands": [
+      {
+        "command": "C:/Anaconda3/python.exe -X utf8 -m pytest -p no:asyncio -q tests/test_market_hub.py -k bounded_read_after",
+        "result": "4 passed, 39 deselected; exit 0",
+        "scope": "all four bounded-read-after Gateway adapter tests"
+      },
+      {
+        "command": "C:/Anaconda3/python.exe -X utf8 -m pytest -p no:asyncio -q tests/test_service_component.py -k \"service_options or bounded_replay\"",
+        "result": "9 passed, 32 deselected; exit 0",
+        "scope": "legacy option normalization plus opt-in schema tests"
+      }
+    ],
+    "superseded_command": {
+      "command": "C:/Anaconda3/python.exe -X utf8 -m pytest -p no:asyncio -q tests/test_market_hub.py -k bounded_read_after tests/test_service_component.py -k \"service_options or bounded_replay\"",
+      "result": "9 passed, 75 deselected; exit 0",
+      "status": "not credited for market_hub coverage because repeated -k selection could override the first selector; replaced by the exact single-selector run above"
+    },
+    "diff_check": "passed"
+  },
+  "independent_review": {
+    "status": "GO_EXACT_FOUR_GATEWAY_PATHS",
+    "scope_note": "Independent static GO on the exact four source/test pins; Root verified current bytes. Parent integration acceptance is recorded separately."
+  },
+  "parent_combined_scope": "pending legacy client path repair and review; child record does not include parent files.",
+  "evidence_limit": "synthetic source and unit tests only; no account, provider, or sustained-load acceptance",
+  "scope": [
+    "src/bt_api_gateway/market_hub.py",
+    "src/bt_api_gateway/service_component.py",
+    "tests/test_market_hub.py",
+    "tests/test_service_component.py",
+    "docs/ITERATION10_BOUNDED_MARKET_REPLAY_20261021.json"
+  ]
+}

@@ -20,6 +20,7 @@ from bt_api_gateway.market_hub import (
     MAX_MARKET_KEY_UNIVERSE,
     MAX_MARKET_READ_PAGE_BYTES,
     MAX_TOTAL_MARKET_REPLAY_BYTES,
+    MARKET_READ_AFTER_BOUNDED_OPERATION,
     GatewayMarketHub,
     GatewayMarketHubError,
     GatewayMarketRegistration,
@@ -1121,6 +1122,129 @@ def test_service_rejects_extra_arguments_and_requires_active_subscription() -> N
             scope=_scope(),
             arguments={"key": key.to_dict()},
             registration_id="trusted-registration",
+        )
+
+
+def test_bounded_read_after_returns_largest_contiguous_reply_fitting_prefix() -> None:
+    key = _key()
+    hub, provider, _ = _hub(principals=("principal:a",))
+    hub.subscribe("principal:a", key, "registration:a")
+    for sequence in range(1, 6):
+        _publish(hub, key, provider, sequence)
+    service = GatewayMarketService(
+        hub,
+        enable_bounded_read_after=True,
+        registrations={
+            "registration:a": GatewayMarketRegistration("principal:a", "domain:paper")
+        },
+    )
+    arguments = {
+        "key": key.to_dict(),
+        "epoch": hub.head(key)["epoch"],
+        "after": 0,
+        "limit": 5,
+    }
+    checked_lengths: list[int] = []
+
+    def fits(reply):
+        checked_lengths.append(len(reply["events"]))
+        return len(reply["events"]) <= 2
+
+    first = service.handle(
+        MARKET_READ_AFTER_BOUNDED_OPERATION,
+        principal_ref="principal:a",
+        scope=_scope(),
+        arguments=arguments,
+        registration_id="registration:a",
+        result_fits=fits,
+    )
+
+    assert first["after"] == 0
+    assert first["limit"] == 5
+    assert [event["header"]["sequence"] for event in first["events"]] == [1, 2]
+    assert first["next_after"] == 2
+    assert first["has_more"] is True
+    assert checked_lengths[0] == 5
+    assert 2 in checked_lengths
+
+    arguments["after"] = first["next_after"]
+    tail = service.handle(
+        MARKET_READ_AFTER_BOUNDED_OPERATION,
+        principal_ref="principal:a",
+        scope=_scope(),
+        arguments=arguments,
+        registration_id="registration:a",
+        result_fits=lambda reply: True,
+    )
+    assert [event["header"]["sequence"] for event in tail["events"]] == [3, 4, 5]
+    assert tail["next_after"] == 5
+    assert tail["has_more"] is False
+
+
+def test_bounded_read_after_is_advertised_only_for_explicit_opt_in() -> None:
+    hub, _provider, _published = _hub()
+
+    legacy = GatewayMarketService(hub)
+    bounded = GatewayMarketService(hub, enable_bounded_read_after=True)
+
+    assert MARKET_READ_AFTER_BOUNDED_OPERATION not in legacy.supported_operations
+    assert MARKET_READ_AFTER_BOUNDED_OPERATION in bounded.supported_operations
+
+
+def test_bounded_read_after_requires_real_reply_size_checker() -> None:
+    key = _key()
+    hub, provider, _ = _hub(principals=("principal:a",))
+    hub.subscribe("principal:a", key, "registration:a")
+    _publish(hub, key, provider, 1)
+    service = GatewayMarketService(
+        hub,
+        enable_bounded_read_after=True,
+        registrations={
+            "registration:a": GatewayMarketRegistration("principal:a", "domain:paper")
+        },
+    )
+
+    with pytest.raises(GatewayMarketServiceError, match="CAPABILITY_UNAVAILABLE"):
+        service.handle(
+            MARKET_READ_AFTER_BOUNDED_OPERATION,
+            principal_ref="principal:a",
+            scope=_scope(),
+            arguments={
+                "key": key.to_dict(),
+                "epoch": hub.head(key)["epoch"],
+                "after": 0,
+                "limit": 1,
+            },
+            registration_id="registration:a",
+        )
+
+
+def test_bounded_read_after_rejects_single_event_that_cannot_fit_reply() -> None:
+    key = _key()
+    hub, provider, _ = _hub(principals=("principal:a",))
+    hub.subscribe("principal:a", key, "registration:a")
+    _publish(hub, key, provider, 1)
+    service = GatewayMarketService(
+        hub,
+        enable_bounded_read_after=True,
+        registrations={
+            "registration:a": GatewayMarketRegistration("principal:a", "domain:paper")
+        },
+    )
+
+    with pytest.raises(GatewayMarketServiceError, match="REPLAY_PAGE_TOO_LARGE"):
+        service.handle(
+            MARKET_READ_AFTER_BOUNDED_OPERATION,
+            principal_ref="principal:a",
+            scope=_scope(),
+            arguments={
+                "key": key.to_dict(),
+                "epoch": hub.head(key)["epoch"],
+                "after": 0,
+                "limit": 1,
+            },
+            registration_id="registration:a",
+            result_fits=lambda reply: not reply["events"],
         )
 
 

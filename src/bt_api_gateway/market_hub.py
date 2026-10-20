@@ -52,6 +52,7 @@ from bt_api_base.service_protocol import (
     encode_envelope,
 )
 
+MARKET_READ_AFTER_BOUNDED_OPERATION = "market.read_after_bounded"
 MARKET_OPERATIONS = frozenset(
     {
         "market.bootstrap_many",
@@ -66,6 +67,12 @@ MARKET_OPERATIONS = frozenset(
 # remains the five-operation default for callers that have not configured history.
 MARKET_HISTORY_OPERATION = "market.history"
 ALL_MARKET_OPERATIONS = MARKET_OPERATIONS | frozenset({MARKET_HISTORY_OPERATION})
+MARKET_OPERATIONS_WITH_BOUNDED_READ_AFTER = MARKET_OPERATIONS | frozenset(
+    {MARKET_READ_AFTER_BOUNDED_OPERATION}
+)
+ALL_MARKET_OPERATIONS_WITH_BOUNDED_READ_AFTER = (
+    ALL_MARKET_OPERATIONS | frozenset({MARKET_READ_AFTER_BOUNDED_OPERATION})
+)
 SUPPORTED_OPERATIONS = MARKET_OPERATIONS
 DEFAULT_MARKET_READ_LIMIT = 100
 MAX_MARKET_READ_LIMIT = 1_000
@@ -1178,11 +1185,14 @@ class GatewayMarketService:
         hub: GatewayMarketHub,
         *,
         registrations: Optional[Mapping[str, GatewayMarketRegistration]] = None,  # noqa: UP045
+        enable_bounded_read_after: bool = False,
     ) -> None:
         if type(hub) is not GatewayMarketHub:
             raise GatewayMarketServiceError("INVALID_MARKET_HUB")
         if registrations is None:
             registrations = {}
+        if type(enable_bounded_read_after) is not bool:
+            raise GatewayMarketServiceError("INVALID_BOUNDED_READ_AFTER_FLAG")
         if not isinstance(registrations, Mapping):
             raise GatewayMarketServiceError("INVALID_REGISTRATIONS")
         if len(registrations) > MAX_MARKET_REGISTRATIONS:
@@ -1193,6 +1203,7 @@ class GatewayMarketService:
             copied[registration_id] = registration
         self._hub = hub
         self._registrations = copied
+        self._enable_bounded_read_after = enable_bounded_read_after
 
     @property
     def ready(self) -> bool:
@@ -1207,7 +1218,10 @@ class GatewayMarketService:
     @property
     def supported_operations(self) -> frozenset[str]:
         """Configured operation set for resource and capability advertisement."""
-        return self._hub.supported_operations
+        operations = self._hub.supported_operations
+        if self._enable_bounded_read_after:
+            operations = operations | frozenset({MARKET_READ_AFTER_BOUNDED_OPERATION})
+        return operations
 
     def register_registration(
         self, registration_id: str, registration: GatewayMarketRegistration
@@ -1242,6 +1256,7 @@ class GatewayMarketService:
         scope: WireScope,
         arguments: Mapping[str, object],
         registration_id: str,
+        result_fits: Optional[Callable[[Mapping[str, object]], bool]] = None,  # noqa: UP045
     ) -> Mapping[str, object]:
         """Handle one exact market RPC under a trusted strategy-run mapping."""
         self._hub._check_owner()
@@ -1268,7 +1283,7 @@ class GatewayMarketService:
                 raise GatewayMarketServiceError("INVALID_ARGUMENTS")
         elif operation == MARKET_HISTORY_OPERATION:
             expected = {"key", "start_time_utc", "end_time_utc", "limit"}
-        elif operation == "market.read_after":
+        elif operation in {"market.read_after", MARKET_READ_AFTER_BOUNDED_OPERATION}:
             expected = {"key", "epoch", "after", "limit"}
         else:
             expected = {"key"}
@@ -1321,8 +1336,78 @@ class GatewayMarketService:
         except GatewayMarketHubError as exc:
             raise GatewayMarketServiceError(exc.code, retryable=exc.retryable) from None
         result = dict(batch)
-        result["events"] = tuple(_envelope_mapping(event) for event in batch["events"])
+        event_mappings = tuple(_envelope_mapping(event) for event in batch["events"])
+        result["events"] = event_mappings
+        if operation == MARKET_READ_AFTER_BOUNDED_OPERATION:
+            if result_fits is None or not callable(result_fits):
+                raise GatewayMarketServiceError("CAPABILITY_UNAVAILABLE")
+            return self._fit_read_after_reply(
+                result,
+                envelopes=tuple(batch["events"]),
+                result_fits=result_fits,
+            )
         return MappingProxyType(result)
+
+    @staticmethod
+    def _fit_read_after_reply(
+        result: Mapping[str, object],
+        *,
+        envelopes: tuple[WireEnvelope, ...],
+        result_fits: Callable[[Mapping[str, object]], bool],
+    ) -> Mapping[str, object]:
+        """Return the largest continuous replay prefix fitting the real reply.
+
+        The trusted registry callback checks the complete normalized service
+        reply against both the server frame limit and the caller's requested
+        reply limit.  Event count and the hub's event-page byte cap remain
+        independent bounds.
+        """
+        if not callable(result_fits):
+            raise GatewayMarketServiceError("INVALID_REPLY_SIZE_CHECKER")
+
+        event_mappings = tuple(result["events"])
+        if len(event_mappings) != len(envelopes):
+            raise GatewayMarketServiceError("INVALID_REPLAY_PAGE")
+        requested_after = result["after"]
+        original_has_more = result["has_more"]
+
+        def candidate(prefix_length: int) -> Mapping[str, object]:
+            selected = event_mappings[:prefix_length]
+            next_after = (
+                envelopes[prefix_length - 1].header.sequence
+                if prefix_length
+                else requested_after
+            )
+            page = dict(result)
+            page["events"] = selected
+            page["next_after"] = next_after
+            page["has_more"] = original_has_more or prefix_length < len(event_mappings)
+            return MappingProxyType(page)
+
+        def fits(page: Mapping[str, object]) -> bool:
+            try:
+                accepted = result_fits(page)
+            except Exception:
+                raise GatewayMarketServiceError("INVALID_REPLY_SIZE_CHECKER") from None
+            if type(accepted) is not bool:
+                raise GatewayMarketServiceError("INVALID_REPLY_SIZE_CHECKER")
+            return accepted
+
+        full = candidate(len(event_mappings))
+        if fits(full):
+            return full
+
+        low = 0
+        high = len(event_mappings)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if fits(candidate(middle)):
+                low = middle
+            else:
+                high = middle - 1
+        if low == 0:
+            raise GatewayMarketServiceError("REPLAY_PAGE_TOO_LARGE")
+        return candidate(low)
 
     def _handle_bootstrap_many(
         self,
@@ -1779,6 +1864,7 @@ def _envelope_mapping(envelope: WireEnvelope) -> Mapping[str, object]:
 
 __all__ = [
     "ALL_MARKET_OPERATIONS",
+    "ALL_MARKET_OPERATIONS_WITH_BOUNDED_READ_AFTER",
     "DEFAULT_MARKET_READ_LIMIT",
     "GatewayMarketHub",
     "GatewayMarketHubError",
@@ -1786,7 +1872,9 @@ __all__ = [
     "GatewayMarketService",
     "GatewayMarketServiceError",
     "MARKET_HISTORY_OPERATION",
+    "MARKET_READ_AFTER_BOUNDED_OPERATION",
     "MARKET_OPERATIONS",
+    "MARKET_OPERATIONS_WITH_BOUNDED_READ_AFTER",
     "MarketProviderSourceDescriber",
     "SUPPORTED_OPERATIONS",
     "MAX_MARKET_EVENT_BYTES",

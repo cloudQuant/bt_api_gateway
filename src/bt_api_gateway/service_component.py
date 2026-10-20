@@ -109,9 +109,10 @@ def validate_service_options(
 ) -> Mapping[str, object]:
     """Validate the declared gateway service roles without performing I/O.
 
-    ``market_hub`` accepts only ``service.market_source`` and the ``role``
-    option. ``account_session_worker`` accepts a nonempty subset of its SDK
-    service ports and requires an SDK-shaped ``account_session_ref``.
+    ``market_hub`` accepts only ``service.market_source`` plus its role and
+    optional bounded-replay capability flag. ``account_session_worker``
+    accepts a nonempty subset of its SDK service ports and requires an
+    SDK-shaped ``account_session_ref``.
     """
 
     if not isinstance(options, Mapping):
@@ -131,8 +132,13 @@ def validate_service_options(
     copied: dict[str, object]
     if role == "market_hub":
         allowed_ports = _MARKET_HUB_PORTS
-        allowed_options = frozenset({"role"})
+        allowed_options = frozenset({"role", "bounded_read_after"})
         copied = {"role": role}
+        if "bounded_read_after" in options:
+            bounded_read_after = options["bounded_read_after"]
+            if type(bounded_read_after) is not bool:
+                raise GatewayServiceError("INVALID_BOUNDED_READ_AFTER")
+            copied["bounded_read_after"] = bounded_read_after
     elif role == "account_session_worker":
         allowed_ports = _ACCOUNT_SESSION_WORKER_PORTS
         allowed_options = frozenset({"role", "account_session_ref"})

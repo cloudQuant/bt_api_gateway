@@ -257,6 +257,15 @@ def test_service_options_match_sdk_gateway_roles_and_return_immutable_mapping() 
         market["role"] = "account_session_worker"  # type: ignore[index]
 
 
+def test_market_service_options_preserve_explicit_bounded_replay_opt_in() -> None:
+    market = validate_service_options(
+        {"role": "market_hub", "bounded_read_after": True},
+        ("service.market_source",),
+    )
+
+    assert market == {"role": "market_hub", "bounded_read_after": True}
+
+
 @pytest.mark.parametrize(
     "options,ports,code",
     [
@@ -265,6 +274,11 @@ def test_service_options_match_sdk_gateway_roles_and_return_immutable_mapping() 
             {"role": "market_hub", "account_session_ref": "session-a"},
             ("service.market_source",),
             "UNKNOWN_OPTION",
+        ),
+        (
+            {"role": "market_hub", "bounded_read_after": 1},
+            ("service.market_source",),
+            "INVALID_BOUNDED_READ_AFTER",
         ),
         (
             {"role": "account_session_worker"},
