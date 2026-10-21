@@ -896,6 +896,8 @@ def test_process_diagnostics_preserve_only_finite_close_response_facts() -> None
         "native_owner_created",
         "native_connection_generation",
         "native_stop_receipt",
+        "native_startup_attempt",
+        "native_startup_stop_receipt",
     }
     assert dict(diagnostic) == {
         "state": "close_retryable",
@@ -910,6 +912,8 @@ def test_process_diagnostics_preserve_only_finite_close_response_facts() -> None
         "native_owner_created": True,
         "native_connection_generation": _NATIVE_GENERATION,
         "native_stop_receipt": None,
+        "native_startup_attempt": None,
+        "native_startup_stop_receipt": None,
     }
     assert _ACCOUNT_KEY.account_id not in repr(diagnostic)
     with pytest.raises(TypeError):
@@ -950,6 +954,8 @@ def test_process_diagnostics_preserve_finite_connect_error_code_only() -> None:
         "native_owner_created": None,
         "native_connection_generation": None,
         "native_stop_receipt": None,
+        "native_startup_attempt": None,
+        "native_startup_stop_receipt": None,
     }
     assert provider.close() is True
 
