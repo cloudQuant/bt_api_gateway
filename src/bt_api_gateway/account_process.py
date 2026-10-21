@@ -192,6 +192,8 @@ class GatewayAccountSessionProcessProvider:
         self._last_response_operation: str | None = None
         self._last_response_status: str | None = None
         self._last_error_code: str | None = None
+        self._first_connect_response_status: str | None = None
+        self._first_connect_error_code: str | None = None
 
     @property
     def process_state(self) -> str:
@@ -266,6 +268,8 @@ class GatewayAccountSessionProcessProvider:
                 "last_response_operation": operation,
                 "last_response_status": status,
                 "error_code": error_code,
+                "first_connect_response_status": self._first_connect_response_status,
+                "first_connect_error_code": self._first_connect_error_code,
                 "native_owner_created": native_owner_created,
                 "native_connection_generation": native_generation,
                 "native_stop_receipt": native_stop_receipt,
@@ -632,9 +636,15 @@ class GatewayAccountSessionProcessProvider:
             self._last_response_status = None
             self._last_error_code = None
             return
+        is_first_connect_response = (
+            operation == "connect" and self._first_connect_response_status is None
+        )
         self._last_response_operation = operation
         self._last_response_status = status
         self._last_error_code = None
+        if is_first_connect_response:
+            self._first_connect_response_status = status
+            self._first_connect_error_code = None
         if status not in _DIAGNOSTIC_ERROR_STATUSES:
             return
         payload = response.get("payload")
@@ -643,6 +653,8 @@ class GatewayAccountSessionProcessProvider:
         code = payload.get("error_code")
         if type(code) is str and _ERROR_CODE_RE.fullmatch(code) is not None:
             self._last_error_code = code
+            if is_first_connect_response:
+                self._first_connect_error_code = code
 
     def _finish_shutdown(self, deadline: float, *, expect_close_ack: bool) -> bool:
         process = self._process

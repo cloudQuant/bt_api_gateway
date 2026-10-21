@@ -891,6 +891,8 @@ def test_process_diagnostics_preserve_only_finite_close_response_facts() -> None
         "last_response_operation",
         "last_response_status",
         "error_code",
+        "first_connect_response_status",
+        "first_connect_error_code",
         "native_owner_created",
         "native_connection_generation",
         "native_stop_receipt",
@@ -903,6 +905,8 @@ def test_process_diagnostics_preserve_only_finite_close_response_facts() -> None
         "last_response_operation": "close",
         "last_response_status": "close_unconfirmed",
         "error_code": "PROVIDER_CLOSE_UNCONFIRMED",
+        "first_connect_response_status": "connected",
+        "first_connect_error_code": None,
         "native_owner_created": True,
         "native_connection_generation": _NATIVE_GENERATION,
         "native_stop_receipt": None,
@@ -941,11 +945,38 @@ def test_process_diagnostics_preserve_finite_connect_error_code_only() -> None:
         "last_response_operation": "connect",
         "last_response_status": "operation_failed",
         "error_code": "NATIVE_LOGIN_REJECTED",
+        "first_connect_response_status": "operation_failed",
+        "first_connect_error_code": "NATIVE_LOGIN_REJECTED",
         "native_owner_created": None,
         "native_connection_generation": None,
         "native_stop_receipt": None,
     }
     assert provider.close() is True
+
+
+def test_connect_error_survives_a_later_unconfirmed_close_diagnostic() -> None:
+    world = _FakeWorld()
+    world.connect_error_code = "NATIVE_LOGIN_REJECTED"
+    world.close_unconfirmed_remaining = 1
+    provider = _provider(world)
+
+    with pytest.raises(GatewayAccountSessionProcessError) as error:
+        provider.connect(account_key=_ACCOUNT_KEY, generation=_GENERATION, timeout=1.0)
+
+    assert error.value.code == "PROCESS_CONNECT_UNCERTAIN"
+    assert provider.close() is False
+    diagnostic = provider.process_diagnostics
+    assert diagnostic["last_response_operation"] == "close"
+    assert diagnostic["last_response_status"] == "close_unconfirmed"
+    assert diagnostic["error_code"] == "PROVIDER_CLOSE_UNCONFIRMED"
+    assert diagnostic["first_connect_response_status"] == "operation_failed"
+    assert diagnostic["first_connect_error_code"] == "NATIVE_LOGIN_REJECTED"
+    assert diagnostic["state"] == "close_retryable"
+    assert diagnostic["custody_retained"] is True
+    assert diagnostic["poisoned"] is False
+    assert len([item for item in world.requests if item["operation"] == "connect"]) == 1
+    assert len([item for item in world.requests if item["operation"] == "close"]) == 1
+    assert _ACCOUNT_KEY.account_id not in repr(diagnostic)
 
 
 def test_nested_child_callable_is_rejected_as_not_module_level() -> None:

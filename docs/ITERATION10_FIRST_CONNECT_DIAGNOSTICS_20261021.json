@@ -1,0 +1,53 @@
+{
+  "date": "2026-10-21",
+  "repository": "bt_api_gateway",
+  "branch": "dev",
+  "parent": "d678a58cb0788f9a8aae90cb6117496ea84bd031",
+  "scope": [
+    "src/bt_api_gateway/account_process.py",
+    "tests/test_account_process.py"
+  ],
+  "problem": "A completed close_unconfirmed response overwrote the first connect failure in the latest-response diagnostic fields.",
+  "change": "Keep the first validated connect status and finite error code separately. Existing latest-response and all custody/close/retry behavior remain unchanged.",
+  "independent_static_review": "GO_SOURCE_FAKE_COMPONENT_ONLY; canonical source binding verified before QA",
+  "acceptance": {
+    "evidence": "SOURCE_FAKE_COMPONENT_ONLY",
+    "pytest_exit": 0,
+    "selected_tests": [
+      "test_close_retry_requires_a_completed_unconfirmed_reply",
+      "test_process_diagnostics_preserve_only_finite_close_response_facts",
+      "test_process_diagnostics_preserve_finite_connect_error_code_only",
+      "test_connect_error_survives_a_later_unconfirmed_close_diagnostic"
+    ],
+    "elapsed_seconds": 4.844000000000051,
+    "source_origin_verified": true,
+    "source_pins": {
+      "D:\\bt_api_py\\bt_api\\bt_api_gateway\\src\\bt_api_gateway\\account_process.py": "d415052bcd46c556a2efef2d418656af64490223b1a7a563040cf89427237ad3",
+      "D:\\bt_api_py\\bt_api\\bt_api_gateway\\tests\\test_account_process.py": "875995893977899855ccff19f8222fc3f9e564198e568a33043b74e9da87e45c"
+    },
+    "source_pins_unchanged": true,
+    "ctp_modules_loaded": false,
+    "account_action": false
+  },
+  "passed": 4,
+  "warnings": 0,
+  "retained_r7_observation": {
+    "functions_preserved": true,
+    "generation": "r7-diagnostic-20261021-01",
+    "no_runtime_reload": true,
+    "observed_at_utc": "2026-10-21T00:49:11.292Z",
+    "original_projection_preserved": true,
+    "phase": "held_gateway_binding_after_source_only_fix",
+    "process_state": "close_retryable",
+    "provider_identity_preserved": true,
+    "schema": "venue01.root.readonly-service-observation.v2",
+    "selected_25_source_pins_unchanged": true,
+    "status": "ROOT_READONLY_METADATA"
+  },
+  "limitations": [
+    "Source-fake diagnostic acceptance only; no VENUE formal PASS.",
+    "Cannot recover the original R7 connect error.",
+    "Retained R7 parent and child were not reloaded, patched, retried or terminated. The already loaded parent provider and four function/code/global bindings remain unchanged; child bindings were not inspected.",
+    "Original source/test bytes are preserved in the candidate directory and previous Git commit."
+  ]
+}
