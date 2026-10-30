@@ -45,6 +45,12 @@ sharing, or proof of a coherent provider account snapshot.
 The network transport (including the ZMQ adapter) remains a separate
 package and must authenticate clients before it creates a `GatewayPrincipal`.
 
+## Role in the trading-system architecture
+
+`bt_api_gateway` provides server-side, provider-neutral command routing and durable account event/read views. The hosting service supplies authenticated principals, the account-owner executor, current admission checks, and provider integration. Its SQLite leases and journals coordinate only cooperating processes on the configured database; they do not fence external writers or prove provider state. An executor return is not a provider acknowledgement, and no production writer route is enabled by default.
+
+[Trading system architecture overview](https://github.com/cloudQuant/backtrader/blob/dev/docs/TRADING_SYSTEM_ARCHITECTURE.md).
+
 ## Market hub provider event delivery
 
 `GatewayMarketHub` requires providers to implement `subscribe` and
