@@ -5,3 +5,6 @@ __pycache__/
 .ruff_cache/
 build/
 dist/
+
+# Codex scratch
+.codex-tmp/
