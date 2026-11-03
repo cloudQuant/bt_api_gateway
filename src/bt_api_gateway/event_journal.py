@@ -287,8 +287,15 @@ class GatewayEventJournal:
         fact_digest: str,
         bind_order_route: str | None = None,
         observed_at: float | None = None,
+        trade_fee: tuple[str, str | None, str | None] | None = None,
     ) -> tuple[GatewayAccountEvent, bool]:
         """Append one execution fact once; return ``(event, created)``.
+
+        ``trade_fee`` (iteration 60 R3) is ``(trade_key, fee, fee_currency)`` of
+        a trade fact. A fill's fee is a cumulative fact for that fill: a later
+        report may raise it (a fee correction, a new fact id) but a lower fee
+        is refused with ``EXECUTION_FEE_REGRESSED`` and another currency with
+        ``EXECUTION_FEE_CURRENCY_CONFLICT``, in the same transaction.
 
         ``event_id`` is a provider fact id (iteration 60, R2-C). A redelivered
         fact with the same ``fact_digest`` (the payload's own field) is a
@@ -339,6 +346,8 @@ class GatewayEventJournal:
                     raise GatewayEventJournalError(
                         "EXECUTION_ROUTE_CONFLICT", "order id is routed to another stream"
                     )
+            if trade_fee is not None:
+                self._check_trade_fee(connection, account_scope, trade_fee)
             existing = connection.execute(
                 """
                 SELECT e.* FROM gateway_event_dedupe d
@@ -416,6 +425,56 @@ class GatewayEventJournal:
                 (account_scope, strategy_scope, event_id, sequence, fingerprint, event_time),
             )
         return event, True
+
+    @staticmethod
+    def _check_trade_fee(
+        connection: sqlite3.Connection,
+        account_scope: str,
+        trade_fee: tuple[str, str | None, str | None],
+    ) -> None:
+        from decimal import Decimal, InvalidOperation
+
+        if type(trade_fee) is not tuple or len(trade_fee) != 3:
+            raise GatewayEventJournalError("EXECUTION_FACT_INVALID", "invalid trade fee")
+        trade_key, fee, currency = trade_fee
+        _require_text(trade_key, "trade_key")
+        if (fee is None) != (currency is None):
+            raise GatewayEventJournalError("EXECUTION_FACT_INVALID", "invalid trade fee")
+        try:
+            amount = None if fee is None else Decimal(fee)
+        except (InvalidOperation, TypeError, ValueError):
+            raise GatewayEventJournalError("EXECUTION_FACT_INVALID", "invalid trade fee") from None
+        row = connection.execute(
+            """
+            SELECT fee, fee_currency FROM gateway_execution_trade_fees
+            WHERE account_scope = ? AND trade_key = ?
+            """,
+            (account_scope, trade_key),
+        ).fetchone()
+        if row is None:
+            connection.execute(
+                "INSERT INTO gateway_execution_trade_fees VALUES (?, ?, ?, ?)",
+                (account_scope, trade_key, fee, currency),
+            )
+            return
+        if amount is None:
+            return  # a fee-less re-report changes nothing recorded
+        if row["fee"] is not None:
+            if str(row["fee_currency"]) != currency:
+                raise GatewayEventJournalError(
+                    "EXECUTION_FEE_CURRENCY_CONFLICT", "fill fee currency changed"
+                )
+            if amount < Decimal(str(row["fee"])):
+                raise GatewayEventJournalError("EXECUTION_FEE_REGRESSED", "fill fee regressed")
+            if amount == Decimal(str(row["fee"])):
+                return
+        connection.execute(
+            """
+            UPDATE gateway_execution_trade_fees SET fee = ?, fee_currency = ?
+            WHERE account_scope = ? AND trade_key = ?
+            """,
+            (fee, currency, account_scope, trade_key),
+        )
 
     def execution_order_route(self, account_scope: str, order_id: str) -> str | None:
         """Return the execution stream a provider order id was routed to, if any."""
@@ -2560,6 +2619,13 @@ class GatewayEventJournal:
                     order_id TEXT NOT NULL,
                     strategy_scope TEXT NOT NULL,
                     PRIMARY KEY (account_scope, order_id)
+                );
+                CREATE TABLE IF NOT EXISTS gateway_execution_trade_fees (
+                    account_scope TEXT NOT NULL,
+                    trade_key TEXT NOT NULL,
+                    fee TEXT,
+                    fee_currency TEXT,
+                    PRIMARY KEY (account_scope, trade_key)
                 );
                 CREATE TABLE IF NOT EXISTS gateway_account_views (
                     account_scope TEXT NOT NULL,

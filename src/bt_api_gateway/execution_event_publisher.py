@@ -18,6 +18,12 @@ event:
 * **Idempotent ids.** The event id is the Base fact id; a redelivered fact is
   a duplicate (``created=False``) and a different fact under the same id is
   refused with ``EXECUTION_FACT_CONFLICT`` (fail closed).
+* **Fill fees (iteration 60 R3).** A trade observation carries the provider
+  fee of the fill when the provider supplies it (Base execution event v2). The
+  fee is part of the trade fact: a re-report with a higher fee is a new event
+  (a fee correction for consumers such as Backtrader's ``notify_fee_correction``),
+  a lower fee (``EXECUTION_FEE_REGRESSED``) or another currency
+  (``EXECUTION_FEE_CURRENCY_CONFLICT``) is refused and nothing is appended.
 
 The publisher does not contact a provider, verify a fill or bind an intent;
 the observations remain provider declarations.
@@ -34,6 +40,7 @@ from bt_api_base.execution_row_observation_protocol import (
     AccountExecutionOrderObservation,
     AccountExecutionTradeObservation,
     execution_observation_event,
+    strategy_client_order_prefix,
 )
 
 from .event_journal import GatewayEventJournal, GatewayEventJournalError
@@ -79,6 +86,32 @@ class GatewayExecutionScopePolicy:
             if self.unattributed_scope in copied.values():
                 raise GatewayExecutionEventError("AMBIGUOUS_UNATTRIBUTED_SCOPE")
         object.__setattr__(self, "client_order_prefixes", MappingProxyType(copied))
+
+    @classmethod
+    def for_strategies(
+        cls, strategy_streams: Mapping[str, str], *, unattributed_scope: str | None = None
+    ) -> GatewayExecutionScopePolicy:
+        """Routes from strategy refs, with the Base-derived client-order prefixes.
+
+        ``strategy_streams`` maps a strategy reference to its execution stream.
+        The prefix of each strategy is
+        :func:`bt_api_base.execution_row_observation_protocol.strategy_client_order_prefix`,
+        the same derivation the order-entry owner uses when it generates the
+        provider client order id (iteration 60 R3), so routing is not typed twice.
+        """
+
+        if not isinstance(strategy_streams, Mapping) or not strategy_streams:
+            raise GatewayExecutionEventError("INVALID_EXECUTION_ROUTES")
+        prefixes: dict[str, str] = {}
+        for strategy_ref, stream in strategy_streams.items():
+            try:
+                prefix = strategy_client_order_prefix(strategy_ref)
+            except ValueError:
+                raise GatewayExecutionEventError("INVALID_EXECUTION_ROUTES") from None
+            if prefix in prefixes:
+                raise GatewayExecutionEventError("AMBIGUOUS_EXECUTION_ROUTES")
+            prefixes[prefix] = stream
+        return cls(prefixes, unattributed_scope)
 
     @property
     def scopes(self) -> frozenset[str]:
@@ -190,6 +223,15 @@ class GatewayExecutionEventPublisher:
                 dropped += 1
                 continue
             kind, event_id, payload = execution_observation_event(item)
+            trade_fee = None
+            if type(item) is AccountExecutionTradeObservation:
+                # A fill's provider fee is cumulative for that fill: a higher
+                # later fee is a fee correction, a lower one is refused.
+                trade_fee = (
+                    item.trade.instrument.instrument_id + "\x1f" + item.trade.trade_id,
+                    item.fee,
+                    item.fee_currency,
+                )
             try:
                 _event, created = self._journal.append_execution_fact(
                     self._account_scope,
@@ -199,6 +241,7 @@ class GatewayExecutionEventPublisher:
                     payload,
                     fact_digest=payload["fact_digest"],
                     bind_order_route=bind,
+                    trade_fee=trade_fee,
                 )
             except GatewayEventJournalError as error:
                 code = error.code
