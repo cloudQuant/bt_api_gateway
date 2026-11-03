@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Optional, Union
 
 import pytest
 from bt_api_base.account_protocol import (
@@ -44,7 +43,7 @@ _SOURCE_SCOPE = "strategy:source-state"
 class _Provider:
     def __init__(
         self,
-        observations: tuple[Union[AccountObservation, Exception], ...],  # noqa: UP007
+        observations: tuple[AccountObservation | Exception, ...],
     ) -> None:
         self._observations = list(observations)
 
@@ -113,11 +112,11 @@ def _policies() -> tuple[GatewayAccountViewPolicy, GatewayAccountViewPolicy]:
 
 def _new_worker_service(
     tmp_path,
-    observations: tuple[Union[AccountObservation, Exception], ...],  # noqa: UP007
+    observations: tuple[AccountObservation | Exception, ...],
     *,
     view_policies: tuple[GatewayAccountViewPolicy, ...] = _policies(),
-    strategy_scope_map: Optional[Mapping[str, str]] = None,  # noqa: UP045
-    account_read_strategy_scope: Optional[str] = None,  # noqa: UP045
+    strategy_scope_map: Mapping[str, str] | None = None,
+    account_read_strategy_scope: str | None = None,
 ):
     guard_dir = tmp_path / "guards"
     guard_dir.mkdir(exist_ok=True)
@@ -164,7 +163,7 @@ def _new_worker_service(
     return journal, worker, service
 
 
-def _scope(strategy_ref: Optional[str]) -> WireScope:  # noqa: UP045
+def _scope(strategy_ref: str | None) -> WireScope:
     return WireScope(
         execution_domain_ref="paper-a",
         account_ref="account-a",
@@ -175,7 +174,7 @@ def _scope(strategy_ref: Optional[str]) -> WireScope:  # noqa: UP045
 def _read(
     service: GatewayReadService,
     operation: str,
-    strategy_ref: Optional[str],  # noqa: UP045
+    strategy_ref: str | None,
     **args,
 ):
     return service.handle(

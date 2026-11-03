@@ -25,10 +25,10 @@ import re
 import threading
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Callable
+from typing import Any, Protocol, cast
 
 from bt_api_base.account_protocol import (
     MAX_ACCOUNT_OBSERVATION_BYTES,
@@ -139,6 +139,16 @@ class GatewayAccountSessionProfileUnavailableError(RuntimeError):
     release its local guard after the child exits.  Any other factory failure
     is uncertain and retains process custody.
     """
+
+
+class _ChildAccountProvider(Protocol):
+    """Provider methods the child calls; results are untrusted and validated."""
+
+    def connect(self, *, account_key: AccountKey, generation: str, timeout: float) -> object: ...
+
+    def read_account(self, *, generation: str, timeout: float) -> object: ...
+
+    def close(self) -> object: ...
 
 
 @dataclass(frozen=True)
@@ -534,9 +544,10 @@ class GatewayAccountSessionProcessProvider:
                         cleanup_confirmed = False
                 if not cleanup_confirmed:
                     # Startup did not report a PID, but local handle cleanup
-                    # itself is uncertain. Retain every exact object and keep
-                    # the account-session guard held until an owner can inspect
-                    # or retry cleanup explicitly.
+                    # itself is uncertain. Retain every exact object whose
+                    # close was not confirmed (closed ones are released) and
+                    # keep the account-session guard held until an owner can
+                    # inspect or retry cleanup explicitly.
                     self._process = remaining_process
                     self._connection = remaining_parent
                     self._child_connection = remaining_child
@@ -803,9 +814,7 @@ def serve_account_session_child(
     provider_factory: Callable[[str], GatewayAccountSessionProcessBinding],
     close_receipt_projector: Callable[[object, int], Mapping[str, object]] | None = None,
     startup_attempt_projector: Callable[[object], Mapping[str, object]] | None = None,
-    startup_stop_receipt_projector: Callable[
-        [object, str], Mapping[str, object]
-    ] | None = None,
+    startup_stop_receipt_projector: Callable[[object, str], Mapping[str, object]] | None = None,
 ) -> None:
     """Serve one typed account-session connection inside a trusted child entry.
 
@@ -820,9 +829,7 @@ def serve_account_session_child(
     if startup_attempt_projector is not None:
         _validate_module_entry(startup_attempt_projector, "STARTUP_ATTEMPT_PROJECTOR_INVALID")
     if startup_stop_receipt_projector is not None:
-        _validate_module_entry(
-            startup_stop_receipt_projector, "STARTUP_STOP_PROJECTOR_INVALID"
-        )
+        _validate_module_entry(startup_stop_receipt_projector, "STARTUP_STOP_PROJECTOR_INVALID")
     binding: GatewayAccountSessionProcessBinding | None = None
     generation: str | None = None
     native_owner_created = False
@@ -849,7 +856,7 @@ def serve_account_session_child(
                 connection, request, "bootstrap_rejected", {"error_code": "BOOTSTRAP_INVALID"}
             )
             return
-        generation = request["generation"]
+        generation = cast("str", request["generation"])  # validated by _decode_frame
         profile_ref = payload["profile_ref"]
         try:
             binding = provider_factory(profile_ref)
@@ -874,8 +881,7 @@ def serve_account_session_child(
                 {"error_code": "PROFILE_BINDING_INVALID"},
             )
             return
-        provider = binding.provider
-        if not _valid_provider(provider):
+        if not _valid_provider(binding.provider):
             _send_response(
                 connection,
                 request,
@@ -883,6 +889,7 @@ def serve_account_session_child(
                 {"error_code": "PROFILE_PROVIDER_INVALID"},
             )
             return
+        provider = cast("_ChildAccountProvider", binding.provider)
         _send_response(
             connection,
             request,
@@ -1058,11 +1065,12 @@ def serve_account_session_child(
                             continue
                         if startup_phase == "api_created":
                             try:
-                                closed_owner_created, closed_native_generation = (
-                                    _native_owner_state(provider)
-                                )
+                                owner_state = _native_owner_state(provider)
                             except Exception:
-                                closed_owner_created, closed_native_generation = None, None
+                                owner_state = None  # unknown: fall back to the receipt
+                            closed_owner_created, closed_native_generation = (
+                                owner_state if owner_state is not None else (False, None)
+                            )
                             if not (
                                 closed_owner_created is True
                                 and type(closed_native_generation) is int
@@ -1078,21 +1086,17 @@ def serve_account_session_child(
                                         "NATIVE_STARTUP_ATTEMPT_INVALID"
                                     )
                                 startup_receipt = _validate_startup_stop_receipt(
-                                    startup_stop_receipt_projector(
-                                        provider, expected_attempt_id
-                                    ),
+                                    startup_stop_receipt_projector(provider, expected_attempt_id),
                                     native_startup_attempt,
                                 )
-                                startup_payload = {
+                                startup_payload: dict[str, object] = {
                                     "native_owner_created": True,
                                     "native_connection_generation": None,
                                     "native_stop_receipt": None,
                                     "native_startup_stop_receipt": startup_receipt,
                                     "close_confirmed": True,
                                 }
-                                _send_response(
-                                    connection, request, "closed", startup_payload
-                                )
+                                _send_response(connection, request, "closed", startup_payload)
                                 return
 
                     # If connect failed before its native state could be
@@ -1124,7 +1128,7 @@ def serve_account_session_child(
                             raise ValueError("native generation missing")
                         raw_receipt = close_receipt_projector(provider, native_generation)
                         receipt = _validate_stop_receipt(raw_receipt, native_generation)
-                    close_payload = {
+                    close_payload: dict[str, object] = {
                         "native_owner_created": native_owner_created,
                         "native_connection_generation": native_generation,
                         "native_stop_receipt": receipt,
@@ -1323,8 +1327,8 @@ def _send_response(
 
 def _native_owner_state(provider: object) -> tuple[bool, int | None]:
     try:
-        owner = provider.native_owner_created
-        native_generation = provider.native_connection_generation
+        owner = getattr(provider, "native_owner_created")  # noqa: B009 - may raise
+        native_generation = getattr(provider, "native_connection_generation")  # noqa: B009
     except Exception:
         raise GatewayAccountSessionProcessError("NATIVE_OWNER_STATE_UNAVAILABLE") from None
     if type(owner) is not bool:
@@ -1378,10 +1382,7 @@ def _validate_startup_attempt_payload(value: object) -> dict[str, object]:
     if phase == "preflight_no_owner":
         if attempt_id is not None:
             raise GatewayAccountSessionProcessError("NATIVE_STARTUP_ATTEMPT_INVALID")
-    elif (
-        type(attempt_id) is not str
-        or _NATIVE_API_ATTEMPT_RE.fullmatch(attempt_id) is None
-    ):
+    elif type(attempt_id) is not str or _NATIVE_API_ATTEMPT_RE.fullmatch(attempt_id) is None:
         raise GatewayAccountSessionProcessError("NATIVE_STARTUP_ATTEMPT_INVALID")
     return {"api_attempt_id": attempt_id, "phase": phase}
 
@@ -1407,7 +1408,8 @@ def _validate_startup_stop_receipt(
         or receipt["native_released"] is not True
         or type(receipt["join_required"]) is not bool
         or type(receipt["join_completed"]) is not bool
-        or receipt["join_required"] and not receipt["join_completed"]
+        or receipt["join_required"]
+        and not receipt["join_completed"]
         or type(receipt["thread_alive"]) is not bool
         or receipt["thread_alive"] is not False
         or type(receipt["timed_out"]) is not bool
@@ -1515,9 +1517,10 @@ def _encode_account_result(
     result: object, account_key: AccountKey, generation: str
 ) -> dict[str, object]:
     if type(result) is AccountObservation:
-        if result.account_key != account_key:
+        observation = cast("AccountObservation", result)
+        if observation.account_key != account_key:
             raise GatewayAccountSessionProcessError("OBSERVATION_ACCOUNT_MISMATCH")
-        return {"kind": "observation", "observation": result.to_dict()}
+        return {"kind": "observation", "observation": observation.to_dict()}
     if type(result) is GatewayFullPositionSnapshot:
         if (
             result.observation.account_key != account_key

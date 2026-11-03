@@ -14,13 +14,13 @@ import json
 import math
 import sqlite3
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol, Union
+from typing import TYPE_CHECKING, Any, Protocol
 
 from .database_identity import SQLiteFileIdentity
 
@@ -187,12 +187,12 @@ class GatewayCommandRouter:
 
     def __init__(
         self,
-        database_path: Union[Path, str],  # noqa: UP007 -- Python 3.9 is supported.
+        database_path: Path | str,
         executor: GatewayExecutor,
-        clock: Optional[Callable[[], float]] = None,  # noqa: UP045 -- Python 3.9 is supported.
+        clock: Callable[[], float] | None = None,
         timeout_seconds: float = 5.0,
-        admission: Optional[GatewayAdmission] = None,  # noqa: UP045 -- Python 3.9 is supported.
-        writer_authority: Optional[GatewayAccountWriterAuthority] = None,  # noqa: UP045 -- Python 3.9 is supported.
+        admission: GatewayAdmission | None = None,
+        writer_authority: GatewayAccountWriterAuthority | None = None,
     ) -> None:
         self._database_identity = SQLiteFileIdentity(Path(database_path).absolute())
         self._database_path = self._database_identity.path
@@ -277,7 +277,7 @@ class GatewayCommandRouter:
         # READ is the only command that does not change account or control
         # state. A client-side digest and principal ACL are not substitutes for
         # current server-side execution/risk/session admission.
-        action_claim: Optional[GatewayActionClaim] = None  # noqa: UP045 -- Python 3.9 is supported.
+        action_claim: GatewayActionClaim | None = None
         writer_lease: Any = None
         if command.kind is not GatewayCommandKind.READ:
             try:
@@ -363,7 +363,7 @@ class GatewayCommandRouter:
         recovered = self._begin_dispatch(command.command_id)
         if recovered is not None:
             if action_claim is not None and recovered.status is GatewayCommandStatus.EXPIRED:
-                self._writer_authority.reject_unstarted_action(
+                self._claimed_writer_authority().reject_unstarted_action(
                     action_claim, "command_expired_before_dispatch"
                 )
             if recovered.status is GatewayCommandStatus.EXPIRED:
@@ -374,11 +374,13 @@ class GatewayCommandRouter:
             try:
                 # This commits the current epoch, lease expiry/revocation, action
                 # binding, and single-use claim check immediately before owner call.
-                self._writer_authority.begin_action_dispatch(
+                self._claimed_writer_authority().begin_action_dispatch(
                     writer_lease, principal, command, action_claim
                 )
             except Exception as exc:
-                self._writer_authority.reject_unstarted_action(action_claim, type(exc).__name__)
+                self._claimed_writer_authority().reject_unstarted_action(
+                    action_claim, type(exc).__name__
+                )
                 status = (
                     GatewayCommandStatus.EXPIRED
                     if command.expires_at <= self._clock()
@@ -406,7 +408,7 @@ class GatewayCommandRouter:
             }
             if action_claim is not None:
                 with contextlib.suppress(Exception):
-                    self._writer_authority.mark_unknown(action_claim, type(exc).__name__)
+                    self._claimed_writer_authority().mark_unknown(action_claim, type(exc).__name__)
                     # The durable DISPATCHING claim itself remains unresolved and
                     # fences takeover if a crash or storage error interrupts us.
             self._finish(command.command_id, GatewayCommandStatus.UNKNOWN, safe_outcome)
@@ -414,7 +416,7 @@ class GatewayCommandRouter:
 
         if action_claim is not None:
             # A local executor return says nothing about provider acceptance.
-            self._writer_authority.mark_owner_returned_unverified(action_claim, outcome)
+            self._claimed_writer_authority().mark_owner_returned_unverified(action_claim, outcome)
         self._finish(
             command.command_id,
             (
@@ -435,7 +437,18 @@ class GatewayCommandRouter:
             outcome=outcome,
         )
 
-    def get(self, command_id: str) -> Optional[GatewayDispatchResult]:  # noqa: UP045 -- Python 3.9 is supported.
+    def _claimed_writer_authority(self) -> GatewayAccountWriterAuthority:
+        """Writer authority for a command that already holds an action claim."""
+
+        authority = self._writer_authority
+        if authority is None:  # a claim is only issued by a configured authority
+            raise GatewayRoutingError(
+                "WRITER_AUTHORITY_UNAVAILABLE",
+                "non-read command has no server-owned account writer authority",
+            )
+        return authority
+
+    def get(self, command_id: str) -> GatewayDispatchResult | None:
         """Read a command state without creating a new dispatch opportunity."""
         with self._connection() as connection:
             row = connection.execute(
@@ -484,7 +497,7 @@ class GatewayCommandRouter:
                 (status.value, _canonical_json(outcome), self._clock(), command_id),
             )
 
-    def _begin_dispatch(self, command_id: str) -> Optional[GatewayDispatchResult]:  # noqa: UP045 -- Python 3.9 is supported.
+    def _begin_dispatch(self, command_id: str) -> GatewayDispatchResult | None:
         """Atomically move an admitted, unexpired command to owner dispatch."""
         with self._transaction() as connection:
             now = self._clock()

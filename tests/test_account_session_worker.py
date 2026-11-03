@@ -7,7 +7,6 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
-from typing import Optional
 
 import pytest
 from bt_api_base.account_protocol import (
@@ -87,7 +86,7 @@ class FakeProvider:
             raise value
         return value  # type: ignore[return-value]
 
-    def close(self) -> Optional[bool]:  # noqa: UP045 -- Python 3.9 support.
+    def close(self) -> bool | None:
         self.close_calls += 1
         if self.close_results:
             value = self.close_results.pop(0)
@@ -125,16 +124,16 @@ def _observation(
     clocks: Clocks,
     *,
     observation_id: str,
-    account_key: Optional[AccountKey] = None,  # noqa: UP045 -- Python 3.9 support.
-    coverage: Optional[tuple[AccountResourceKey, ...]] = None,  # noqa: UP045
+    account_key: AccountKey | None = None,
+    coverage: tuple[AccountResourceKey, ...] | None = None,
     positions: tuple[AccountPosition, ...] = (),
     balances_complete: bool = True,
     positions_complete: bool = True,
-    open_orders: Optional[tuple[AccountOpenOrder, ...]] = None,  # noqa: UP045
+    open_orders: tuple[AccountOpenOrder, ...] | None = None,
     open_orders_complete: bool = False,
-    row_timestamp: Optional[str] = None,  # noqa: UP045
-    started_at_utc: Optional[str] = None,  # noqa: UP045
-    completed_at_utc: Optional[str] = None,  # noqa: UP045
+    row_timestamp: str | None = None,
+    started_at_utc: str | None = None,
+    completed_at_utc: str | None = None,
 ) -> AccountObservation:
     identity = account_key or _identity()
     resource = _resource()
@@ -181,8 +180,8 @@ def _open_order(
     clocks: Clocks,
     *,
     order_id: str = "order-1",
-    observed_at_utc: Optional[str] = None,  # noqa: UP045
-    created_at_utc: Optional[str] = None,  # noqa: UP045
+    observed_at_utc: str | None = None,
+    created_at_utc: str | None = None,
 ) -> AccountOpenOrder:
     observed_at = observed_at_utc or clocks.timestamp()
     created_at = created_at_utc or clocks.timestamp(-1.0)
@@ -212,13 +211,13 @@ def _worker(
     provider: FakeProvider,
     clocks: Clocks,
     *,
-    account_key: Optional[AccountKey] = None,  # noqa: UP045
-    required_coverage: Optional[tuple[AccountResourceKey, ...]] = None,  # noqa: UP045
+    account_key: AccountKey | None = None,
+    required_coverage: tuple[AccountResourceKey, ...] | None = None,
     require_open_orders: bool = False,
     max_staleness_seconds: float = 5.0,
     request_timeout_seconds: float = 2.0,
-    guard: Optional[LocalAccountSessionGuard] = None,  # noqa: UP045
-    clock_resolution_seconds: Optional[tuple[float, float]] = None,  # noqa: UP045
+    guard: LocalAccountSessionGuard | None = None,
+    clock_resolution_seconds: tuple[float, float] | None = None,
 ) -> tuple[GatewayAccountSessionWorker, GatewayEventJournal]:
     identity = account_key or _identity()
     journal = GatewayEventJournal(tmp_path / "gateway.db", clock=clocks.utc)
@@ -608,7 +607,9 @@ def test_reported_clock_quantization_is_tolerated_without_renewing_old_facts(tmp
 
         status = worker.read_status()
         assert status["ready"] is True
-        assert status["fresh_for_seconds"] == pytest.approx(4.95)
+        # Monotonic elapsed time (0.05 s, less the bounded clock-rate skew)
+        # ages the facts, not the smaller wall-clock advance (0.015625 s).
+        assert status["fresh_for_seconds"] == pytest.approx(4.95, abs=1e-4)
 
         # A new observation id with the same provider timestamps cannot use
         # the tolerated wall/monotonic difference to extend its deadline.
@@ -1311,7 +1312,7 @@ def test_older_complete_empty_positions_snapshot_cannot_remove_newer_positions(t
 def _wire_scope(
     *,
     account_ref: str = "account-a",
-    strategy_ref: Optional[str] = None,  # noqa: UP045
+    strategy_ref: str | None = None,
 ) -> WireScope:
     return WireScope(
         execution_domain_ref="paper-a",

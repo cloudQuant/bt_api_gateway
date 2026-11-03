@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 import pytest
@@ -19,6 +19,8 @@ from bt_api_gateway.quota_admission import (
     GatewayQuotaOperation,
     GatewayQuotaSubject,
 )
+
+_SQLITE_BUSY = getattr(sqlite3, "SQLITE_BUSY", 5)  # constant added in Python 3.11
 
 
 def _is_test_sqlite_busy(exc: sqlite3.OperationalError) -> bool:
@@ -134,27 +136,31 @@ def test_critical_operations_can_use_reserved_capacity_but_open_cannot(
     clock = _LogicalQuotaClock(time.monotonic_ns())
     monkeypatch.setattr(quota_module, "time", clock)
 
-    assert callback(
-        "acct:2", "strategy:2", "run:2", "ETH-PERP", "OPEN", clock.monotonic_ns() + 100_000_000
-    ) is None
+    assert (
+        callback(
+            "acct:2", "strategy:2", "run:2", "ETH-PERP", "OPEN", clock.monotonic_ns() + 100_000_000
+        )
+        is None
+    )
     with pytest.raises(GatewayQuotaAdmissionError) as denied:
         callback(
             "acct:2", "strategy:2", "run:2", "ETH-PERP", "OPEN", clock.monotonic_ns() + 10_000_000
         )
     assert denied.value.code == "DEADLINE_EXCEEDED"
-    assert callback(
-        "acct:2",
-        "strategy:2",
-        "run:2",
-        "ETH-PERP",
-        critical_operation,
-        clock.monotonic_ns() + 100_000_000,
-    ) is None
+    assert (
+        callback(
+            "acct:2",
+            "strategy:2",
+            "run:2",
+            "ETH-PERP",
+            critical_operation,
+            clock.monotonic_ns() + 100_000_000,
+        )
+        is None
+    )
 
     with sqlite3.connect(path) as connection:
-        operations = connection.execute(
-            "SELECT operation FROM grants ORDER BY sequence"
-        ).fetchall()
+        operations = connection.execute("SELECT operation FROM grants ORDER BY sequence").fetchall()
     assert operations == [("open",), (stored_operation,)]
 
 
@@ -179,15 +185,9 @@ def test_critical_waiter_bypasses_same_subject_open_only_at_reserved_boundary(
         GatewayQuotaOperation.OPEN,
         now + 1_000_000_000,
     )
-    blocked_open = GatewayQuotaSubject(
-        "acct:shared", "strategy:shared", "BTC-PERP", "run:open"
-    )
-    critical = GatewayQuotaSubject(
-        "acct:shared", "strategy:shared", "BTC-PERP", "run:critical"
-    )
-    assert quota_module._subject_digest(blocked_open) == quota_module._subject_digest(
-        critical
-    )
+    blocked_open = GatewayQuotaSubject("acct:shared", "strategy:shared", "BTC-PERP", "run:open")
+    critical = GatewayQuotaSubject("acct:shared", "strategy:shared", "BTC-PERP", "run:critical")
+    assert quota_module._subject_digest(blocked_open) == quota_module._subject_digest(critical)
     blocked_deadline = now + 5_000_000_000
     open_id = "a" * 32
     _persist_waiter(
@@ -199,10 +199,11 @@ def test_critical_waiter_bypasses_same_subject_open_only_at_reserved_boundary(
         request_id=open_id,
     )
 
+    # The bypass is immediate; the deadline only has to survive a loaded host.
     grant = owner.admit(
         critical,
         operation,
-        time.monotonic_ns() + 40_000_000,
+        time.monotonic_ns() + 1_000_000_000,
     )
 
     assert grant.operation is operation
@@ -231,12 +232,8 @@ def test_same_subject_critical_does_not_overtake_open_while_regular_capacity_is_
         GatewayQuotaOperation.OPEN,
         now + 1_000_000_000,
     )
-    blocked_open = GatewayQuotaSubject(
-        "acct:shared", "strategy:shared", "BTC-PERP", "run:open"
-    )
-    current_cancel = GatewayQuotaSubject(
-        "acct:shared", "strategy:shared", "BTC-PERP", "run:cancel"
-    )
+    blocked_open = GatewayQuotaSubject("acct:shared", "strategy:shared", "BTC-PERP", "run:open")
+    current_cancel = GatewayQuotaSubject("acct:shared", "strategy:shared", "BTC-PERP", "run:cancel")
     open_id = "f" * 32
     _persist_waiter(
         path,
@@ -292,9 +289,7 @@ def test_blocked_subject_does_not_skip_earlier_critical_ticket(
         GatewayQuotaOperation.OPEN,
         now + 1_000_000_000,
     )
-    subject = GatewayQuotaSubject(
-        "acct:fifo", "strategy:fifo", "BTC-PERP", "run:old"
-    )
+    subject = GatewayQuotaSubject("acct:fifo", "strategy:fifo", "BTC-PERP", "run:old")
     deadline = now + 5_000_000_000
     open_id = "b" * 32
     critical_id = "c" * 32
@@ -317,9 +312,7 @@ def test_blocked_subject_does_not_skip_earlier_critical_ticket(
 
     with pytest.raises(GatewayQuotaAdmissionError) as expired:
         owner.admit(
-            GatewayQuotaSubject(
-                "acct:fifo", "strategy:fifo", "BTC-PERP", "run:current"
-            ),
+            GatewayQuotaSubject("acct:fifo", "strategy:fifo", "BTC-PERP", "run:current"),
             current_operation,
             time.monotonic_ns() + 25_000_000,
         )
@@ -331,8 +324,7 @@ def test_blocked_subject_does_not_skip_earlier_critical_ticket(
             (owner._domain_digest,),
         ).fetchall()
         earlier = connection.execute(
-            "SELECT ticket, operation FROM waiters "
-            "WHERE domain_digest = ? AND request_id = ?",
+            "SELECT ticket, operation FROM waiters WHERE domain_digest = ? AND request_id = ?",
             (owner._domain_digest, critical_id),
         ).fetchone()
     assert grants == [("open",)]
@@ -381,9 +373,7 @@ def test_cross_subject_turn_fairness_survives_reserved_bypass(
             GatewayQuotaOperation.OPEN,
             time.monotonic_ns() + 1_000_000_000,
         )
-    older_subject = GatewayQuotaSubject(
-        "acct:older", "strategy:older", "BTC-PERP", "run:older"
-    )
+    older_subject = GatewayQuotaSubject("acct:older", "strategy:older", "BTC-PERP", "run:older")
     current_subject = GatewayQuotaSubject(
         "acct:current", "strategy:current", "BTC-PERP", "run:current"
     )
@@ -490,19 +480,20 @@ def test_reserved_bypass_refuses_when_all_quota_capacity_is_used(
 
     with pytest.raises(GatewayQuotaAdmissionError) as expired:
         owner.admit(
-            GatewayQuotaSubject(
-                "acct:full", "strategy:full", "BTC-PERP", "run:cancel"
-            ),
+            GatewayQuotaSubject("acct:full", "strategy:full", "BTC-PERP", "run:cancel"),
             GatewayQuotaOperation.CANCEL,
             time.monotonic_ns() + 25_000_000,
         )
 
     assert expired.value.code == "DEADLINE_EXCEEDED"
     with sqlite3.connect(path) as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) FROM grants WHERE domain_digest = ?",
-            (owner._domain_digest,),
-        ).fetchone()[0] == owner._capacity
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM grants WHERE domain_digest = ?",
+                (owner._domain_digest,),
+            ).fetchone()[0]
+            == owner._capacity
+        )
 
 
 def test_manual_account_bucket_requires_both_strategy_refs_absent(tmp_path: Path) -> None:
@@ -555,27 +546,26 @@ def test_existing_quota_schema_adds_run_metadata_columns(tmp_path: Path) -> None
         )
 
     callback = GatewayQuotaDispatchAdmission(_owner(path))
-    assert callback(
-        "acct:migrated",
-        "strategy:migrated",
-        "run:migrated",
-        "BTC-PERP",
-        "OPEN",
-        time.monotonic_ns() + 2_000_000_000,
-    ) is None
+    assert (
+        callback(
+            "acct:migrated",
+            "strategy:migrated",
+            "run:migrated",
+            "BTC-PERP",
+            "OPEN",
+            time.monotonic_ns() + 2_000_000_000,
+        )
+        is None
+    )
 
     with sqlite3.connect(path) as connection:
-        assert "run_digest" in {
-            row[1] for row in connection.execute("PRAGMA table_info(waiters)")
-        }
-        grant_columns = {
-            row[1] for row in connection.execute("PRAGMA table_info(grants)")
-        }
+        assert "run_digest" in {row[1] for row in connection.execute("PRAGMA table_info(waiters)")}
+        grant_columns = {row[1] for row in connection.execute("PRAGMA table_info(grants)")}
         assert "run_digest" in grant_columns
         assert connection.execute("SELECT run_digest FROM grants").fetchone()[0]
 
 
-class _StopBeforeQuotaWait(Exception):  # noqa: N818
+class _StopBeforeQuotaWaitError(Exception):
     pass
 
 
@@ -634,8 +624,7 @@ def _persist_waiter(
             ),
         )
         connection.execute(
-            "UPDATE quota_domains SET next_ticket = next_ticket + 1 "
-            "WHERE domain_digest = ?",
+            "UPDATE quota_domains SET next_ticket = next_ticket + 1 WHERE domain_digest = ?",
             (owner._domain_digest,),
         )
     return ticket
@@ -643,20 +632,22 @@ def _persist_waiter(
 
 def _capture_one_quota_wait(
     path: Path, monkeypatch: pytest.MonkeyPatch
-) -> list[tuple[float, int, int, list[int]]]:
-    waits: list[tuple[float, int, int, list[int]]] = []
+) -> list[tuple[float, int, int, list[int], int]]:
+    """Capture the first quota sleep and the durable state it was derived from.
+
+    Each entry is ``(requested_seconds, poll_now_ns, backoff_until_ns,
+    active_grants, sleep_called_ns)``. The admitter converts its absolute wake
+    instant into a sleep using a fresh monotonic reading taken after
+    ``poll_now_ns``, so the requested sleep is bounded by the two clocks.
+    """
+    waits: list[tuple[float, int, int, list[int], int]] = []
 
     def stop_before_sleep(seconds: float) -> None:
+        sleep_called_ns = time.monotonic_ns()
         with sqlite3.connect(path) as connection:
-            now = int(
-                connection.execute(
-                    "SELECT last_mono_ns FROM quota_domains"
-                ).fetchone()[0]
-            )
+            now = int(connection.execute("SELECT last_mono_ns FROM quota_domains").fetchone()[0])
             backoff_until = int(
-                connection.execute(
-                    "SELECT backoff_until_ns FROM quota_domains"
-                ).fetchone()[0]
+                connection.execute("SELECT backoff_until_ns FROM quota_domains").fetchone()[0]
             )
             grants = [
                 int(row[0])
@@ -664,11 +655,21 @@ def _capture_one_quota_wait(
                     "SELECT granted_ns FROM grants ORDER BY granted_ns"
                 ).fetchall()
             ]
-        waits.append((seconds, now, backoff_until, grants))
-        raise _StopBeforeQuotaWait
+        waits.append((seconds, now, backoff_until, grants, sleep_called_ns))
+        raise _StopBeforeQuotaWaitError
 
     monkeypatch.setattr(quota_module.time, "sleep", stop_before_sleep)
     return waits
+
+
+def _assert_sleep_targets(
+    requested_seconds: float, wake_ns: int, poll_now_ns: int, sleep_called_ns: int
+) -> None:
+    """The sleep ends at ``wake_ns`` measured from some instant in the poll window."""
+
+    latest = max(0.0, (wake_ns - poll_now_ns) / 1_000_000_000)
+    earliest = max(0.0, (wake_ns - sleep_called_ns) / 1_000_000_000)
+    assert earliest - 1e-6 <= requested_seconds <= latest + 1e-6
 
 
 @pytest.mark.parametrize(
@@ -710,7 +711,7 @@ def test_adaptive_wait_uses_operation_threshold_and_kth_grant_expiry(
         )
 
     waits = _capture_one_quota_wait(path, monkeypatch)
-    with pytest.raises(_StopBeforeQuotaWait):
+    with pytest.raises(_StopBeforeQuotaWaitError):
         owner.admit(
             GatewayQuotaSubject("acct:waiter", "strategy:waiter", "BTC-PERP", "run:waiter"),
             operation,
@@ -718,7 +719,7 @@ def test_adaptive_wait_uses_operation_threshold_and_kth_grant_expiry(
         )
 
     assert len(waits) == 1
-    requested_seconds, poll_now_ns, backoff_until_ns, active_grants = waits[0]
+    requested_seconds, poll_now_ns, backoff_until_ns, active_grants, called_ns = waits[0]
     threshold = 3 if operation is GatewayQuotaOperation.CANCEL else 2
     needed_to_expire = len(active_grants) - threshold + 1
     expected_wake_ns = max(
@@ -726,9 +727,7 @@ def test_adaptive_wait_uses_operation_threshold_and_kth_grant_expiry(
         backoff_until_ns,
     )
     assert expected_expiry_index == needed_to_expire - 1
-    assert requested_seconds == pytest.approx(
-        max(0.0, (expected_wake_ns - poll_now_ns) / 1_000_000_000), abs=1e-6
-    )
+    _assert_sleep_targets(requested_seconds, expected_wake_ns, poll_now_ns, called_ns)
 
 
 def test_adaptive_wait_uses_later_rate_limit_backoff_or_grant_expiry(
@@ -762,7 +761,7 @@ def test_adaptive_wait_uses_later_rate_limit_backoff_or_grant_expiry(
     clock = _LogicalQuotaClock(base)
     monkeypatch.setattr(quota_module, "time", clock)
     waits = _capture_one_quota_wait(path, monkeypatch)
-    with pytest.raises(_StopBeforeQuotaWait):
+    with pytest.raises(_StopBeforeQuotaWaitError):
         owner.admit(
             GatewayQuotaSubject("acct:waiter", "strategy:waiter", "BTC-PERP", "run:waiter"),
             GatewayQuotaOperation.OPEN,
@@ -770,12 +769,10 @@ def test_adaptive_wait_uses_later_rate_limit_backoff_or_grant_expiry(
         )
 
     assert len(waits) == 1
-    requested_seconds, poll_now_ns, backoff_until_ns, active_grants = waits[0]
+    requested_seconds, poll_now_ns, backoff_until_ns, active_grants, called_ns = waits[0]
     grant_expiry_ns = active_grants[0] + 60_000_000_000
     assert backoff_until_ns > grant_expiry_ns
-    assert requested_seconds == pytest.approx(
-        (backoff_until_ns - poll_now_ns) / 1_000_000_000, abs=1e-6
-    )
+    _assert_sleep_targets(requested_seconds, backoff_until_ns, poll_now_ns, called_ns)
 
 
 def test_adaptive_wait_spreads_fairness_losers_by_virtual_turn_rank(
@@ -790,9 +787,7 @@ def test_adaptive_wait_spreads_fairness_losers_by_virtual_turn_rank(
     )
     base = time.monotonic_ns()
     deadline = base + 4_000_000_000
-    head_subject = GatewayQuotaSubject(
-        "acct:fair", "strategy:older", "BTC-PERP", "run:older"
-    )
+    head_subject = GatewayQuotaSubject("acct:fair", "strategy:older", "BTC-PERP", "run:older")
     with sqlite3.connect(path) as connection:
         next_ticket = int(
             connection.execute(
@@ -815,15 +810,14 @@ def test_adaptive_wait_spreads_fairness_losers_by_virtual_turn_rank(
             ),
         )
         connection.execute(
-            "UPDATE quota_domains SET next_ticket = next_ticket + 1 "
-            "WHERE domain_digest = ?",
+            "UPDATE quota_domains SET next_ticket = next_ticket + 1 WHERE domain_digest = ?",
             (owner._domain_digest,),
         )
 
     clock = _LogicalQuotaClock(base)
     monkeypatch.setattr(quota_module, "time", clock)
     waits = _capture_one_quota_wait(path, monkeypatch)
-    with pytest.raises(_StopBeforeQuotaWait):
+    with pytest.raises(_StopBeforeQuotaWaitError):
         owner.admit(
             GatewayQuotaSubject("acct:fair", "strategy:later", "BTC-PERP", "run:later"),
             GatewayQuotaOperation.OPEN,
@@ -871,12 +865,8 @@ def test_admit_keeps_last_served_selector_when_deadline_column_is_appended(
 ) -> None:
     path = tmp_path / "adaptive-selector-column-order.sqlite3"
     owner = _adaptive_wait_owner(path, capacity=2, reserved=0)
-    older_ticket = GatewayQuotaSubject(
-        "acct:selector", "strategy:older", "BTC-PERP", "run:older"
-    )
-    selected = GatewayQuotaSubject(
-        "acct:selector", "strategy:selected", "BTC-PERP", "run:selected"
-    )
+    older_ticket = GatewayQuotaSubject("acct:selector", "strategy:older", "BTC-PERP", "run:older")
+    selected = GatewayQuotaSubject("acct:selector", "strategy:selected", "BTC-PERP", "run:selected")
     now = time.monotonic_ns()
     older_deadline = now + 1_000_000_000
     selected_deadline = now + 5_000_000_000
@@ -908,7 +898,7 @@ def test_admit_keeps_last_served_selector_when_deadline_column_is_appended(
         )
 
     def fail_if_target_loses(seconds: float) -> None:
-        raise _StopBeforeQuotaWait
+        raise _StopBeforeQuotaWaitError
 
     monkeypatch.setattr(quota_module.time, "sleep", fail_if_target_loses)
     grant = owner.admit(selected, GatewayQuotaOperation.OPEN, selected_deadline)
@@ -1210,9 +1200,7 @@ def test_admit_reselects_after_ranked_predecessor_is_withdrawn(
     )
     base = time.monotonic_ns()
     deadline = base + 4_000_000_000
-    head_subject = GatewayQuotaSubject(
-        "acct:withdrawn", "strategy:head", "BTC-PERP", "run:head"
-    )
+    head_subject = GatewayQuotaSubject("acct:withdrawn", "strategy:head", "BTC-PERP", "run:head")
     with sqlite3.connect(path) as connection:
         next_ticket = int(
             connection.execute(
@@ -1235,8 +1223,7 @@ def test_admit_reselects_after_ranked_predecessor_is_withdrawn(
             ),
         )
         connection.execute(
-            "UPDATE quota_domains SET next_ticket = next_ticket + 1 "
-            "WHERE domain_digest = ?",
+            "UPDATE quota_domains SET next_ticket = next_ticket + 1 WHERE domain_digest = ?",
             (owner._domain_digest,),
         )
 
@@ -1252,24 +1239,31 @@ def test_admit_reselects_after_ranked_predecessor_is_withdrawn(
 
     monkeypatch.setattr(quota_module.time, "sleep", withdraw_predecessor)
     grant = owner.admit(
-        GatewayQuotaSubject(
-            "acct:withdrawn", "strategy:later", "BTC-PERP", "run:later"
-        ),
+        GatewayQuotaSubject("acct:withdrawn", "strategy:later", "BTC-PERP", "run:later"),
         GatewayQuotaOperation.OPEN,
         deadline,
     )
 
     assert grant.sequence == 2
-    assert waits == [pytest.approx(owner._poll_interval_seconds, abs=1e-6)]
+    # One ranked poll: at most one poll interval, shortened by the time spent
+    # between selecting the wake instant and sleeping.
+    assert len(waits) == 1
+    assert 0.0 <= waits[0] <= owner._poll_interval_seconds + 1e-6
     with sqlite3.connect(path) as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) FROM waiters WHERE domain_digest = ?",
-            (owner._domain_digest,),
-        ).fetchone()[0] == 0
-        assert connection.execute(
-            "SELECT COUNT(*) FROM grants WHERE domain_digest = ?",
-            (owner._domain_digest,),
-        ).fetchone()[0] == 2
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM waiters WHERE domain_digest = ?",
+                (owner._domain_digest,),
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM grants WHERE domain_digest = ?",
+                (owner._domain_digest,),
+            ).fetchone()[0]
+            == 2
+        )
 
 
 def test_adaptive_wake_revalidates_after_concurrent_grant_stales_hint(
@@ -1309,14 +1303,11 @@ def test_adaptive_wake_revalidates_after_concurrent_grant_stales_hint(
             ),
         )
         connection.execute(
-            "UPDATE quota_domains SET next_ticket = next_ticket + 1 "
-            "WHERE domain_digest = ?",
+            "UPDATE quota_domains SET next_ticket = next_ticket + 1 WHERE domain_digest = ?",
             (owner._domain_digest,),
         )
 
-    target = GatewayQuotaSubject(
-        "acct:stale", "strategy:target", "BTC-PERP", "run:target"
-    )
+    target = GatewayQuotaSubject("acct:stale", "strategy:target", "BTC-PERP", "run:target")
     sleep_facts: list[tuple[float, int, int]] = []
 
     def add_competing_grant_then_stop(seconds: float) -> None:
@@ -1328,12 +1319,15 @@ def test_adaptive_wake_revalidates_after_concurrent_grant_stales_hint(
             subject_digest = quota_module._subject_digest(competitor)
             run_digest = quota_module._run_digest(competitor)
             with sqlite3.connect(path) as connection:
-                sequence = int(
-                    connection.execute(
-                        "SELECT grant_sequence FROM quota_domains WHERE domain_digest = ?",
-                        (owner._domain_digest,),
-                    ).fetchone()[0]
-                ) + 1
+                sequence = (
+                    int(
+                        connection.execute(
+                            "SELECT grant_sequence FROM quota_domains WHERE domain_digest = ?",
+                            (owner._domain_digest,),
+                        ).fetchone()[0]
+                    )
+                    + 1
+                )
                 connection.execute(
                     "INSERT INTO grants "
                     "(grant_id, domain_digest, subject_digest, run_digest, operation, granted_ns, sequence) "
@@ -1372,26 +1366,28 @@ def test_adaptive_wake_revalidates_after_concurrent_grant_stales_hint(
             )
             target_pending = int(
                 connection.execute(
-                    "SELECT COUNT(*) FROM waiters WHERE domain_digest = ? "
-                    "AND subject_digest = ?",
+                    "SELECT COUNT(*) FROM waiters WHERE domain_digest = ? AND subject_digest = ?",
                     (owner._domain_digest, quota_module._subject_digest(target)),
                 ).fetchone()[0]
             )
         sleep_facts.append((seconds, grant_count, target_pending))
-        raise _StopBeforeQuotaWait
+        raise _StopBeforeQuotaWaitError
 
     monkeypatch.setattr(quota_module.time, "sleep", add_competing_grant_then_stop)
-    with pytest.raises(_StopBeforeQuotaWait):
+    with pytest.raises(_StopBeforeQuotaWaitError):
         owner.admit(target, GatewayQuotaOperation.OPEN, deadline)
 
     assert len(sleep_facts) == 2
     assert sleep_facts[1][0] > 0.0
     assert sleep_facts[1][1:] == (2, 1)
     with sqlite3.connect(path) as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) FROM grants WHERE domain_digest = ?",
-            (owner._domain_digest,),
-        ).fetchone()[0] == 2
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM grants WHERE domain_digest = ?",
+                (owner._domain_digest,),
+            ).fetchone()[0]
+            == 2
+        )
 
 
 def test_adaptive_wait_never_sleeps_past_business_deadline(
@@ -1422,7 +1418,7 @@ def test_adaptive_wait_never_sleeps_past_business_deadline(
     deadline = base + 300_000_000
 
     waits = _capture_one_quota_wait(path, monkeypatch)
-    with pytest.raises(_StopBeforeQuotaWait):
+    with pytest.raises(_StopBeforeQuotaWaitError):
         owner.admit(
             GatewayQuotaSubject("acct:deadline", "strategy:deadline", "BTC-PERP", "run:deadline"),
             GatewayQuotaOperation.OPEN,
@@ -1430,13 +1426,13 @@ def test_adaptive_wait_never_sleeps_past_business_deadline(
         )
 
     assert len(waits) == 1
-    requested_seconds, poll_now_ns, _, active_grants = waits[0]
+    requested_seconds, poll_now_ns, _, active_grants, called_ns = waits[0]
     quota_expiry_ns = active_grants[0] + 60_000_000_000
     deadline_wait = max(0.0, (deadline - poll_now_ns) / 1_000_000_000)
     quota_wait = max(0.0, (quota_expiry_ns - poll_now_ns) / 1_000_000_000)
     assert deadline_wait < quota_wait
-    assert requested_seconds <= deadline_wait
-    assert deadline_wait - requested_seconds < 0.01
+    # The sleep targets the business deadline, not the later quota expiry.
+    _assert_sleep_targets(requested_seconds, deadline, poll_now_ns, called_ns)
 
 
 def test_admit_commits_clock_epoch_reset_before_returning_reset_error(
@@ -1476,17 +1472,13 @@ def test_admit_commits_clock_epoch_reset_before_returning_reset_error(
             on_epoch_reset=on_epoch_reset,
         )
 
-    monkeypatch.setattr(
-        GatewayQuotaAdmission, "_clock_locked", inject_reset_during_waiter_poll
-    )
+    monkeypatch.setattr(GatewayQuotaAdmission, "_clock_locked", inject_reset_during_waiter_poll)
 
     def unexpected_wake_calculation(*args, **kwargs):
         rank_calls.append(None)
         return 0, None
 
-    monkeypatch.setattr(
-        quota_module, "_virtual_waiter_wake_rank", unexpected_wake_calculation
-    )
+    monkeypatch.setattr(quota_module, "_virtual_waiter_wake_rank", unexpected_wake_calculation)
     with pytest.raises(GatewayQuotaAdmissionError) as reset:
         owner.admit(
             GatewayQuotaSubject("acct:waiter", "strategy:waiter", "BTC-PERP", "run:waiter"),
@@ -1559,12 +1551,10 @@ def test_advisory_rank_runs_after_commit_and_keeps_reserved_capacity(
         rank_snapshot_counts.append(kwargs["grant_count"])
         return original_rank(*args, **kwargs)
 
-    monkeypatch.setattr(
-        quota_module, "_virtual_waiter_wake_rank", rank_only_after_writer_commit
-    )
+    monkeypatch.setattr(quota_module, "_virtual_waiter_wake_rank", rank_only_after_writer_commit)
     waits = _capture_one_quota_wait(path, monkeypatch)
     open_deadline = base + 10_000_000_000
-    with pytest.raises(_StopBeforeQuotaWait):
+    with pytest.raises(_StopBeforeQuotaWaitError):
         owner.admit(
             GatewayQuotaSubject(
                 "acct:reserved-open", "strategy:reserved-open", "BTC-PERP", "run:open"
@@ -1576,10 +1566,13 @@ def test_advisory_rank_runs_after_commit_and_keeps_reserved_capacity(
     assert rank_snapshot_counts == [1]
     assert len(waits) == 1
     with sqlite3.connect(path) as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) FROM grants WHERE domain_digest = ?",
-            (owner._domain_digest,),
-        ).fetchone()[0] == 2
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM grants WHERE domain_digest = ?",
+                (owner._domain_digest,),
+            ).fetchone()[0]
+            == 2
+        )
 
     # OPEN remains blocked at capacity-reserved, while a critical operation
     # can still consume that reserved slot through the normal writer path.
@@ -1653,7 +1646,7 @@ def test_ranked_sleep_subtracts_post_snapshot_monotonic_time(
 
     def stop_before_sleep(seconds: float) -> None:
         sleeps.append(seconds)
-        raise _StopBeforeQuotaWait
+        raise _StopBeforeQuotaWaitError
 
     monkeypatch.setattr(quota_module, "time", clock)
     monkeypatch.setattr(clock, "monotonic_ns", delayed_monotonic_ns)
@@ -1661,7 +1654,7 @@ def test_ranked_sleep_subtracts_post_snapshot_monotonic_time(
     monkeypatch.setattr(clock, "sleep", stop_before_sleep)
 
     deadline = base + 3_000_000_000
-    with pytest.raises(_StopBeforeQuotaWait):
+    with pytest.raises(_StopBeforeQuotaWaitError):
         owner.admit(
             GatewayQuotaSubject("acct:waiter", "strategy:waiter", "BTC-PERP", "run:waiter"),
             GatewayQuotaOperation.OPEN,
@@ -1701,7 +1694,7 @@ def test_transaction_retries_only_busy_begin_before_yield(
             begin_attempts += 1
             if begin_attempts == 1:
                 error = sqlite3.OperationalError("database is locked")
-                error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+                error.sqlite_errorcode = _SQLITE_BUSY
                 raise error
 
         def commit(self) -> None:
@@ -1759,7 +1752,7 @@ def test_transaction_busy_after_begin_is_not_retried(
             if failure_point == "commit":
                 now_ns[0] = deadline + 1
                 error = sqlite3.OperationalError("database is locked")
-                error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+                error.sqlite_errorcode = _SQLITE_BUSY
                 raise error
 
         def rollback(self) -> None:
@@ -1775,13 +1768,12 @@ def test_transaction_busy_after_begin_is_not_retried(
     monkeypatch.setattr(GatewayQuotaAdmission, "_connection", scripted_connection)
     monkeypatch.setattr(quota_module.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(quota_module.time, "monotonic_ns", lambda: now_ns[0])
-    with pytest.raises(GatewayQuotaAdmissionError) as unavailable:
-        with owner._transaction(deadline):
-            if failure_point == "body":
-                now_ns[0] = deadline + 1
-                error = sqlite3.OperationalError("database is locked")
-                error.sqlite_errorcode = sqlite3.SQLITE_BUSY
-                raise error
+    with pytest.raises(GatewayQuotaAdmissionError) as unavailable, owner._transaction(deadline):
+        if failure_point == "body":
+            now_ns[0] = deadline + 1
+            error = sqlite3.OperationalError("database is locked")
+            error.sqlite_errorcode = _SQLITE_BUSY
+            raise error
 
     assert unavailable.value.code == "OWNER_UNAVAILABLE"
     assert begin_attempts == rollbacks == 1
@@ -1827,9 +1819,8 @@ def test_transaction_that_acquires_writer_after_deadline_rolls_back_before_yield
 
     monkeypatch.setattr(GatewayQuotaAdmission, "_connection", scripted_connection)
     monkeypatch.setattr(quota_module.time, "monotonic_ns", monotonic_sample)
-    with pytest.raises(GatewayQuotaAdmissionError) as expired:
-        with owner._transaction(deadline):
-            body_calls += 1
+    with pytest.raises(GatewayQuotaAdmissionError) as expired, owner._transaction(deadline):
+        body_calls += 1
 
     assert expired.value.code == "DEADLINE_EXCEEDED"
     assert begin_attempts == 1
@@ -1877,12 +1868,8 @@ def test_admit_rejects_late_successful_commit_and_keeps_its_quota_record(
             return getattr(self._connection, name)
 
     @contextmanager
-    def late_commit_connection(
-        quota_owner: GatewayQuotaAdmission, *, timeout_seconds: float = 1.0
-    ):
-        with original_connection(
-            quota_owner, timeout_seconds=timeout_seconds
-        ) as connection:
+    def late_commit_connection(quota_owner: GatewayQuotaAdmission, *, timeout_seconds: float = 1.0):
+        with original_connection(quota_owner, timeout_seconds=timeout_seconds) as connection:
             yield LateCommitConnection(connection)
 
     monkeypatch.setattr(GatewayQuotaAdmission, "_connection", late_commit_connection)
@@ -1890,9 +1877,7 @@ def test_admit_rejects_late_successful_commit_and_keeps_its_quota_record(
 
     with pytest.raises(GatewayQuotaAdmissionError) as expired:
         owner.admit(
-            GatewayQuotaSubject(
-                "acct:late", "strategy:late", "BTC-PERP", "run:late"
-            ),
+            GatewayQuotaSubject("acct:late", "strategy:late", "BTC-PERP", "run:late"),
             GatewayQuotaOperation.OPEN,
             deadline,
         )
@@ -1945,7 +1930,7 @@ def test_admit_commit_failure_does_not_return_grant_or_skip_waiter_cleanup(
             if self._has_grant_write:
                 grant_commit_attempts += 1
                 error = sqlite3.OperationalError("database is locked")
-                error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+                error.sqlite_errorcode = _SQLITE_BUSY
                 raise error
             self._connection.commit()
             successful_commits += 1
@@ -1962,14 +1947,10 @@ def test_admit_commit_failure_does_not_return_grant_or_skip_waiter_cleanup(
     def failing_grant_connection(
         quota_owner: GatewayQuotaAdmission, *, timeout_seconds: float = 1.0
     ):
-        with original_connection(
-            quota_owner, timeout_seconds=timeout_seconds
-        ) as connection:
+        with original_connection(quota_owner, timeout_seconds=timeout_seconds) as connection:
             yield FailGrantCommitConnection(connection)
 
-    monkeypatch.setattr(
-        GatewayQuotaAdmission, "_connection", failing_grant_connection
-    )
+    monkeypatch.setattr(GatewayQuotaAdmission, "_connection", failing_grant_connection)
 
     with pytest.raises(GatewayQuotaAdmissionError) as unavailable:
         owner.admit(
@@ -2036,18 +2017,15 @@ def test_deadline_spent_before_commit_rolls_back_without_replaying_body(
     scripted = DeadlineConnection()
 
     @contextmanager
-    def scripted_connection(
-        _owner: GatewayQuotaAdmission, *, timeout_seconds: float = 1.0
-    ):
+    def scripted_connection(_owner: GatewayQuotaAdmission, *, timeout_seconds: float = 1.0):
         yield scripted
 
     monkeypatch.setattr(GatewayQuotaAdmission, "_connection", scripted_connection)
     monkeypatch.setattr(quota_module.time, "monotonic_ns", lambda: now_ns[0])
 
-    with pytest.raises(GatewayQuotaAdmissionError) as expired:
-        with owner._transaction(deadline):
-            body_calls += 1
-            now_ns[0] = deadline - 500
+    with pytest.raises(GatewayQuotaAdmissionError) as expired, owner._transaction(deadline):
+        body_calls += 1
+        now_ns[0] = deadline - 500
 
     assert expired.value.code == "DEADLINE_EXCEEDED"
     assert begin_calls == body_calls == rollback_calls == 1
@@ -2082,12 +2060,8 @@ def test_initial_enqueue_retries_busy_begin_until_lock_releases(
     original_connection = GatewayQuotaAdmission._connection
 
     @contextmanager
-    def track_owner_connection(
-        quota_owner: GatewayQuotaAdmission, *, timeout_seconds: float = 1.0
-    ):
-        with original_connection(
-            quota_owner, timeout_seconds=timeout_seconds
-        ) as connection:
+    def track_owner_connection(quota_owner: GatewayQuotaAdmission, *, timeout_seconds: float = 1.0):
+        with original_connection(quota_owner, timeout_seconds=timeout_seconds) as connection:
             owner_connections.append(connection)
             yield connection
 
@@ -2103,10 +2077,8 @@ def test_initial_enqueue_retries_busy_begin_until_lock_releases(
     finally:
         release_thread.join(timeout=1.0)
         if release_thread.is_alive():
-            try:
+            with suppress(sqlite3.Error):
                 blocker.execute("ROLLBACK")
-            except sqlite3.Error:
-                pass
             release_thread.join(timeout=0.25)
 
     assert not release_thread.is_alive()
@@ -2168,10 +2140,13 @@ def test_initial_enqueue_lock_held_through_deadline_leaves_no_waiter(
     assert time.monotonic_ns() >= deadline
     assert time.monotonic_ns() - started < 1_000_000_000
     with sqlite3.connect(path) as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) FROM waiters WHERE domain_digest = ?",
-            (owner._domain_digest,),
-        ).fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM waiters WHERE domain_digest = ?",
+                (owner._domain_digest,),
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_persisted_waiter_survives_busy_begin_until_expired_grant_releases(
@@ -2224,12 +2199,8 @@ def test_persisted_waiter_survives_busy_begin_until_expired_grant_releases(
     original_connection = GatewayQuotaAdmission._connection
 
     @contextmanager
-    def track_owner_connection(
-        quota_owner: GatewayQuotaAdmission, *, timeout_seconds: float = 1.0
-    ):
-        with original_connection(
-            quota_owner, timeout_seconds=timeout_seconds
-        ) as connection:
+    def track_owner_connection(quota_owner: GatewayQuotaAdmission, *, timeout_seconds: float = 1.0):
+        with original_connection(quota_owner, timeout_seconds=timeout_seconds) as connection:
             yield BeginTrackingConnection(connection)
 
     monkeypatch.setattr(GatewayQuotaAdmission, "_connection", track_owner_connection)
@@ -2271,9 +2242,7 @@ def test_persisted_waiter_survives_busy_begin_until_expired_grant_releases(
                     raise
                 time.sleep(0.002)
         assert acquired_lock, "test failed to establish a SQLite writer lock"
-        remaining_deadline_seconds = max(
-            0.0, (deadline - time.monotonic_ns()) / 1_000_000_000
-        )
+        remaining_deadline_seconds = max(0.0, (deadline - time.monotonic_ns()) / 1_000_000_000)
         assert busy_begin_observed.wait(timeout=remaining_deadline_seconds), (
             "persisted waiter did not reach a BUSY BEGIN while the writer lock was held"
         )
@@ -2300,10 +2269,13 @@ def test_persisted_waiter_survives_busy_begin_until_expired_grant_releases(
     assert len(outcomes) == 1
     assert outcomes[0].sequence == 2
     with sqlite3.connect(path) as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) FROM waiters WHERE domain_digest = ?",
-            (owner._domain_digest,),
-        ).fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM waiters WHERE domain_digest = ?",
+                (owner._domain_digest,),
+            ).fetchone()[0]
+            == 0
+        )
         assert connection.execute(
             "SELECT sequence, granted_ns FROM grants WHERE domain_digest = ?",
             (owner._domain_digest,),
@@ -2325,7 +2297,7 @@ def test_begin_busy_retries_end_at_business_deadline(
             assert statement == "BEGIN IMMEDIATE"
             begin_attempts += 1
             error = sqlite3.OperationalError("database is locked")
-            error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+            error.sqlite_errorcode = _SQLITE_BUSY
             raise error
 
         def commit(self) -> None:
@@ -2348,9 +2320,8 @@ def test_begin_busy_retries_end_at_business_deadline(
     monkeypatch.setattr(GatewayQuotaAdmission, "_connection", scripted_connection)
     monkeypatch.setattr(quota_module.time, "monotonic_ns", lambda: now_ns[0])
     monkeypatch.setattr(quota_module.time, "sleep", advance_clock)
-    with pytest.raises(GatewayQuotaAdmissionError) as expired:
-        with owner._transaction(deadline):
-            raise AssertionError("busy BEGIN must not yield")
+    with pytest.raises(GatewayQuotaAdmissionError) as expired, owner._transaction(deadline):
+        raise AssertionError("busy BEGIN must not yield")
 
     assert expired.value.code == "DEADLINE_EXCEEDED"
     assert 1 < begin_attempts < 10

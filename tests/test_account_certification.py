@@ -79,10 +79,16 @@ def test_server_time_uses_provider_leaf_not_gateway_receipt_clock():
 @pytest.mark.parametrize(
     ("provider", "collector", "code"),
     (
-        (_Provider(configuration={"canTrade": 1}), collect_account_configuration,
-         "PROVIDER_CONFIGURATION_INVALID"),
-        (_Provider(server_time={"serverTime": True}), collect_exchange_server_time,
-         "PROVIDER_SERVER_TIME_INVALID"),
+        (
+            _Provider(configuration={"canTrade": 1}),
+            collect_account_configuration,
+            "PROVIDER_CONFIGURATION_INVALID",
+        ),
+        (
+            _Provider(server_time={"serverTime": True}),
+            collect_exchange_server_time,
+            "PROVIDER_SERVER_TIME_INVALID",
+        ),
         (_Provider(), collect_exchange_server_time, "PROVIDER_SERVER_TIME_INVALID"),
     ),
 )
@@ -141,4 +147,3 @@ def test_server_time_leaf_rejects_extra_provider_fields():
             monotonic_clock=lambda: 1.0,
         )
     assert exc_info.value.code == "PROVIDER_SERVER_TIME_INVALID"
-

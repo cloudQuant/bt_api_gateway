@@ -14,11 +14,12 @@ import json
 import os
 import secrets
 import stat
+import sys
 import threading
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
-if os.name == "nt":
+if sys.platform == "win32":
     import msvcrt
 else:
     import fcntl
@@ -62,9 +63,9 @@ class LocalAccountSessionGuard:
         self._account_digest = hashlib.sha256(account_bytes).hexdigest()
         self._owner_ref = _bounded_text(owner_ref, "owner_ref", 512).decode("utf-8")
         self._lock_path = self._directory / f"account-{self._account_digest}.session-lock"
-        self._fd: Optional[int] = None  # noqa: UP045 -- Python 3.9 support.
-        self._file_identity: Optional[tuple[int, int]] = None  # noqa: UP045
-        self._generation: Optional[str] = None  # noqa: UP045
+        self._fd: int | None = None
+        self._file_identity: tuple[int, int] | None = None
+        self._generation: str | None = None
         self._phase = "idle"
         self._os_locked = False
         self._closed_record_durable = False
@@ -301,7 +302,7 @@ class LocalAccountSessionGuard:
         assert self._fd is not None
         os.lseek(self._fd, 0, os.SEEK_SET)
         try:
-            if os.name == "nt":
+            if sys.platform == "win32":
                 msvcrt.locking(self._fd, msvcrt.LK_NBLCK, 1)
             else:
                 fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -315,12 +316,12 @@ class LocalAccountSessionGuard:
     def _unlock_file(self) -> None:
         assert self._fd is not None
         os.lseek(self._fd, 0, os.SEEK_SET)
-        if os.name == "nt":
+        if sys.platform == "win32":
             msvcrt.locking(self._fd, msvcrt.LK_UNLCK, 1)
         else:
             fcntl.flock(self._fd, fcntl.LOCK_UN)
 
-    def _read_record(self) -> Optional[dict[str, Any]]:  # noqa: UP045 -- Python 3.9 support.
+    def _read_record(self) -> dict[str, Any] | None:
         assert self._fd is not None
         size = os.fstat(self._fd).st_size
         if size == 0:
@@ -350,7 +351,7 @@ class LocalAccountSessionGuard:
     def _record(
         self,
         status: str,
-        generation: Optional[str],  # noqa: UP045 -- Python 3.9 support.
+        generation: str | None,
     ) -> dict[str, Any]:
         assert generation is not None
         return {
@@ -401,7 +402,7 @@ class LocalAccountSessionGuard:
                 "SESSION_NOT_OWNED", "session ownership record is no longer active"
             )
 
-    def _cleanup_failed_acquire(self) -> Optional[BaseException]:  # noqa: UP045 -- Python 3.9 support.
+    def _cleanup_failed_acquire(self) -> BaseException | None:
         if self._fd is None:
             self._phase = "idle"
             self._generation = None
@@ -564,7 +565,7 @@ def _is_generation(value: Any) -> bool:
 def _record_matches_owner(
     record: dict[str, Any],
     account_digest: str,
-    generation: Optional[str],  # noqa: UP045 -- Python 3.9 support.
+    generation: str | None,
     owner_ref: str,
 ) -> bool:
     return (

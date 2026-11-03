@@ -101,9 +101,7 @@ class _PartialNativeConnectError(Exception):
 
 
 class _PartialConnectNativeProvider:
-    def __init__(
-        self, *, close_failures: int = 0, owner_after_close: bool = True
-    ) -> None:
+    def __init__(self, *, close_failures: int = 0, owner_after_close: bool = True) -> None:
         self.close_failures_remaining = close_failures
         self.owner_after_close = owner_after_close
         self._native_owner_created: bool | None = None
@@ -449,13 +447,11 @@ class _FakeContext:
     def __init__(self, world: _FakeWorld) -> None:
         self.world = world
 
-    def Pipe(self, *, duplex: bool) -> tuple[_FakeConnection, _FakeConnection]:  # noqa: N802
+    def Pipe(self, *, duplex: bool) -> tuple[_FakeConnection, _FakeConnection]:
         assert duplex is True
         return self.world.parent, self.world.child
 
-    def Process(  # noqa: N802
-        self, *, target: object, args: tuple[object, ...]
-    ) -> _FakeProcess:
+    def Process(self, *, target: object, args: tuple[object, ...]) -> _FakeProcess:
         assert target is _child_target
         assert args == (self.world.child,)
         if self.world.process_construct_error:
@@ -501,12 +497,21 @@ def test_partial_start_cleanup_uncertainty_retains_exact_local_handles() -> None
     assert error.value.code == "PROCESS_START_CLEANUP_UNCERTAIN"
     assert provider.process_state == "unknown"
     assert provider.custody_retained
-    assert provider._process is world.process
+    # Only the handle whose close is uncertain stays in custody; handles that
+    # closed cleanly are released.
+    assert provider._process is None
     assert provider._connection is world.parent
-    assert provider._child_connection is world.child
+    assert provider._child_connection is None
     assert world.parent.closed is False
     assert world.child.closed is True
     assert world.process.closed is True
+    assert provider.close() is False
+    assert provider.custody_retained
+
+    world.parent.close_error = False
+    assert provider.close() is True
+    assert not provider.custody_retained
+    assert provider._connection is None
 
 
 @pytest.mark.parametrize("failing_side", ["parent", "child"])
@@ -555,10 +560,17 @@ def test_partial_start_process_close_uncertainty_retains_exact_local_handles() -
     assert provider.process_state == "unknown"
     assert provider.custody_retained
     assert provider._process is world.process
-    assert provider._connection is world.parent
-    assert provider._child_connection is world.child
+    assert provider._connection is None
+    assert provider._child_connection is None
     assert world.parent.closed and world.child.closed
     assert world.process.closed is False
+    assert provider.close() is False
+    assert provider._process is world.process
+
+    world.process.close_error = False
+    assert provider.close() is True
+    assert not provider.custody_retained
+    assert provider._process is None
 
 
 def test_late_profile_rejection_is_validated_then_closed_without_command_replay() -> None:
@@ -751,9 +763,7 @@ def test_partial_connect_unknown_owner_closes_same_provider_and_requires_receipt
 ) -> None:
     _PARTIAL_NATIVE_PROVIDERS.clear()
     close_count = close_failures + 1
-    connection = _ChildConnection(
-        _partial_native_requests(profile_ref, close_count=close_count)
-    )
+    connection = _ChildConnection(_partial_native_requests(profile_ref, close_count=close_count))
 
     serve_account_session_child(
         connection,
@@ -794,9 +804,7 @@ def test_partial_connect_unknown_owner_closes_same_provider_and_requires_receipt
 def test_partial_connect_never_closes_as_native_free_after_unknown_owner() -> None:
     _PARTIAL_NATIVE_PROVIDERS.clear()
     connection = _ChildConnection(
-        _partial_native_requests(
-            "synthetic.partial-native-unresolved.v1", close_count=2
-        )
+        _partial_native_requests("synthetic.partial-native-unresolved.v1", close_count=2)
     )
 
     serve_account_session_child(

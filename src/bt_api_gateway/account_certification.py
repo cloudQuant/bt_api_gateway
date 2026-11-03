@@ -10,9 +10,8 @@ from __future__ import annotations
 import math
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
-from typing import Callable
 
 from bt_api_base.account_certification_protocol import (
     AccountConfigurationObservation,

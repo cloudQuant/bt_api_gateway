@@ -8,3 +8,8 @@ dist/
 
 # Codex scratch
 .codex-tmp/
+
+# Local tool output
+.coverage
+.coverage.*
+.benchmarks/

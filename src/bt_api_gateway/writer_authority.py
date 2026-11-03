@@ -14,13 +14,13 @@ import secrets
 import sqlite3
 import time
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from threading import RLock
-from typing import TYPE_CHECKING, Any, Callable, Optional, Union
+from typing import TYPE_CHECKING, Any
 
 from .database_identity import SQLiteFileIdentity
 from .resolution import GatewayResolutionCapability, GatewayResolutionMixin
@@ -83,8 +83,8 @@ class GatewayActionRecord:
     status: GatewayActionStatus
     created_at: float
     updated_at: float
-    outcome_digest: Optional[str]  # noqa: UP045 -- Python 3.9 is supported.
-    rejection_code: Optional[str]  # noqa: UP045 -- Python 3.9 is supported.
+    outcome_digest: str | None
+    rejection_code: str | None
 
 
 class GatewayAccountWriterAuthority(GatewayResolutionMixin):
@@ -106,13 +106,11 @@ class GatewayAccountWriterAuthority(GatewayResolutionMixin):
 
     def __init__(
         self,
-        database_path: Union[Path, str],  # noqa: UP007 -- Python 3.9 is supported.
-        clock: Optional[Callable[[], float]] = None,  # noqa: UP045 -- Python 3.9 is supported.
+        database_path: Path | str,
+        clock: Callable[[], float] | None = None,
         max_lease_seconds: float = 60.0,
         timeout_seconds: float = 5.0,
-        resolution_capability: Optional[  # noqa: UP045 -- Python 3.9 support.
-            GatewayResolutionCapability
-        ] = None,
+        resolution_capability: GatewayResolutionCapability | None = None,
     ) -> None:
         if not _finite_number(max_lease_seconds) or max_lease_seconds <= 0:
             raise ValueError("max_lease_seconds must be finite and positive")
@@ -509,9 +507,7 @@ class GatewayAccountWriterAuthority(GatewayResolutionMixin):
             outcome_digest=digest,
         )
 
-    def get_action(
-        self, account_scope: str, action_id: str
-    ) -> Optional[GatewayActionRecord]:  # noqa: UP045 -- Python 3.9 is supported.
+    def get_action(self, account_scope: str, action_id: str) -> GatewayActionRecord | None:
         with self._connection() as connection:
             row = connection.execute(
                 """
@@ -766,7 +762,11 @@ def _is_retryable_sqlite_lock(error: sqlite3.OperationalError) -> bool:
     code = getattr(error, "sqlite_errorcode", None)
     if code is not None:
         base_code = int(code) & 0xFF
-        return base_code in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+        # The named constants exist from Python 3.11; the codes are stable.
+        return base_code in {
+            getattr(sqlite3, "SQLITE_BUSY", 5),
+            getattr(sqlite3, "SQLITE_LOCKED", 6),
+        }
     return str(error).strip().lower() in {
         "database is locked",
         "database table is locked",

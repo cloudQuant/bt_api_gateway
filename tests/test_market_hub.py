@@ -16,11 +16,11 @@ from bt_api_base.market_protocol import (
 from bt_api_base.service_protocol import WireIdentity, WireRole, WireScope, encode_envelope
 
 from bt_api_gateway.market_hub import (
+    MARKET_READ_AFTER_BOUNDED_OPERATION,
     MAX_MARKET_EVENT_BYTES,
     MAX_MARKET_KEY_UNIVERSE,
     MAX_MARKET_READ_PAGE_BYTES,
     MAX_TOTAL_MARKET_REPLAY_BYTES,
-    MARKET_READ_AFTER_BOUNDED_OPERATION,
     GatewayMarketHub,
     GatewayMarketHubError,
     GatewayMarketRegistration,
@@ -678,9 +678,7 @@ def test_market_bootstrap_many_returns_rejected_after_confirmed_partial_rollback
 ) -> None:
     first = _key(instrument={"instrument_id": "instrument-a", "native_symbol": "A-USD"})
     second = _key(instrument={"instrument_id": "instrument-b", "native_symbol": "B-USD"})
-    hub, provider, _published = _hub(
-        keys=(first, second), principals=("principal:a",)
-    )
+    hub, provider, _published = _hub(keys=(first, second), principals=("principal:a",))
     registration = GatewayMarketRegistration("principal:a", "domain:paper")
     service = GatewayMarketService(hub, registrations={"registration:a": registration})
     snapshot = hub.snapshot
@@ -771,15 +769,9 @@ def test_market_bootstrap_many_distinguishes_confirmed_and_uncertain_descriptor_
     registration = GatewayMarketRegistration("principal:a", "domain:paper")
 
     provider = DescribingProvider()
-    hub, _provider, _published = _hub(
-        keys=(key,), principals=("principal:a",), provider=provider
-    )
+    hub, _provider, _published = _hub(keys=(key,), principals=("principal:a",), provider=provider)
     service = GatewayMarketService(hub, registrations={"registration:a": registration})
-    arguments = {
-        "subscriptions": [
-            {"key": key.to_dict(), "require_source_descriptor": True}
-        ]
-    }
+    arguments = {"subscriptions": [{"key": key.to_dict(), "require_source_descriptor": True}]}
     rejected = service.handle(
         "market.bootstrap_many",
         principal_ref="principal:a",
@@ -832,6 +824,7 @@ def test_market_bootstrap_many_distinguishes_confirmed_and_uncertain_descriptor_
     assert len(uncertain_provider.active_handles) == 1
     uncertain_hub.close()
     assert uncertain_provider.active_handles == set()
+
 
 def test_registration_binding_is_idempotent_but_cannot_be_rebound() -> None:
     hub, _, _ = _hub()
@@ -1134,9 +1127,7 @@ def test_bounded_read_after_returns_largest_contiguous_reply_fitting_prefix() ->
     service = GatewayMarketService(
         hub,
         enable_bounded_read_after=True,
-        registrations={
-            "registration:a": GatewayMarketRegistration("principal:a", "domain:paper")
-        },
+        registrations={"registration:a": GatewayMarketRegistration("principal:a", "domain:paper")},
     )
     arguments = {
         "key": key.to_dict(),
@@ -1199,9 +1190,7 @@ def test_bounded_read_after_requires_real_reply_size_checker() -> None:
     service = GatewayMarketService(
         hub,
         enable_bounded_read_after=True,
-        registrations={
-            "registration:a": GatewayMarketRegistration("principal:a", "domain:paper")
-        },
+        registrations={"registration:a": GatewayMarketRegistration("principal:a", "domain:paper")},
     )
 
     with pytest.raises(GatewayMarketServiceError, match="CAPABILITY_UNAVAILABLE"):
@@ -1227,9 +1216,7 @@ def test_bounded_read_after_rejects_single_event_that_cannot_fit_reply() -> None
     service = GatewayMarketService(
         hub,
         enable_bounded_read_after=True,
-        registrations={
-            "registration:a": GatewayMarketRegistration("principal:a", "domain:paper")
-        },
+        registrations={"registration:a": GatewayMarketRegistration("principal:a", "domain:paper")},
     )
 
     with pytest.raises(GatewayMarketServiceError, match="REPLAY_PAGE_TOO_LARGE"):

@@ -13,20 +13,26 @@ import hashlib
 import json
 import math
 import secrets
+import sqlite3
 from abc import ABC, abstractmethod
+from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any
 
 from .router import GatewayCommand, GatewayCommandKind, _canonical_json
 
+if TYPE_CHECKING:
+    from .writer_authority import GatewayWriterLease
 
-def _text(value: str) -> None:
+
+def _text(value: object) -> str:
     if type(value) is not str or not value or value != value.strip() or len(value) > 512:
         raise ValueError("bounded non-empty trimmed text required")
+    return value
 
 
-def _number(value: float) -> None:
-    if type(value) not in (int, float) or not math.isfinite(value):
+def _number(value: object) -> None:
+    if type(value) not in (int, float) or not math.isfinite(value):  # type: ignore[arg-type]
         raise ValueError("finite timestamp required")
 
 
@@ -35,15 +41,15 @@ class GatewayProviderBinding:
     """Provider correlation persisted before the provider call by its owner."""
 
     source_id: str
-    provider_account_id: Optional[str]  # noqa: UP045 -- Python 3.9 support.
-    provider_session_id: Optional[str]  # noqa: UP045 -- Python 3.9 support.
+    provider_account_id: str | None
+    provider_session_id: str | None
     request_reference: str
     operation: str
-    target_order_id: Optional[str] = None  # noqa: UP045 -- Python 3.9 support.
+    target_order_id: str | None = None
     authentication_profile: str = "provider_session"
-    credential_binding_ref: Optional[str] = None  # noqa: UP045 -- Python 3.9 support.
-    local_capture_scope: Optional[str] = None  # noqa: UP045 -- Python 3.9 support.
-    internal_account_scope: Optional[str] = None  # noqa: UP045 -- Python 3.9 support.
+    credential_binding_ref: str | None = None
+    local_capture_scope: str | None = None
+    internal_account_scope: str | None = None
     request_reference_kind: str = "client_order_id"
     schema: str = "bt_api_gateway.provider_binding.v2"
 
@@ -75,11 +81,11 @@ class GatewayProviderBinding:
                 raise ValueError("signed REST has no provider session identity")
             if self.provider_account_id is not None:
                 _text(self.provider_account_id)
-            _text(self.credential_binding_ref)
+            binding_ref = _text(self.credential_binding_ref)
             if (
-                not self.credential_binding_ref.startswith("sha256:")
-                or len(self.credential_binding_ref) != 71
-                or any(c not in "0123456789abcdef" for c in self.credential_binding_ref[7:])
+                not binding_ref.startswith("sha256:")
+                or len(binding_ref) != 71
+                or any(c not in "0123456789abcdef" for c in binding_ref[7:])
             ):
                 raise ValueError(
                     "signed REST requires a key fingerprint reference, not a provider UID"
@@ -152,7 +158,7 @@ class GatewayProviderQueryProof:
     binding: GatewayProviderBinding
     provider_order_id: str
     order_state: str
-    cancel_state: Optional[str]  # noqa: UP045 -- Python 3.9 support.
+    cancel_state: str | None
     query_started_at: float
     observed_at: float
     verified_at: float
@@ -175,8 +181,8 @@ class GatewayProviderQueryProof:
                 raise ValueError("SHA-256 digest required")
         if type(self.binding) is not GatewayProviderBinding:
             raise ValueError("exact provider binding required")
-        for value in (self.source_generation, self.source_sequence):
-            if type(value) is not int or value < 1:
+        for frame_number in (self.source_generation, self.source_sequence):
+            if type(frame_number) is not int or frame_number < 1:
                 raise ValueError("positive source frame required")
         terminal = {"filled", "cancelled", "rejected", "expired"}
         if self.order_state not in terminal | {"working", "partially_filled"}:
@@ -191,8 +197,13 @@ class GatewayProviderQueryProof:
                 raise ValueError("cancel target differs from queried order")
         elif self.cancel_state is not None:
             raise ValueError("submit query cannot contain cancel state")
-        for value in (self.query_started_at, self.observed_at, self.verified_at, self.expires_at):
-            _number(value)
+        for timestamp in (
+            self.query_started_at,
+            self.observed_at,
+            self.verified_at,
+            self.expires_at,
+        ):
+            _number(timestamp)
         if not self.query_started_at <= self.observed_at <= self.verified_at < self.expires_at:
             raise ValueError("invalid query evidence chronology")
 
@@ -242,13 +253,27 @@ class GatewayActionResolution:
     verifier_id: str
     provider_order_id: str
     order_state: str
-    cancel_state: Optional[str]  # noqa: UP045 -- Python 3.9 support.
+    cancel_state: str | None
     resolved_at: float
     duplicate: bool
 
 
 class GatewayResolutionMixin:
     """Public resolution methods used by the local writer authority."""
+
+    if TYPE_CHECKING:
+        # Members supplied by the host class (GatewayAccountWriterAuthority).
+        _resolution_capability: GatewayResolutionCapability | None
+
+        def _now(self) -> float: ...
+
+        def _connection(self) -> AbstractContextManager[sqlite3.Connection]: ...
+
+        def _transaction(self) -> AbstractContextManager[sqlite3.Connection]: ...
+
+        def _require_active_lease(
+            self, connection: sqlite3.Connection, lease: GatewayWriterLease, now: float
+        ) -> sqlite3.Row: ...
 
     def _resolution_error(self, code: str, message: str) -> Exception:
         from .writer_authority import GatewayWriterAuthorityError

@@ -226,3 +226,29 @@ provider authentication, query completeness, a cross-host writer fence, risk
 settlement, a production adapter, or live permission. The tests use an explicit
 fake query source only. Existing deployments without a capability retain their
 original fail-closed behavior.
+
+## Optional instrument metadata capability
+
+`account.instrument_metadata` is advertised only when the trusted account
+provider implements both `read_instrument_metadata(...)` and
+`is_current_instrument_metadata(value)` (see
+`GatewayInstrumentMetadataCapability` in `account_session_worker`). The worker
+accepts a result only when the provider recognizes it as its own sealed fact
+bound to the current owner generation; provider error codes outside the
+documented finite set collapse to `PROVIDER_FACT_READ_FAILED`. This package
+imports no provider package: the CTP implementation is
+`bt_api_ctp.gateway_instrument_metadata.bind_ctp_instrument_metadata_provider`.
+
+## Development
+
+Requires Python 3.10 or newer.
+
+```bash
+python -m pip install -e ".[dev]"
+python -m pytest -q          # offline unit tests
+ruff check src tests && ruff format --check src tests
+mypy                         # configured in pyproject.toml
+```
+
+CI runs the tests on Python 3.10–3.13, Ruff (lint and format), mypy, and a
+wheel/sdist build on every push to `dev` and every pull request.

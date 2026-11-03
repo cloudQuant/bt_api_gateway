@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from types import MappingProxyType
-from typing import Optional
 
 import pytest
 from bt_api_base.account_protocol import (
@@ -48,10 +47,10 @@ def _principal(
 
 def _scope(
     *,
-    account_ref: Optional[str] = "account-a",  # noqa: UP045 -- Python 3.9 support.
+    account_ref: str | None = "account-a",
     execution_domain_ref: str = "paper-a",
-    strategy_ref: Optional[str] = "strategy-a",  # noqa: UP045 -- Python 3.9 support.
-    run_id: Optional[str] = None,  # noqa: UP045 -- Python 3.9 support.
+    strategy_ref: str | None = "strategy-a",
+    run_id: str | None = None,
 ) -> WireScope:
     return WireScope(
         execution_domain_ref=execution_domain_ref,
@@ -66,7 +65,7 @@ def _identity(
     *,
     principal_ref: str = "principal-a",
     role: WireRole = WireRole.STRATEGY_CLIENT,
-    delegate_ref: Optional[str] = None,  # noqa: UP045 -- Python 3.9 support.
+    delegate_ref: str | None = None,
 ) -> WireIdentity:
     return WireIdentity(
         role=role,
@@ -135,7 +134,7 @@ class _StateProvider:
 def _state_observation(
     observation_id: str,
     *,
-    open_orders: Optional[tuple[AccountOpenOrder, ...]] = None,  # noqa: UP045
+    open_orders: tuple[AccountOpenOrder, ...] | None = None,
     open_orders_complete: bool = False,
 ) -> AccountObservation:
     completed_at = "2023-11-14T22:13:20Z"
@@ -913,6 +912,7 @@ def test_supported_operations_are_finite_and_service_borrows_journal(tmp_path) -
                 "account.ack",
                 "account.configuration",
                 "account.head",
+                "account.instrument_metadata",
                 "account.progress",
                 "account.read_after",
                 "account.server_time_probe",

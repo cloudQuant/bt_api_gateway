@@ -29,7 +29,7 @@ def _child_env() -> dict[str, str]:
 
 
 def _run_child(tmp_path: Path, program: str, account_key: str = "canonical-account:one"):
-    return subprocess.run(  # noqa: S603 -- fixed local guard fixture; no shell or provider code.
+    return subprocess.run(
         [sys.executable, "-c", program, str(tmp_path), account_key],
         capture_output=True,
         text=True,

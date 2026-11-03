@@ -8,7 +8,7 @@ from bt_api_gateway.session_owner import GatewaySessionOwner, GatewaySessionOwne
 
 _SESSION_REF = "gateway-account-session-v1"
 _CREDENTIAL_REF = "operator-vault://gateway/account-a"
-_SYNTHETIC_SECRET = "AFI09-LOCAL-SYNTHETIC-SECRET"  # noqa: S105 -- synthetic test sentinel.
+_SYNTHETIC_SECRET = "AFI09-LOCAL-SYNTHETIC-SECRET"
 
 
 class _Provider:

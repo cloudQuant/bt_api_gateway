@@ -13,7 +13,7 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Optional
+from typing import Any
 
 from bt_api_base.account_protocol import (
     MAX_ACCOUNT_ROWS,
@@ -190,9 +190,7 @@ def project_account_view(
     return _freeze_json(result)
 
 
-def view_delta(
-    previous: Mapping[str, Any], current: Mapping[str, Any]
-) -> Optional[Mapping[str, Any]]:  # noqa: UP045 -- Python 3.9 support.
+def view_delta(previous: Mapping[str, Any], current: Mapping[str, Any]) -> Mapping[str, Any] | None:
     """Return a complete, immutable visible change or ``None`` if unchanged.
 
     Changes contain row upserts and identity-only deletes. Observation-level
@@ -247,9 +245,8 @@ def _parse_projection(value: Mapping[str, Any]) -> dict[str, Any]:
         raise AccountViewProjectionError("VIEW_SCHEMA_INVALID")
     if value.get("consistency") != "multi_query":
         raise AccountViewProjectionError("VIEW_PROJECTION_INVALID")
-    view_scope = value.get("view_scope")
     try:
-        _require_scope(view_scope)
+        view_scope = _require_scope(value.get("view_scope"))
     except AccountViewProjectionError:
         raise AccountViewProjectionError("VIEW_PROJECTION_INVALID") from None
     coverage_value = value.get("coverage")
@@ -404,7 +401,7 @@ def _projection_policy_digest(
     return hashlib.sha256(_canonical_json(policy).encode("utf-8")).hexdigest()
 
 
-def _require_scope(value: object) -> None:
+def _require_scope(value: object) -> str:
     if type(value) is not str:
         raise AccountViewProjectionError("INVALID_VIEW_SCOPE")
     try:
@@ -418,6 +415,7 @@ def _require_scope(value: object) -> None:
         or any(ord(char) < 32 or 0x7F <= ord(char) <= 0x9F for char in value)
     ):
         raise AccountViewProjectionError("INVALID_VIEW_SCOPE")
+    return value
 
 
 def _freeze_json(value: Any) -> Any:

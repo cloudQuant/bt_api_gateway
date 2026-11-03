@@ -7,28 +7,48 @@ name = "bt_api_gateway"
 version = "0.1.0"
 description = "Provider-neutral, durable shared-account command gateway"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [{name = "cloudQuant", email = "yunjinqi@gmail.com"}]
 dependencies = ["bt_api_base>=0.15.8"]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "ruff>=0.1.0"]
+dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff>=0.6", "mypy>=1.10"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+bt_api_gateway = ["py.typed"]
+
 [tool.ruff]
 line-length = 100
-target-version = "py39"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "N", "UP", "B", "C4", "SIM", "TCH", "RUF100", "S", "PERF", "PIE790"]
 ignore = ["E501", "S101", "TC001", "TC002", "TC003", "PERF203"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101", "S106"]
+# Tests spawn the interpreter itself with fixed arguments (S603), use
+# synthetic secrets (S105/S106) and fakes that mirror multiprocessing's
+# ``Pipe``/``Process`` factory names (N802).
+"tests/**" = ["S101", "S105", "S106", "S603", "N802"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-ra --strict-markers"
 markers = ["unit: Unit tests without a network or provider"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["src/bt_api_gateway"]
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+strict_equality = true
+
+[[tool.mypy.overrides]]
+# Sibling packages do not ship a py.typed marker yet.
+module = ["bt_api_base.*", "bt_api_ctp.*"]
+ignore_missing_imports = true

@@ -24,7 +24,7 @@ from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from types import MappingProxyType
-from typing import Any, Optional, Protocol
+from typing import Any, Protocol, cast
 
 from bt_api_base.market_history_protocol import (
     MAX_MARKET_HISTORY_PAGE_BYTES,
@@ -70,8 +70,8 @@ ALL_MARKET_OPERATIONS = MARKET_OPERATIONS | frozenset({MARKET_HISTORY_OPERATION}
 MARKET_OPERATIONS_WITH_BOUNDED_READ_AFTER = MARKET_OPERATIONS | frozenset(
     {MARKET_READ_AFTER_BOUNDED_OPERATION}
 )
-ALL_MARKET_OPERATIONS_WITH_BOUNDED_READ_AFTER = (
-    ALL_MARKET_OPERATIONS | frozenset({MARKET_READ_AFTER_BOUNDED_OPERATION})
+ALL_MARKET_OPERATIONS_WITH_BOUNDED_READ_AFTER = ALL_MARKET_OPERATIONS | frozenset(
+    {MARKET_READ_AFTER_BOUNDED_OPERATION}
 )
 SUPPORTED_OPERATIONS = MARKET_OPERATIONS
 DEFAULT_MARKET_READ_LIMIT = 100
@@ -89,7 +89,7 @@ DEFAULT_MARKET_PROVIDER_POLL_LIMIT = 32
 MAX_MARKET_PROVIDER_POLL_LIMIT = 256
 
 _UTC_TIMESTAMP_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$")
-_MAPPING_PROXY_TYPE = type(MappingProxyType({}))
+_MAPPING_PROXY_TYPE: type[MappingProxyType[Any, Any]] = type(MappingProxyType({}))
 
 
 class GatewayMarketHubError(RuntimeError):
@@ -207,9 +207,9 @@ class GatewayMarketRegistration:
 
     principal_ref: str
     execution_domain_ref: str
-    strategy_ref: Optional[str] = None  # noqa: UP045 -- Python 3.9 support.
-    run_id: Optional[str] = None  # noqa: UP045 -- Python 3.9 support.
-    account_ref: Optional[str] = None  # noqa: UP045 -- Python 3.9 support.
+    strategy_ref: str | None = None
+    run_id: str | None = None
+    account_ref: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("principal_ref", "execution_domain_ref"):
@@ -237,14 +237,14 @@ class _MarketStream:
     events: deque[_ReplayEntry] = field(default_factory=deque)
     replay_bytes: int = 0
     sequence: int = 0
-    handle: Optional[object] = None  # noqa: UP045 -- Python 3.9 support.
+    handle: object | None = None
     registrations: set[str] = field(default_factory=set)
     starting: bool = False
     start_uncertain: bool = False
     releasing: bool = False
     pending_release: bool = False
     needs_new_epoch: bool = False
-    generation: Optional[str] = None  # noqa: UP045 -- Python 3.9 support.
+    generation: str | None = None
 
 
 class GatewayMarketHub:
@@ -273,14 +273,13 @@ class GatewayMarketHub:
         max_replay_events: int = 1_000,
         max_replay_bytes: int = 256 * 1024,
         max_provider_events_per_maintain: int = DEFAULT_MARKET_PROVIDER_POLL_LIMIT,
-        publisher: Optional[Callable[[WireEnvelope], object]] = None,  # noqa: UP045
-        epoch_factory: Optional[Callable[[], str]] = None,  # noqa: UP045 -- Python 3.9 support.
-        history_provider: Optional[MarketHistoryProvider] = None,  # noqa: UP045
-        history_timeout_seconds: Optional[float] = None,  # noqa: UP045
-        history_key_universe: Optional[Collection[MarketSubscriptionKey]] = None,  # noqa: UP045
-        principal_allowed_history_keys: Optional[
-            Mapping[str, Collection[MarketSubscriptionKey]]
-        ] = None,  # noqa: UP045
+        publisher: Callable[[WireEnvelope], object] | None = None,
+        epoch_factory: Callable[[], str] | None = None,
+        history_provider: MarketHistoryProvider | None = None,
+        history_timeout_seconds: float | None = None,
+        history_key_universe: Collection[MarketSubscriptionKey] | None = None,
+        principal_allowed_history_keys: Mapping[str, Collection[MarketSubscriptionKey]]
+        | None = None,
     ) -> None:
         if not callable(getattr(provider, "subscribe", None)) or not callable(
             getattr(provider, "unsubscribe", None)
@@ -325,8 +324,8 @@ class GatewayMarketHub:
         self._provider_poller = provider_poll if callable(provider_poll) else None
         reset_required = getattr(provider, "source_epoch_reset_required", None)
         acknowledge_reset = getattr(provider, "acknowledge_source_epoch_reset", None)
-        self._provider_epoch_resetter = (
-            provider
+        self._provider_epoch_resetter: MarketProviderSourceEpochResetting | None = (
+            cast("MarketProviderSourceEpochResetting", provider)
             if callable(reset_required) and callable(acknowledge_reset)
             else None
         )
@@ -580,7 +579,7 @@ class GatewayMarketHub:
                 stream.replay_bytes = 0
                 stream.needs_new_epoch = False
 
-        descriptor: MarketSourceDescriptor | None = None
+        descriptor = None
         if require_source_descriptor:
             try:
                 descriptor = self._describe_source(stream)
@@ -914,7 +913,7 @@ class GatewayMarketHub:
         _require_reference(epoch, "INVALID_EPOCH")
         _validate_cursor(after, limit)
         oldest = _oldest_sequence(stream)
-        gap_reason: Optional[str] = None  # noqa: UP045 -- Python 3.9 support.
+        gap_reason: str | None = None
         if epoch != stream.epoch:
             gap_reason = "epoch_mismatch"
         elif oldest is not None and after < oldest - 1:
@@ -1056,9 +1055,7 @@ class GatewayMarketHub:
             raise GatewayMarketHubError("MARKET_KEY_DENIED")
         return stream
 
-    def _authorize_history_key(
-        self, principal_ref: str, key: MarketSubscriptionKey
-    ) -> None:
+    def _authorize_history_key(self, principal_ref: str, key: MarketSubscriptionKey) -> None:
         _require_reference(principal_ref, "INVALID_PRINCIPAL_REF")
         allowed = self._principal_allowed_history_keys.get(principal_ref)
         if allowed is None:
@@ -1184,7 +1181,7 @@ class GatewayMarketService:
         self,
         hub: GatewayMarketHub,
         *,
-        registrations: Optional[Mapping[str, GatewayMarketRegistration]] = None,  # noqa: UP045
+        registrations: Mapping[str, GatewayMarketRegistration] | None = None,
         enable_bounded_read_after: bool = False,
     ) -> None:
         if type(hub) is not GatewayMarketHub:
@@ -1256,7 +1253,7 @@ class GatewayMarketService:
         scope: WireScope,
         arguments: Mapping[str, object],
         registration_id: str,
-        result_fits: Optional[Callable[[Mapping[str, object]], bool]] = None,  # noqa: UP045
+        result_fits: Callable[[Mapping[str, object]], bool] | None = None,
     ) -> Mapping[str, object]:
         """Handle one exact market RPC under a trusted strategy-run mapping."""
         self._hub._check_owner()
@@ -1330,20 +1327,20 @@ class GatewayMarketService:
             batch = self._hub.read_after(
                 key,
                 epoch=epoch,
-                after=after,  # type: ignore[arg-type] -- the hub validates the exact type.
-                limit=limit,  # type: ignore[arg-type] -- the hub validates the exact type.
+                after=after,  # type: ignore[arg-type]  # the hub validates the exact type.
+                limit=limit,  # type: ignore[arg-type]  # the hub validates the exact type.
             )
         except GatewayMarketHubError as exc:
             raise GatewayMarketServiceError(exc.code, retryable=exc.retryable) from None
         result = dict(batch)
-        event_mappings = tuple(_envelope_mapping(event) for event in batch["events"])
-        result["events"] = event_mappings
+        envelopes = tuple(cast("tuple[WireEnvelope, ...]", batch["events"]))
+        result["events"] = tuple(_envelope_mapping(event) for event in envelopes)
         if operation == MARKET_READ_AFTER_BOUNDED_OPERATION:
             if result_fits is None or not callable(result_fits):
                 raise GatewayMarketServiceError("CAPABILITY_UNAVAILABLE")
             return self._fit_read_after_reply(
                 result,
-                envelopes=tuple(batch["events"]),
+                envelopes=envelopes,
                 result_fits=result_fits,
             )
         return MappingProxyType(result)
@@ -1365,7 +1362,7 @@ class GatewayMarketService:
         if not callable(result_fits):
             raise GatewayMarketServiceError("INVALID_REPLY_SIZE_CHECKER")
 
-        event_mappings = tuple(result["events"])
+        event_mappings = tuple(cast("tuple[Mapping[str, object], ...]", result["events"]))
         if len(event_mappings) != len(envelopes):
             raise GatewayMarketServiceError("INVALID_REPLAY_PAGE")
         requested_after = result["after"]
@@ -1374,9 +1371,7 @@ class GatewayMarketService:
         def candidate(prefix_length: int) -> Mapping[str, object]:
             selected = event_mappings[:prefix_length]
             next_after = (
-                envelopes[prefix_length - 1].header.sequence
-                if prefix_length
-                else requested_after
+                envelopes[prefix_length - 1].header.sequence if prefix_length else requested_after
             )
             page = dict(result)
             page["events"] = selected
@@ -1425,7 +1420,11 @@ class GatewayMarketService:
         """
         _require_exact_arguments(raw, {"subscriptions"})
         subscriptions = raw["subscriptions"]
-        if type(subscriptions) not in (tuple, list) or not 1 <= len(subscriptions) <= 20:
+        if (
+            not isinstance(subscriptions, (tuple, list))
+            or type(subscriptions) not in (tuple, list)
+            or not 1 <= len(subscriptions) <= 20
+        ):
             raise GatewayMarketServiceError("INVALID_BOOTSTRAP_BATCH")
 
         parsed: list[tuple[MarketSubscriptionKey, bool, bool]] = []
@@ -1435,7 +1434,10 @@ class GatewayMarketService:
             self._hub._ensure_open()
             if self._hub._publisher is None:
                 raise GatewayMarketHubError("PUBLISHER_NOT_CONFIGURED")
-            if self._hub._registration_ref_count + len(subscriptions) > MAX_MARKET_REGISTRATION_REFS:
+            if (
+                self._hub._registration_ref_count + len(subscriptions)
+                > MAX_MARKET_REGISTRATION_REFS
+            ):
                 raise GatewayMarketHubError("REGISTRATION_REF_LIMIT_EXCEEDED")
             for item in subscriptions:
                 if not isinstance(item, Mapping) or set(item) not in (
@@ -1660,13 +1662,11 @@ def _copy_market_acl(
 
 
 def _copy_market_history_acl(
-    provider: Optional[MarketHistoryProvider],  # noqa: UP045 -- Python 3.9 support.
+    provider: MarketHistoryProvider | None,
     stream_keys: tuple[MarketSubscriptionKey, ...],
     stream_acl: Mapping[str, frozenset[MarketSubscriptionKey]],
-    history_keys: Optional[Collection[MarketSubscriptionKey]],  # noqa: UP045
-    history_acl: Optional[
-        Mapping[str, Collection[MarketSubscriptionKey]]
-    ],  # noqa: UP045
+    history_keys: Collection[MarketSubscriptionKey] | None,
+    history_acl: Mapping[str, Collection[MarketSubscriptionKey]] | None,
 ) -> tuple[tuple[MarketSubscriptionKey, ...], dict[str, frozenset[MarketSubscriptionKey]]]:
     """Copy history-only keys without adding them to the live stream audience.
 
@@ -1760,9 +1760,9 @@ def _require_reference(value: object, code: str) -> str:
 
 
 def _validate_history_configuration(
-    provider: Optional[MarketHistoryProvider],  # noqa: UP045 -- Python 3.9 support.
-    timeout_seconds: Optional[float],  # noqa: UP045 -- Python 3.9 support.
-) -> Optional[float]:  # noqa: UP045 -- Python 3.9 support.
+    provider: MarketHistoryProvider | None,
+    timeout_seconds: float | None,
+) -> float | None:
     if provider is None:
         if timeout_seconds is not None:
             raise GatewayMarketHubError("HISTORY_TIMEOUT_WITHOUT_PROVIDER")
@@ -1793,9 +1793,10 @@ def _validate_utc_timestamp(value: object, code: str) -> str:
 
 
 def _format_utc(value: object) -> str:
-    if type(value) is not datetime or value.tzinfo is None or value.utcoffset() is None:
+    if type(value) is not datetime or value.tzinfo is None:
         raise GatewayMarketHubError("INVALID_CLOCK_VALUE")
-    if value.utcoffset().total_seconds() != 0:
+    offset = value.utcoffset()
+    if offset is None or offset.total_seconds() != 0:
         raise GatewayMarketHubError("INVALID_CLOCK_VALUE")
     return value.isoformat(timespec="microseconds").replace("+00:00", "Z")
 

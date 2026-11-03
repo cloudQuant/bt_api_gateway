@@ -15,7 +15,7 @@ import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Optional
+from typing import cast
 
 from bt_api_base.account_protocol import AccountObservation
 from bt_api_base.service_protocol import MAX_REFERENCE_BYTES, WireIdentity, WireScope
@@ -175,8 +175,8 @@ class GatewayServiceAccountScope:
     execution_domain_ref: str
     journal_account_scope: str
     strategy_scope_map: Mapping[str, str] = field(default_factory=dict)
-    account_read_strategy_scope: Optional[str] = None  # noqa: UP045 -- Python 3.9 support.
-    shared_account_facts_scope: Optional[str] = None  # noqa: UP045 -- Python 3.9 support.
+    account_read_strategy_scope: str | None = None
+    shared_account_facts_scope: str | None = None
     shared_fact_strategy_refs: Iterable[str] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
@@ -237,7 +237,7 @@ class GatewayReadService:
         *,
         accounts: Mapping[str, GatewayServiceAccountScope],
         principals: Mapping[str, GatewayPrincipal],
-        state_worker: Optional[GatewayAccountSessionWorker] = None,  # noqa: UP045
+        state_worker: GatewayAccountSessionWorker | None = None,
     ) -> None:
         if not isinstance(journal, GatewayEventJournal):
             raise GatewayServiceError("INVALID_JOURNAL")
@@ -297,8 +297,8 @@ class GatewayReadService:
         principal_ref: str,
         scope: WireScope,
         arguments: Mapping[str, object],
-        identity: Optional[WireIdentity] = None,  # noqa: UP045 -- Python 3.9 support.
-        result_fits: Optional[Callable[[Mapping[str, object]], bool]] = None,  # noqa: UP045
+        identity: WireIdentity | None = None,
+        result_fits: Callable[[Mapping[str, object]], bool] | None = None,
     ) -> Mapping[str, object]:
         """Dispatch a bounded journal read or consumer-progress operation.
 
@@ -328,7 +328,7 @@ class GatewayReadService:
             if set(arguments) != {"instrument_id", "exchange_id"}:
                 raise GatewayServiceError("INVALID_ARGUMENTS")
             # Scope resolution is only routing. Check the same durable journal
-            # ACL used for account snapshots before querying the CTP provider.
+            # ACL used for account snapshots before querying the provider.
             self._journal.read_after(
                 principal,
                 account.journal_account_scope,
@@ -343,10 +343,14 @@ class GatewayReadService:
                     instrument_id=arguments["instrument_id"],  # type: ignore[arg-type]
                     exchange_id=arguments["exchange_id"],  # type: ignore[arg-type]
                 )
-                return MappingProxyType({"metadata": metadata.to_dict()})  # type: ignore[attr-defined]
+                return MappingProxyType({"metadata": metadata.to_dict()})
             except Exception as exc:
                 code = getattr(exc, "code", None)
-                if type(code) is not str or code not in _INSTRUMENT_METADATA_ERROR_CODES | _CERTIFICATION_FACT_ERROR_CODES:
+                if (
+                    type(code) is not str
+                    or code
+                    not in _INSTRUMENT_METADATA_ERROR_CODES | _CERTIFICATION_FACT_ERROR_CODES
+                ):
                     code = "PROVIDER_FACT_READ_FAILED"
                 raise GatewayServiceError(code) from None
 
@@ -405,9 +409,11 @@ class GatewayReadService:
                         account.journal_account_scope,
                         journal_strategy_scope,
                         consumer_ref,
-                        cursor=cursor,  # type: ignore[arg-type] -- validated above.
-                        limit=limit,  # type: ignore[arg-type] -- validated above.
-                        stream_epoch=arguments.get("stream_epoch"),
+                        cursor=cursor,  # type: ignore[arg-type]  # validated above.
+                        limit=limit,  # type: ignore[arg-type]  # validated above.
+                        stream_epoch=cast(
+                            "str | None", arguments.get("stream_epoch")
+                        ),  # journal validates
                     )
                     return self._consumer_read_result(
                         batch,
@@ -416,11 +422,11 @@ class GatewayReadService:
                         strategy_scope=journal_strategy_scope,
                     )
 
-                selected_batch: Optional[GatewayReadBatch] = None  # noqa: UP045
-                selected_progress: Optional[GatewayConsumerProgress] = None  # noqa: UP045
-                selected_result: Optional[Mapping[str, object]] = None  # noqa: UP045
+                selected_batch: GatewayReadBatch | None = None
+                selected_progress: GatewayConsumerProgress | None = None
+                selected_result: Mapping[str, object] | None = None
                 selected_fits = False
-                state_status_snapshot: Optional[Mapping[str, object]] = None  # noqa: UP045
+                state_status_snapshot: Mapping[str, object] | None = None
                 source_cursor_snapshot: object = _UNSAMPLED_SOURCE_CURSOR
                 state_status_captured = False
 
@@ -465,9 +471,11 @@ class GatewayReadService:
                     account.journal_account_scope,
                     journal_strategy_scope,
                     consumer_ref,
-                    cursor=cursor,  # type: ignore[arg-type] -- validated above.
-                    limit=limit,  # type: ignore[arg-type] -- validated above.
-                    stream_epoch=arguments.get("stream_epoch"),
+                    cursor=cursor,  # type: ignore[arg-type]  # validated above.
+                    limit=limit,  # type: ignore[arg-type]  # validated above.
+                    stream_epoch=cast(
+                        "str | None", arguments.get("stream_epoch")
+                    ),  # journal validates
                     page_fits=page_fits,
                 )
                 if (
@@ -484,8 +492,8 @@ class GatewayReadService:
                 principal,
                 account.journal_account_scope,
                 journal_strategy_scope,
-                cursor=cursor,  # type: ignore[arg-type] -- validated above.
-                limit=limit,  # type: ignore[arg-type] -- validated above.
+                cursor=cursor,  # type: ignore[arg-type]  # validated above.
+                limit=limit,  # type: ignore[arg-type]  # validated above.
             )
             return self._with_state_status(
                 _batch_result(batch, include_snapshot_source=False),
@@ -528,8 +536,9 @@ class GatewayReadService:
                 account.journal_account_scope,
                 journal_strategy_scope,
                 consumer_ref,
-                stream_epoch=arguments["stream_epoch"],
-                cursor=arguments["cursor"],
+                # The journal validates the exact argument types.
+                stream_epoch=cast("str", arguments["stream_epoch"]),
+                cursor=cast("int", arguments["cursor"]),
             )
             return MappingProxyType({"consumer_progress": _consumer_progress_result(progress)})
 
@@ -542,7 +551,7 @@ class GatewayReadService:
                 account.journal_account_scope,
                 journal_strategy_scope,
                 cursor=None,
-                limit=limit,  # type: ignore[arg-type] -- validated above.
+                limit=limit,  # type: ignore[arg-type]  # validated above.
             )
             return self._with_state_status(
                 _batch_result(batch, include_snapshot_source=True),
@@ -569,7 +578,7 @@ class GatewayReadService:
 
     def _consumer_ref(
         self,
-        identity: Optional[WireIdentity],  # noqa: UP045 -- Python 3.9 support.
+        identity: WireIdentity | None,
         *,
         principal_ref: str,
         principal: GatewayPrincipal,
@@ -577,7 +586,11 @@ class GatewayReadService:
         account: GatewayServiceAccountScope,
         journal_strategy_scope: str,
     ) -> str:
-        if type(identity) is not WireIdentity or identity.principal_ref != principal_ref:
+        if (
+            identity is None
+            or type(identity) is not WireIdentity
+            or identity.principal_ref != principal_ref
+        ):
             # A missing or mismatched claim must not bypass normal journal ACL
             # checks. This read is side-effect free and never creates progress.
             self._journal.read_after(
@@ -618,7 +631,7 @@ class GatewayReadService:
         *,
         operation: str,
         strategy_scope: str,
-        state_status: Optional[Mapping[str, object]] = None,  # noqa: UP045
+        state_status: Mapping[str, object] | None = None,
         source_cursor: object = _UNSAMPLED_SOURCE_CURSOR,
     ) -> Mapping[str, object]:
         if self._state_worker is None:
@@ -684,7 +697,7 @@ class GatewayReadService:
         *,
         operation: str,
         strategy_scope: str,
-        state_status: Optional[Mapping[str, object]] = None,  # noqa: UP045
+        state_status: Mapping[str, object] | None = None,
         source_cursor: object = _UNSAMPLED_SOURCE_CURSOR,
     ) -> Mapping[str, object]:
         result = dict(_batch_result(batch, include_snapshot_source=False))
@@ -836,8 +849,8 @@ def _consumer_progress_result(
 
 
 def _snapshot_result(
-    snapshot: Optional[GatewayAccountSnapshot],  # noqa: UP045 -- Python 3.9 support.
-) -> Optional[Mapping[str, object]]:  # noqa: UP045 -- Python 3.9 support.
+    snapshot: GatewayAccountSnapshot | None,
+) -> Mapping[str, object] | None:
     if snapshot is None:
         return None
     return MappingProxyType(
@@ -906,7 +919,7 @@ def _snapshot_result_matches(
         and value.get("cursor") == latest.cursor
         and isinstance(value.get("payload"), Mapping)
         and value.get("payload") == latest.payload
-        and value["payload"].get("session_generation") == generation  # type: ignore[index]
+        and value["payload"].get("session_generation") == generation
     )
 
 

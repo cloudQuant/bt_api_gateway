@@ -104,7 +104,7 @@ except GatewayWriterAuthorityError as exc:
 else:
     raise SystemExit('second process unexpectedly acquired account lease')
 """
-    result = subprocess.run(  # noqa: S603 -- fixed local lease-competition fixture.
+    result = subprocess.run(
         [sys.executable, "-c", program, str(database)],
         capture_output=True,
         text=True,
@@ -325,7 +325,7 @@ if point == 'after_claim':
 router.dispatch(principal, command)
 raise SystemExit('crash hook was not reached')
 """
-    result = subprocess.run(  # noqa: S603 -- fixed local crash-point fixture.
+    result = subprocess.run(
         [sys.executable, "-c", program, str(database), crash_point],
         capture_output=True,
         text=True,
@@ -396,7 +396,7 @@ else:
         workers.append(
             (
                 ready,
-                subprocess.Popen(  # noqa: S603 -- fixed local SQLite contention fixture.
+                subprocess.Popen(
                     [sys.executable, "-c", program, str(database), str(trigger), str(ready), name],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,

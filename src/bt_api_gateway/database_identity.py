@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from threading import RLock
-from typing import Optional
 
 
 class GatewayDatabaseIdentityError(RuntimeError):
@@ -25,7 +24,7 @@ class SQLiteFileIdentity:
     def __init__(self, path: Path) -> None:
         self._requested_path = Path(path).absolute()
         self._path = self._requested_path.resolve()
-        self._identity: Optional[tuple[int, int]] = None  # noqa: UP045 -- Python 3.9 support.
+        self._identity: tuple[int, int] | None = None
         self._lock = RLock()
 
     @property

@@ -15,11 +15,11 @@ import re
 import sqlite3
 import time
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Optional, Union
+from typing import Any
 
 from bt_api_base.account_protocol import AccountObservation, AccountResourceKey
 
@@ -111,8 +111,8 @@ class GatewayReadBatch:
 
     account_scope: str
     strategy_scope: str
-    requested_cursor: Optional[int]  # noqa: UP045 -- Python 3.9 is supported.
-    snapshot: Optional[GatewayAccountSnapshot]  # noqa: UP045 -- Python 3.9 is supported.
+    requested_cursor: int | None
+    snapshot: GatewayAccountSnapshot | None
     events: tuple[GatewayAccountEvent, ...]
     next_cursor: int
     latest_cursor: int
@@ -159,8 +159,8 @@ class GatewayEventJournal:
 
     def __init__(
         self,
-        database_path: Union[Path, str],  # noqa: UP007 -- Python 3.9 is supported.
-        clock: Optional[Callable[[], float]] = None,  # noqa: UP045 -- Python 3.9 is supported.
+        database_path: Path | str,
+        clock: Callable[[], float] | None = None,
         timeout_seconds: float = 5.0,
     ) -> None:
         self._database_path = Path(database_path)
@@ -176,7 +176,7 @@ class GatewayEventJournal:
         event_id: str,
         kind: str,
         payload: Mapping[str, Any],
-        observed_at: Optional[float] = None,  # noqa: UP045 -- Python 3.9 is supported.
+        observed_at: float | None = None,
     ) -> GatewayAccountEvent:
         """Persist an event once; identical redelivery returns its original cursor."""
         event_time = self._clock() if observed_at is None else observed_at
@@ -280,7 +280,7 @@ class GatewayEventJournal:
         snapshot_id: str,
         expected_cursor: int,
         payload: Mapping[str, Any],
-        captured_at: Optional[float] = None,  # noqa: UP045 -- Python 3.9 is supported.
+        captured_at: float | None = None,
     ) -> GatewayAccountSnapshot:
         """Store a caller-supplied snapshot only if its declared cursor is current.
 
@@ -372,7 +372,7 @@ class GatewayEventJournal:
         payload: Mapping[str, Any],
         *,
         expected_cursor: int,
-        captured_at: Optional[float] = None,  # noqa: UP045 -- Python 3.9 is supported.
+        captured_at: float | None = None,
         view_policies: tuple[GatewayAccountViewPolicy, ...] = (),
     ) -> GatewayAccountSnapshot:
         """Atomically replace a bounded account-state snapshot and advance its cursor.
@@ -411,8 +411,8 @@ class GatewayEventJournal:
             )
         fingerprint = _snapshot_fingerprint(candidate)
 
-        source_observation: Optional[AccountObservation] = None  # noqa: UP045
-        account_key_digest: Optional[str] = None  # noqa: UP045
+        source_observation: AccountObservation | None = None
+        account_key_digest: str | None = None
         if policies:
             source_observation, account_key_digest = self._parse_view_source_payload(candidate)
 
@@ -728,7 +728,7 @@ class GatewayEventJournal:
         principal: GatewayPrincipal,
         account_scope: str,
         strategy_scope: str,
-        cursor: Optional[int] = None,  # noqa: UP045 -- Python 3.9 is supported.
+        cursor: int | None = None,
         limit: int = 100,
     ) -> GatewayReadBatch:
         """Return replay events or a compacted snapshot followed by replay."""
@@ -757,12 +757,10 @@ class GatewayEventJournal:
         strategy_scope: str,
         consumer_ref: str,
         *,
-        cursor: Optional[int] = None,  # noqa: UP045 -- Python 3.9 is supported.
+        cursor: int | None = None,
         limit: int = 100,
-        stream_epoch: Optional[str] = None,  # noqa: UP045 -- Python 3.9 is supported.
-        page_fits: Optional[  # noqa: UP045 -- Python 3.9 is supported.
-            Callable[[GatewayReadBatch, GatewayConsumerProgress], bool]
-        ] = None,
+        stream_epoch: str | None = None,
+        page_fits: Callable[[GatewayReadBatch, GatewayConsumerProgress], bool] | None = None,
     ) -> tuple[GatewayReadBatch, GatewayConsumerProgress]:
         """Offer a read range and persist its cursor with the same SQLite commit.
 
@@ -1136,7 +1134,7 @@ class GatewayEventJournal:
         connection: sqlite3.Connection,
         account_scope: str,
         strategy_scope: str,
-        cursor: Optional[int],  # noqa: UP045 -- Python 3.9 is supported.
+        cursor: int | None,
         limit: int,
     ) -> GatewayReadBatch:
         latest = self._latest_cursor(connection, account_scope, strategy_scope)
@@ -1225,7 +1223,7 @@ class GatewayEventJournal:
 
     def _state_view_source_binding(
         self, connection: sqlite3.Connection, account_scope: str, source_scope: str
-    ) -> Optional[sqlite3.Row]:  # noqa: UP045 -- Python 3.9 support.
+    ) -> sqlite3.Row | None:
         row = connection.execute(
             """
             SELECT policy_set_json, policy_set_digest, account_key_digest, source_cursor
@@ -1312,7 +1310,7 @@ class GatewayEventJournal:
         policies: tuple[GatewayAccountViewPolicy, ...],
         policy_set_json: str,
         policy_set_digest: str,
-        account_key_digest: Optional[str],  # noqa: UP045 -- Python 3.9 support.
+        account_key_digest: str | None,
     ) -> None:
         if (
             str(binding["policy_set_json"]) != policy_set_json
@@ -1576,7 +1574,7 @@ class GatewayEventJournal:
         connection: sqlite3.Connection,
         account_scope: str,
         source_scope: str,
-        binding: Optional[sqlite3.Row],  # noqa: UP045 -- Python 3.9 support.
+        binding: sqlite3.Row | None,
     ) -> AccountObservation:
         if binding is None:
             raise GatewayEventJournalError(
@@ -2049,7 +2047,7 @@ class GatewayEventJournal:
 
     def _view_delta(
         self, previous: Mapping[str, Any], current: Mapping[str, Any]
-    ) -> Optional[Mapping[str, Any]]:  # noqa: UP045 -- Python 3.9 support.
+    ) -> Mapping[str, Any] | None:
         try:
             return view_delta(previous, current)
         except AccountViewProjectionError as exc:
@@ -2106,7 +2104,7 @@ class GatewayEventJournal:
 
     def _validate_read_request(
         self,
-        cursor: Optional[int],  # noqa: UP045 -- Python 3.9 is supported.
+        cursor: int | None,
         limit: int,
     ) -> None:
         if cursor is not None and (type(cursor) is not int or cursor < 0):

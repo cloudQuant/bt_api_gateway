@@ -609,7 +609,7 @@ authority.acquire_writer('account:demo', 'crash-test-owner', lease_seconds=30)
 router = GatewayCommandRouter(sys.argv[1], crash_after_claim, clock=lambda: 1700000000.0, admission=lambda principal, command: True, writer_authority=authority)
 router.dispatch(principal, command)
 """
-    result = subprocess.run(  # noqa: S603 -- fixed crash worker with no provider or shell.
+    result = subprocess.run(
         [sys.executable, "-c", program, str(database)],
         capture_output=True,
         text=True,

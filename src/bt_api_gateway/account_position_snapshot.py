@@ -11,13 +11,9 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from bt_api_base.account_protocol import AccountKey, AccountObservation
-
-if TYPE_CHECKING:
-    from .account_session_worker import GatewayAccountSessionWorker
-    from .event_journal import GatewayAccountSnapshot
 
 
 class GatewayPositionSnapshotError(RuntimeError):
@@ -105,9 +101,7 @@ class GatewayFullPositionSnapshot:
             value = getattr(self, name)
             if type(value) is not str or not value or value != value.strip():
                 raise GatewayPositionSnapshotError("POSITION_COVERAGE_INVALID")
-        if type(self.filters) is not tuple or any(
-            type(item) is not str for item in self.filters
-        ):
+        if type(self.filters) is not tuple or any(type(item) is not str for item in self.filters):
             raise GatewayPositionSnapshotError("POSITION_COVERAGE_INVALID")
         if type(self.pagination_exhausted) is not bool:
             raise GatewayPositionSnapshotError("POSITION_COVERAGE_INVALID")
@@ -207,9 +201,7 @@ class GatewayFullPositionSnapshotReceipt:
                 {
                     "account_key_id": self.account_key.account_key_id,
                     "observation_id": self.observation.observation_id,
-                    "observation_sha256": _sha256(
-                        _canonical_json(self.observation.to_dict())
-                    ),
+                    "observation_sha256": _sha256(_canonical_json(self.observation.to_dict())),
                     "session_generation": self.session_generation,
                     "snapshot_cursor": self.snapshot_cursor,
                     "source": self._source.source_payload(),
@@ -223,4 +215,3 @@ class GatewayFullPositionSnapshotReceipt:
         if not callable(verifier):
             raise GatewayPositionSnapshotError("POSITION_RECEIPT_INVALID")
         verifier(self)
-

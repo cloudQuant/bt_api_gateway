@@ -13,10 +13,10 @@ import json
 import math
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import datetime
 from types import MappingProxyType
-from typing import Callable, Optional, Protocol
+from typing import Protocol, cast
 
 from bt_api_base.account_certification_protocol import (
     AccountConfigurationObservation,
@@ -34,12 +34,6 @@ from .account_certification import (
     collect_account_configuration,
     collect_exchange_server_time,
 )
-from .account_view_projection import (
-    AccountViewProjectionError,
-    GatewayAccountViewPolicy,
-    project_account_view,
-    validate_policy_set,
-)
 from .account_position_snapshot import (
     GatewayFullPositionSnapshot,
     GatewayFullPositionSnapshotReceipt,
@@ -47,6 +41,12 @@ from .account_position_snapshot import (
     position_rows_sha256,
     resource_coverage_sha256,
     utc_timestamp_ns,
+)
+from .account_view_projection import (
+    AccountViewProjectionError,
+    GatewayAccountViewPolicy,
+    project_account_view,
+    validate_policy_set,
 )
 from .event_journal import (
     GatewayAccountSnapshot,
@@ -61,6 +61,13 @@ _STATE_SCHEMA_VERSION_LEGACY = 1
 _STATE_SCHEMA_VERSION_OPEN_ORDERS = 2
 _MAX_TRACKED_ROWS = 3 * MAX_ACCOUNT_ROWS + 1
 _STATE_METADATA_RESERVE_BYTES = 4096
+# Upper bound on the rate difference between the wall and monotonic clocks.
+# NTP/adjtime slew the wall clock by at most 500 ppm, and some monotonic clocks
+# (macOS mach_absolute_time) are not frequency-corrected at all, so the two
+# legitimately diverge by tens of ppm. A wall clock that falls behind faster
+# than this is treated as a regression.
+_MAX_CLOCK_RATE_SKEW = 500e-6
+
 _INSTRUMENT_METADATA_ERROR_CODES = frozenset(
     {
         "ACCOUNT_GENERATION_INVALID",
@@ -97,6 +104,33 @@ class GatewayAccountSessionWorkerError(RuntimeError):
         super().__init__(code)
 
 
+class GatewayInstrumentMetadataCapability(Protocol):
+    """Optional provider capability: fresh instrument metadata for this session.
+
+    A provider-specific adapter (for CTP: ``bt_api_ctp.gateway_instrument_metadata``)
+    implements both methods. The Gateway stays provider-neutral: it only
+    requires that the provider recognize its own sealed result, that the result
+    is bound to the current owner generation, and that it projects to a mapping.
+    Provider errors carry a finite ``code``; codes outside
+    ``_INSTRUMENT_METADATA_ERROR_CODES`` collapse to ``PROVIDER_FACT_READ_FAILED``.
+    """
+
+    def read_instrument_metadata(
+        self, *, instrument_id: str, exchange_id: str, generation: str, timeout: float
+    ) -> GatewayInstrumentMetadataFact: ...
+
+    def is_current_instrument_metadata(self, value: object) -> bool: ...
+
+
+class GatewayInstrumentMetadataFact(Protocol):
+    """Typed instrument metadata issued by the provider capability."""
+
+    @property
+    def account_session_generation(self) -> str: ...
+
+    def to_dict(self) -> dict[str, object]: ...
+
+
 class GatewayAccountSessionProvider(Protocol):
     """Trusted provider boundary exposing account reads and lifecycle only."""
 
@@ -108,7 +142,7 @@ class GatewayAccountSessionProvider(Protocol):
     ) -> AccountObservation | GatewayFullPositionSnapshot:
         """Return an observation, optionally with trusted full-position coverage."""
 
-    def close(self) -> Optional[bool]:  # noqa: UP045 -- Python 3.9 support.
+    def close(self) -> bool | None:
         """Close idempotently; only None or literal True confirms success."""
 
 
@@ -141,7 +175,7 @@ class GatewayAccountSessionWorker:
         request_timeout_seconds: float = 2.0,
         clock: Callable[[], float] = time.time,
         monotonic_clock: Callable[[], float] = time.monotonic,
-        clock_resolution_seconds: Optional[tuple[float, float]] = None,  # noqa: UP045
+        clock_resolution_seconds: tuple[float, float] | None = None,
     ) -> None:
         if type(account_key) is not AccountKey:
             raise GatewayAccountSessionWorkerError("INVALID_ACCOUNT_KEY")
@@ -213,21 +247,24 @@ class GatewayAccountSessionWorker:
             raise GatewayAccountSessionWorkerError("SESSION_GUARD_ACCOUNT_MISMATCH")
 
         self._state = "new"
-        self._generation: Optional[str] = None  # noqa: UP045 -- Python 3.9 support.
+        self._generation: str | None = None
         self._cursor = 0
-        self._latest_snapshot: Optional[GatewayAccountSnapshot] = None  # noqa: UP045
-        self._latest_observation: Optional[AccountObservation] = None  # noqa: UP045
-        self._latest_position_source: Optional[GatewayFullPositionSnapshot] = None  # noqa: UP045
-        self._last_observation_id: Optional[str] = None  # noqa: UP045
-        self._last_observation_digest: Optional[str] = None  # noqa: UP045
-        self._last_completed_at: Optional[datetime] = None  # noqa: UP045
+        self._latest_snapshot: GatewayAccountSnapshot | None = None
+        self._latest_observation: AccountObservation | None = None
+        self._latest_position_source: GatewayFullPositionSnapshot | None = None
+        self._last_observation_id: str | None = None
+        self._last_observation_digest: str | None = None
+        self._last_completed_at: datetime | None = None
         self._last_row_times: dict[str, datetime] = {}
-        self._last_captured_at: Optional[float] = None  # noqa: UP045
-        self._wall_monotonic_anchor: Optional[tuple[float, float]] = None  # noqa: UP045
+        self._last_captured_at: float | None = None
+        self._wall_monotonic_anchor: tuple[float, float] | None = None
+        # Last accepted raw wall sample and the monotonic reading taken right
+        # after it: the lower bound used to detect wall-clock regressions.
+        self._wall_sample_anchor: tuple[float, float] | None = None
         self._snapshot_counter = 0
-        self._last_success_monotonic: Optional[float] = None  # noqa: UP045
-        self._provider_expiry_monotonic: Optional[float] = None  # noqa: UP045
-        self._next_refresh_monotonic: Optional[float] = None  # noqa: UP045
+        self._last_success_monotonic: float | None = None
+        self._provider_expiry_monotonic: float | None = None
+        self._next_refresh_monotonic: float | None = None
         self._freshness_invalidated = True
         self._guard_attempted = False
         self._guard_acquired = False
@@ -266,16 +303,19 @@ class GatewayAccountSessionWorker:
 
     @property
     def instrument_metadata_available(self) -> bool:
-        """Whether the trusted provider chain exposes the CTP metadata read.
+        """Whether the trusted provider chain exposes an instrument metadata read.
 
         This is derived from the provider object constructed by the injected
         GatewaySessionOwner factory. It is not a manifest or client setting.
-        The read itself still verifies an exact sealed CTP result and current
-        account/market sessions.
+        The read itself still has the provider verify its own sealed result and
+        the current owner generation.
         """
 
         try:
-            return callable(getattr(self._provider, "read_instrument_metadata", None))
+            return all(
+                callable(getattr(self._provider, name, None))
+                for name in ("read_instrument_metadata", "is_current_instrument_metadata")
+            )
         except Exception:
             return False
 
@@ -286,11 +326,11 @@ class GatewayAccountSessionWorker:
         return self._state
 
     @property
-    def session_generation(self) -> Optional[str]:  # noqa: UP045 -- Python 3.9 support.
+    def session_generation(self) -> str | None:
         return self._generation
 
     @property
-    def latest_snapshot(self) -> Optional[GatewayAccountSnapshot]:  # noqa: UP045
+    def latest_snapshot(self) -> GatewayAccountSnapshot | None:
         """Return the latest persisted state, including an older diagnostic generation."""
 
         return self._latest_snapshot
@@ -348,7 +388,7 @@ class GatewayAccountSessionWorker:
         if self._state != "new":
             raise GatewayAccountSessionWorkerError("WORKER_ALREADY_STARTED")
         self._state = "starting"
-        generation: Optional[str] = None  # noqa: UP045 -- Python 3.9 support.
+        generation: str | None = None
         try:
             self._guard_attempted = True
             generation = self._guard.acquire()
@@ -361,7 +401,8 @@ class GatewayAccountSessionWorker:
             self._connect_attempted = True
             self._provider_connect_active = True
             try:
-                result = self._provider.connect(
+                # The provider is untrusted: check it really returned None.
+                result = self._provider.connect(  # type: ignore[func-returns-value]
                     account_key=self._account_key,
                     generation=generation,
                     timeout=self._request_timeout,
@@ -386,8 +427,7 @@ class GatewayAccountSessionWorker:
             if isinstance(exc, LocalAccountSessionGuardError):
                 code = (
                     exc.code
-                    if exc.code
-                    in {"SESSION_ALREADY_OWNED", "SESSION_RECONCILIATION_REQUIRED"}
+                    if exc.code in {"SESSION_ALREADY_OWNED", "SESSION_RECONCILIATION_REQUIRED"}
                     else "SESSION_OWNERSHIP_UNAVAILABLE"
                 )
                 raise GatewayAccountSessionWorkerError(code) from None
@@ -507,12 +547,13 @@ class GatewayAccountSessionWorker:
         *,
         instrument_id: str,
         exchange_id: str,
-    ) -> object:
-        """Read one typed CTP instrument row under this ready owner generation."""
+    ) -> GatewayInstrumentMetadataFact:
+        """Read one typed instrument row under this ready owner generation."""
 
         generation = self._active_fact_generation()
         reader = getattr(self._provider, "read_instrument_metadata", None)
-        if not callable(reader):
+        is_current = getattr(self._provider, "is_current_instrument_metadata", None)
+        if not callable(reader) or not callable(is_current):
             raise GatewayAccountSessionWorkerError("PROVIDER_FACT_UNAVAILABLE")
         start_monotonic = self._monotonic_now()
         self._assert_current_generation_owned(generation)
@@ -523,11 +564,11 @@ class GatewayAccountSessionWorker:
                 generation=generation,
                 timeout=self._request_timeout,
             )
-        except GatewayAccountSessionWorkerError as exc:
-            code = exc.code if exc.code in _INSTRUMENT_METADATA_ERROR_CODES else "PROVIDER_FACT_READ_FAILED"
+        except Exception as exc:
+            code = getattr(exc, "code", None)
+            if type(code) is not str or code not in _INSTRUMENT_METADATA_ERROR_CODES:
+                code = "PROVIDER_FACT_READ_FAILED"
             raise GatewayAccountSessionWorkerError(code) from None
-        except Exception:
-            raise GatewayAccountSessionWorkerError("PROVIDER_FACT_READ_FAILED") from None
         finish_monotonic = self._monotonic_now()
         self._assert_current_generation_owned(generation)
         if finish_monotonic < start_monotonic:
@@ -535,19 +576,13 @@ class GatewayAccountSessionWorker:
         if finish_monotonic - start_monotonic > self._request_timeout:
             raise GatewayAccountSessionWorkerError("PROVIDER_RESPONSE_LATE")
         try:
-            from bt_api_ctp.instrument_metadata import (
-                CtpInstrumentMetadata,
-                _is_current_ctp_instrument_metadata,
-            )
+            trusted = is_current(result) is True
+            bound = trusted and result.account_session_generation == generation
         except Exception:
-            raise GatewayAccountSessionWorkerError("PROVIDER_FACT_UNAVAILABLE") from None
-        if (
-            type(result) is not CtpInstrumentMetadata
-            or not _is_current_ctp_instrument_metadata(result)
-            or result.account_session_generation != generation
-        ):
+            bound = False
+        if not bound:
             raise GatewayAccountSessionWorkerError("PROVIDER_FACT_UNAVAILABLE")
-        return result
+        return cast("GatewayInstrumentMetadataFact", result)
 
     def read_full_position_snapshot_receipt(self) -> GatewayFullPositionSnapshotReceipt:
         """Issue a non-wire receipt for this owner's current full position snapshot.
@@ -604,9 +639,7 @@ class GatewayAccountSessionWorker:
             or receipt.snapshot_cursor != self._latest_snapshot.cursor
         ):
             raise GatewayAccountSessionWorkerError("POSITION_SNAPSHOT_RECEIPT_STALE")
-        self._validate_full_position_source(
-            receipt._source, receipt.observation, generation
-        )
+        self._validate_full_position_source(receipt._source, receipt.observation, generation)
         if receipt.valid_until_ns <= int(self._wall_clock() * 1_000_000_000):
             raise GatewayAccountSessionWorkerError("POSITION_SNAPSHOT_RECEIPT_STALE")
 
@@ -630,8 +663,7 @@ class GatewayAccountSessionWorker:
                 and source.pagination_exhausted is True
                 and source.positions_sha256 == position_rows_sha256(observation)
                 and source.resource_coverage_sha256 == resource_coverage_sha256(observation)
-                and source.observed_at_ns
-                == utc_timestamp_ns(observation.completed_at_utc)
+                and source.observed_at_ns == utc_timestamp_ns(observation.completed_at_utc)
                 and source.valid_until_ns > source.observed_at_ns
             )
         except GatewayPositionSnapshotError:
@@ -667,7 +699,7 @@ class GatewayAccountSessionWorker:
                 timeout=self._request_timeout,
             )
             if type(provider_result) is GatewayFullPositionSnapshot:
-                position_source: Optional[GatewayFullPositionSnapshot] = provider_result
+                position_source: GatewayFullPositionSnapshot | None = provider_result
                 observation = provider_result.observation
             else:
                 position_source = None
@@ -766,6 +798,7 @@ class GatewayAccountSessionWorker:
             self._last_row_times = row_times
             self._last_captured_at = captured_at
             self._wall_monotonic_anchor = (logical_wall, wall_after)
+            self._wall_sample_anchor = (captured_at, wall_after)
             self._last_success_monotonic = wall_after
             self._provider_expiry_monotonic = wall_after + provider_remaining
             self._next_refresh_monotonic = self._last_success_monotonic + self._refresh_interval
@@ -819,7 +852,7 @@ class GatewayAccountSessionWorker:
             not in {_STATE_SCHEMA_VERSION_LEGACY, _STATE_SCHEMA_VERSION_OPEN_ORDERS}
         ):
             raise GatewayAccountSessionWorkerError("STATE_STREAM_SCHEMA_MISMATCH")
-        persisted_observation: Optional[AccountObservation] = None  # noqa: UP045
+        persisted_observation: AccountObservation | None = None
         if snapshot is not None:
             payload = _plain_json(snapshot.payload)
             expected_fields = {
@@ -866,12 +899,14 @@ class GatewayAccountSessionWorker:
             if current_wall < snapshot.captured_at:
                 raise GatewayAccountSessionWorkerError("WALL_CLOCK_REGRESSED")
             self._wall_monotonic_anchor = (logical_wall, sample_after)
+            self._wall_sample_anchor = (current_wall, sample_after)
 
     def _validate_observation(
-        self, observation: object, *, now: float
+        self, candidate: object, *, now: float
     ) -> tuple[dict[str, datetime], datetime]:
-        if type(observation) is not AccountObservation:
+        if type(candidate) is not AccountObservation:
             raise GatewayAccountSessionWorkerError("OBSERVATION_TYPE_INVALID")
+        observation = cast("AccountObservation", candidate)
         if observation.account_key != self._account_key:
             raise GatewayAccountSessionWorkerError("OBSERVATION_ACCOUNT_MISMATCH")
         if len(observation.coverage) != len(self._required_coverage) or set(
@@ -969,6 +1004,7 @@ class GatewayAccountSessionWorker:
         self._last_row_times.clear()
         self._last_captured_at = None
         self._wall_monotonic_anchor = None
+        self._wall_sample_anchor = None
         self._snapshot_counter = 0
         self._last_success_monotonic = None
         self._provider_expiry_monotonic = None
@@ -985,7 +1021,7 @@ class GatewayAccountSessionWorker:
 
     def _capture_wall_sample(
         self,
-    ) -> tuple[float, float, float, Optional[float]]:  # noqa: UP045
+    ) -> tuple[float, float, float, float | None]:
         monotonic_before = self._monotonic_now()
         captured_at = self._wall_clock()
         monotonic_after = self._monotonic_now()
@@ -993,15 +1029,24 @@ class GatewayAccountSessionWorker:
             raise GatewayAccountSessionWorkerError("MONOTONIC_CLOCK_REGRESSED")
 
         anchor = self._wall_monotonic_anchor
-        if anchor is None:
+        sample_anchor = self._wall_sample_anchor
+        if anchor is None or sample_anchor is None:
             logical_wall = captured_at + (monotonic_after - monotonic_before)
             return captured_at, monotonic_after, logical_wall, None
 
         anchor_wall, anchor_monotonic = anchor
-        if monotonic_before < anchor_monotonic:
+        sample_wall, sample_monotonic = sample_anchor
+        if monotonic_before < max(anchor_monotonic, sample_monotonic):
             raise GatewayAccountSessionWorkerError("MONOTONIC_CLOCK_REGRESSED")
-        projected_floor = anchor_wall + (monotonic_before - anchor_monotonic)
-        projected_after = anchor_wall + (monotonic_after - anchor_monotonic)
+        # Both projections advance at the slowest rate the wall clock may
+        # legitimately run relative to the monotonic clock; projecting at the
+        # full monotonic rate would let a normal rate difference accumulate
+        # without bound and eventually reject every refresh.
+        slowest_rate = 1.0 - _MAX_CLOCK_RATE_SKEW
+        # Regression floor: the previous raw sample was read no later than
+        # sample_monotonic and this one no earlier than monotonic_before.
+        projected_floor = sample_wall + (monotonic_before - sample_monotonic) * slowest_rate
+        projected_after = anchor_wall + (monotonic_after - anchor_monotonic) * slowest_rate
         # The wall sample may have occurred anywhere inside its monotonic
         # bracket. Advancing it by the full span errs toward older provider
         # data; max() also prevents the logical floor from ever moving back.
@@ -1068,7 +1113,7 @@ def _observation_schema_version(observation: AccountObservation) -> int:
     )
 
 
-def _snapshot_generation(snapshot: GatewayAccountSnapshot) -> Optional[str]:  # noqa: UP045
+def _snapshot_generation(snapshot: GatewayAccountSnapshot) -> str | None:
     generation = snapshot.payload.get("session_generation")
     return generation if type(generation) is str else None
 
@@ -1127,7 +1172,7 @@ def _positive_seconds(value: object) -> float:
 def _clock_resolutions(
     clock: Callable[[], float],
     monotonic_clock: Callable[[], float],
-    configured: Optional[tuple[float, float]],  # noqa: UP045
+    configured: tuple[float, float] | None,
 ) -> tuple[float, float]:
     if configured is None:
         try:

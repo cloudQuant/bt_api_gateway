@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from types import MappingProxyType
-from typing import Optional
 
 import pytest
 from bt_api_base.account_protocol import AccountKey, AccountResourceKey
@@ -53,8 +52,8 @@ def _identity() -> WireIdentity:
 def _service(
     journal: GatewayEventJournal,
     *,
-    principal: Optional[GatewayPrincipal] = None,  # noqa: UP045 -- Python 3.9 support.
-    state_worker: Optional[GatewayAccountSessionWorker] = None,  # noqa: UP045
+    principal: GatewayPrincipal | None = None,
+    state_worker: GatewayAccountSessionWorker | None = None,
 ) -> GatewayReadService:
     return GatewayReadService(
         journal,

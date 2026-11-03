@@ -21,7 +21,7 @@ import re
 from collections.abc import Callable, Mapping
 from threading import Lock
 from types import MappingProxyType
-from typing import Any, Optional, Protocol
+from typing import Any, Protocol
 
 _SESSION_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _CREDENTIAL_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
@@ -61,7 +61,7 @@ class GatewayAccountSessionProvider(Protocol):
     def read_account(self, *, generation: str, timeout: float) -> Any:
         """Read one account observation for the active generation."""
 
-    def close(self) -> Optional[bool]:  # noqa: UP045 -- Python 3.9 support.
+    def close(self) -> bool | None:
         """Close the provider; only None or literal True confirms success."""
 
 
@@ -155,7 +155,9 @@ class GatewaySessionOwner:
                     self._uncertain_providers[account_session_ref] = provider
                 raise GatewaySessionOwnerError("PROVIDER_CLOSE_UNCONFIRMED")
             raise GatewaySessionOwnerError(error_code)
-        return provider  # type: ignore[return-value] -- validated by the builder.
+        if provider is None:  # the builder never returns (None, None)
+            raise GatewaySessionOwnerError("PROVIDER_CREATION_FAILED")
+        return provider
 
     @property
     def claimed_session_count(self) -> int:
@@ -181,7 +183,7 @@ def _resolve_and_build_provider(
     """Run secret-bearing callbacks in a frame that never escapes on failure."""
 
     credential: object = None
-    provider: object = None
+    provider: GatewayAccountSessionProvider | None = None
     try:
         try:
             credential = resolver(credential_ref)
@@ -196,8 +198,8 @@ def _resolve_and_build_provider(
         if provider is None:
             return None, "PROVIDER_CREATION_FAILED"
         if not _provider_has_required_methods(provider):
-            return provider, "PROVIDER_INVALID"  # type: ignore[return-value]
-        return provider, None  # type: ignore[return-value]
+            return provider, "PROVIDER_INVALID"
+        return provider, None
     except BaseException:
         return provider, "PROVIDER_CREATION_FAILED" if provider is None else "PROVIDER_INVALID"
     finally:
