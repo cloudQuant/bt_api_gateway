@@ -13,6 +13,7 @@ import json
 import math
 import re
 import sqlite3
+import stat
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping
@@ -168,6 +169,8 @@ class GatewayEventJournal:
         self._timeout_seconds = timeout_seconds
         self._database_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize_schema()
+        journal_stat = self._database_path.stat()
+        self._reconciliation_database_identity = (journal_stat.st_dev, journal_stat.st_ino)
 
     def append(
         self,
@@ -1014,6 +1017,83 @@ class GatewayEventJournal:
                 "no contiguous consumer page fits the response limit",
             )
         return selected, selected_progress
+
+    def inspect_reconciliation_cut(
+        self,
+        principal: GatewayPrincipal,
+        account_scope: str,
+        strategy_scope: str,
+        consumer_ref: str,
+    ) -> tuple[GatewayReadBatch, GatewayConsumerProgress]:
+        """Read a source snapshot and existing consumer progress atomically.
+
+        This read uses the same account/scope ACL as other journal reads; its
+        caller must additionally enforce any reconciliation-specific grant.
+        It never creates a stream, offers a cursor, acknowledges delivery, or
+        establishes provider identity, completeness, or source continuity.
+        """
+        self._authorize_read(principal, account_scope, strategy_scope)
+        self._validate_consumer_ref(consumer_ref)
+        connection = None
+        try:
+            self._assert_reconciliation_database_identity()
+            connection = sqlite3.connect(
+                self._database_path.absolute().as_uri() + "?mode=ro",
+                uri=True,
+                timeout=self._timeout_seconds,
+                isolation_level=None,
+            )
+            connection.row_factory = sqlite3.Row
+            self._assert_reconciliation_database_identity()
+            connection.execute("BEGIN")
+            row = connection.execute(
+                """
+                SELECT progress.stream_epoch, progress.offered_cursor,
+                    progress.acknowledged_cursor, streams.stream_epoch AS current_epoch
+                FROM gateway_consumer_progress AS progress
+                JOIN gateway_consumer_streams AS streams
+                    ON streams.account_scope = progress.account_scope
+                    AND streams.strategy_scope = progress.strategy_scope
+                WHERE progress.principal_id = ? AND progress.consumer_ref = ?
+                    AND progress.account_scope = ? AND progress.strategy_scope = ?
+                """,
+                (principal.principal_id, consumer_ref, account_scope, strategy_scope),
+            ).fetchone()
+            if row is None:
+                raise GatewayEventJournalError(
+                    "CONSUMER_NOT_FOUND", "consumer progress does not exist"
+                )
+            if (
+                not _valid_bounded_identifier(row["current_epoch"])
+                or row["stream_epoch"] != row["current_epoch"]
+            ):
+                raise self._consumer_progress_corrupt()
+            progress = self._consumer_progress_from_row(row)
+            batch = self._read_batch_in_transaction(
+                connection, account_scope, strategy_scope, None, 1
+            )
+            self._assert_reconciliation_database_identity()
+            connection.execute("COMMIT")
+            self._assert_reconciliation_database_identity()
+            return batch, progress
+        except (OSError, sqlite3.Error) as exc:
+            raise GatewayEventJournalError(
+                "RECONCILIATION_JOURNAL_UNAVAILABLE", "reconciliation journal unavailable"
+            ) from exc
+        finally:
+            if connection is not None:
+                # Closing abandons any interrupted read transaction without
+                # masking the original ACL/validation or SQLite error.
+                connection.close()
+
+    def _assert_reconciliation_database_identity(self) -> None:
+        journal_stat = self._database_path.stat()
+        if not stat.S_ISREG(journal_stat.st_mode) or (
+            journal_stat.st_dev, journal_stat.st_ino
+        ) != self._reconciliation_database_identity:
+            raise GatewayEventJournalError(
+                "RECONCILIATION_JOURNAL_UNAVAILABLE", "reconciliation journal unavailable"
+            )
 
     def consumer_progress(
         self,

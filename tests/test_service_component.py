@@ -917,6 +917,7 @@ def test_supported_operations_are_finite_and_service_borrows_journal(tmp_path) -
                 "account.read_after",
                 "account.server_time_probe",
                 "account.snapshot",
+                "account.snapshot.typed",
             }
         )
         == SUPPORTED_OPERATIONS

@@ -252,9 +252,10 @@ class GatewayMarketHub:
     """Share bounded market streams inside one trusted execution-domain hub.
 
     ``key_universe`` is the complete stream audience published by the hub.
-    Every accepted principal is required to be allowed every exported key;
-    topic filters on a PUB socket are never treated as authorization. The
-    whole-endpoint entitlement is separate from registration leases: pruning
+    A shared PUB audience must be allowed every exported key. A partitioned
+    audience may use subsets only when the trusted hosting layer installs a
+    per-peer enforcing transport. Topic filters alone are never authorization.
+    The endpoint entitlement is separate from registration leases: pruning
     a registration releases upstream refs but does not revoke data access
     from an already-authorized raw SUB socket. Revocation requires controlled
     publisher shutdown/restart with a new audience map. Provider calls and
@@ -311,6 +312,9 @@ class GatewayMarketHub:
         if len(copied_keys) * max_replay_bytes > MAX_TOTAL_MARKET_REPLAY_BYTES:
             raise GatewayMarketHubError("TOTAL_REPLAY_BUDGET_EXCEEDED")
         copied_acl = _copy_market_acl(principal_allowed_keys, copied_keys)
+        partitioned = any(allowed != frozenset(copied_keys) for allowed in copied_acl.values())
+        if partitioned and publisher is not None:
+            raise GatewayMarketHubError("PARTITIONED_PUBLISHER_REQUIRED")
         copied_history_keys, copied_history_acl = _copy_market_history_acl(
             history_provider,
             copied_keys,
@@ -332,6 +336,7 @@ class GatewayMarketHub:
         )
         self._key_universe = frozenset(copied_keys)
         self._principal_allowed_keys = MappingProxyType(copied_acl)
+        self._requires_partitioned_audience = partitioned
         self._service_identity = service_identity
         self._service_scope = service_scope
         self._max_replay_events = max_replay_events
@@ -396,6 +401,12 @@ class GatewayMarketHub:
     def authorized_principals(self) -> frozenset[str]:
         """All principals with configured access to this endpoint audience."""
         return frozenset(self._principal_allowed_keys)
+
+    @property
+    def requires_partitioned_audience(self) -> bool:
+        """Whether a plain whole-endpoint PUB audience would disclose data."""
+
+        return self._requires_partitioned_audience
 
     @property
     def principal_allowed_keys(
@@ -471,14 +482,18 @@ class GatewayMarketHub:
         principal_refs: Collection[str],
         identity: WireIdentity,
         scope: WireScope,
+        *,
+        partitioned: bool = False,
     ) -> None:
         """Purely preflight the transport audience against this hub's identity.
 
         The transport must call this before constructing a PUB or RPC socket.
-        Every transport-authorized principal must have the entire finite key
-        universe, because the PUB channel itself is not a per-key ACL.
+        Partial audiences require explicit per-peer enforcing transport from
+        the trusted host; subscription filters alone are not authorization.
         """
         _validate_service_wire_scope(identity, scope)
+        if type(partitioned) is not bool:
+            raise GatewayMarketHubError("MARKET_AUDIENCE_INVALID")
         if identity != self._service_identity or scope != self._service_scope:
             raise GatewayMarketHubError("SERVICE_WIRE_SCOPE_MISMATCH")
         principals = _copy_principal_refs(principal_refs)
@@ -490,11 +505,46 @@ class GatewayMarketHub:
             allowed = self._principal_allowed_keys.get(principal_ref)
             if allowed is None:
                 raise GatewayMarketHubError("MARKET_AUDIENCE_DENIED")
-            if allowed != self._key_universe:
+            if allowed != self._key_universe and not partitioned:
                 raise GatewayMarketHubError("MARKET_AUDIENCE_INCOMPLETE")
 
     def set_publisher(self, publisher: Callable[[WireEnvelope], object]) -> None:
         """Install the owner-thread PUB callback exactly once before use."""
+        if self._requires_partitioned_audience:
+            raise GatewayMarketHubError("PARTITIONED_PUBLISHER_REQUIRED")
+        self._set_publisher(publisher)
+
+    def set_partitioned_publisher(
+        self,
+        publisher: Callable[[WireEnvelope], object],
+        *,
+        principal_stream_grants: Mapping[str, Collection[str]],
+    ) -> None:
+        """Bind a trusted host's per-peer transport with the exact hub ACL.
+
+        This is a trusted local composition interface, not an authentication
+        proof. The host is responsible for constructing a transport that
+        actually enforces these grants before invoking this method.
+        """
+
+        expected = {
+            principal: frozenset(key.stream_id for key in allowed)
+            for principal, allowed in self._principal_allowed_keys.items()
+        }
+        if not isinstance(principal_stream_grants, Mapping):
+            raise GatewayMarketHubError("PARTITIONED_PUBLISHER_GRANTS_INVALID")
+        try:
+            supplied = {
+                principal: frozenset(grants)
+                for principal, grants in principal_stream_grants.items()
+            }
+        except (TypeError, ValueError):
+            raise GatewayMarketHubError("PARTITIONED_PUBLISHER_GRANTS_INVALID") from None
+        if supplied != expected:
+            raise GatewayMarketHubError("PARTITIONED_PUBLISHER_GRANTS_INVALID")
+        self._set_publisher(publisher)
+
+    def _set_publisher(self, publisher: Callable[[WireEnvelope], object]) -> None:
         self._check_owner()
         if not callable(publisher):
             raise GatewayMarketHubError("INVALID_PUBLISHER")
@@ -1656,8 +1706,8 @@ def _copy_market_acl(
         allowed = frozenset(allowed_keys)
         if any(type(key) is not MarketSubscriptionKey for key in allowed):
             raise GatewayMarketHubError("INVALID_MARKET_ACL")
-        if allowed != universe:
-            raise GatewayMarketHubError("INCOMPLETE_MARKET_AUDIENCE")
+        if not allowed or not allowed <= universe:
+            raise GatewayMarketHubError("INVALID_MARKET_ACL")
         copied[principal_ref] = allowed
     return copied
 

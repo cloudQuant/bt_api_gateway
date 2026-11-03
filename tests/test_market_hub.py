@@ -319,14 +319,17 @@ def test_full_audience_preflight_and_exact_key_authorization() -> None:
     key = _key()
     other = _key(source_ref="source:other")
     provider = CountedProvider()
-    with pytest.raises(GatewayMarketHubError, match="INCOMPLETE_MARKET_AUDIENCE"):
-        GatewayMarketHub(
-            provider,
-            key_universe=(key, other),
-            principal_allowed_keys={"principal:a": (key,)},
-            service_identity=_identity(),
-            service_scope=_scope(),
-        )
+    partial = GatewayMarketHub(
+        provider,
+        key_universe=(key, other),
+        principal_allowed_keys={"principal:a": (key,)},
+        service_identity=_identity(),
+        service_scope=_scope(),
+    )
+    with pytest.raises(GatewayMarketHubError, match="MARKET_AUDIENCE_INCOMPLETE"):
+        partial.validate_audience(("principal:a",), _identity(), _scope())
+    with pytest.raises(GatewayMarketHubError, match="PARTITIONED_PUBLISHER_REQUIRED"):
+        partial.set_publisher(lambda _: None)
 
     hub, _, _ = _hub((key, other))
     hub.validate_audience(("principal:a", "principal:b"), _identity(), _scope())
@@ -336,6 +339,50 @@ def test_full_audience_preflight_and_exact_key_authorization() -> None:
         hub.subscribe("principal:a", _key(source_ref="not-exported"), "registration:a")
     with pytest.raises(GatewayMarketHubError, match="UNKNOWN_PRINCIPAL"):
         hub.subscribe("principal:unknown", key, "registration:a")
+
+
+def test_partial_audience_requires_exact_trusted_publisher_grants() -> None:
+    key_a, key_b = _key(), _key(source_ref="source:other")
+    provider = CountedProvider()
+    acl = {"principal:a": (key_a,), "principal:b": (key_b,)}
+    with pytest.raises(GatewayMarketHubError, match="PARTITIONED_PUBLISHER_REQUIRED"):
+        GatewayMarketHub(
+            provider,
+            key_universe=(key_a, key_b),
+            principal_allowed_keys=acl,
+            service_identity=_identity(),
+            service_scope=_scope(),
+            publisher=lambda _: None,
+        )
+    hub = GatewayMarketHub(
+        provider,
+        key_universe=(key_a, key_b),
+        principal_allowed_keys=acl,
+        service_identity=_identity(),
+        service_scope=_scope(),
+    )
+    assert hub.requires_partitioned_audience is True
+    hub.validate_audience(tuple(acl), _identity(), _scope(), partitioned=True)
+    with pytest.raises(GatewayMarketHubError, match="PARTITIONED_PUBLISHER_GRANTS_INVALID"):
+        hub.set_partitioned_publisher(
+            lambda _: None,
+            principal_stream_grants={
+                "principal:a": {key_a.stream_id, key_b.stream_id},
+                "principal:b": {key_b.stream_id},
+            },
+        )
+    published = []
+    hub.set_partitioned_publisher(
+        published.append,
+        principal_stream_grants={
+            "principal:a": {key_a.stream_id},
+            "principal:b": {key_b.stream_id},
+        },
+    )
+    hub.subscribe("principal:a", key_a, "registration:a")
+    with pytest.raises(GatewayMarketHubError, match="MARKET_KEY_DENIED"):
+        hub.subscribe("principal:a", key_b, "registration:a")
+    hub.close()
 
 
 def test_key_dimensions_do_not_collide_or_share_provider_handles() -> None:

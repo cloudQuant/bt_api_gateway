@@ -35,7 +35,13 @@ from .router import GatewayPrincipal
 _SERVICE_REFERENCE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _MARKET_HUB_PORTS = frozenset({"service.market_source"})
 _ACCOUNT_SESSION_WORKER_PORTS = frozenset(
-    {"service.account_read", "service.provider_session", "service.owner_control"}
+    {
+        "service.account_read",
+        "service.provider_session",
+        "service.owner_control",
+        # Trusted in-process reconciliation inspector (opt-in, acceptance G2).
+        "service.reconciliation",
+    }
 )
 _DEFAULT_READ_LIMIT = 100
 _UNSAMPLED_SOURCE_CURSOR = object()
@@ -92,8 +98,12 @@ SUPPORTED_OPERATIONS = frozenset(
         "account.read_after",
         "account.server_time_probe",
         "account.snapshot",
+        "account.snapshot.typed",
     }
 )
+#: Opt-in, outside the default set: advertised only when the trusted host
+#: assembled a reconciliation inspector (iteration 60, acceptance G2).
+RECONCILIATION_CUT_OPERATION = "account.reconciliation_cut"
 
 
 class GatewayServiceError(RuntimeError):
@@ -141,13 +151,19 @@ def validate_service_options(
             copied["bounded_read_after"] = bounded_read_after
     elif role == "account_session_worker":
         allowed_ports = _ACCOUNT_SESSION_WORKER_PORTS
-        allowed_options = frozenset({"role", "account_session_ref"})
+        allowed_options = frozenset({"role", "account_session_ref", "reconciliation_cut"})
         session_ref = options.get("account_session_ref")
         if session_ref is None:
             raise GatewayServiceError("MISSING_ACCOUNT_SESSION_REF")
         if not _is_service_reference(session_ref):
             raise GatewayServiceError("INVALID_ACCOUNT_SESSION_REF")
         copied = {"role": role, "account_session_ref": session_ref}
+        if "reconciliation_cut" in options:
+            # Opt-in: the host must also supply a trusted reconciliation
+            # inspector as the internal ``service.reconciliation`` port.
+            if type(options["reconciliation_cut"]) is not bool:
+                raise GatewayServiceError("INVALID_OPTIONS")
+            copied["reconciliation_cut"] = options["reconciliation_cut"]
     else:
         raise GatewayServiceError("UNKNOWN_SERVICE_ROLE")
 
@@ -238,9 +254,20 @@ class GatewayReadService:
         accounts: Mapping[str, GatewayServiceAccountScope],
         principals: Mapping[str, GatewayPrincipal],
         state_worker: GatewayAccountSessionWorker | None = None,
+        reconciliation: object | None = None,
     ) -> None:
         if not isinstance(journal, GatewayEventJournal):
             raise GatewayServiceError("INVALID_JOURNAL")
+        if reconciliation is not None:
+            from .reconciliation_authority import GatewayReconciliationInspector
+
+            if (
+                type(reconciliation) is not GatewayReconciliationInspector
+                or state_worker is None
+                or reconciliation._worker is not state_worker
+            ):
+                raise GatewayServiceError("INVALID_RECONCILIATION_INSPECTOR")
+        self._reconciliation = reconciliation
         self._journal = journal
         self._accounts = MappingProxyType(_copy_accounts(accounts))
         self._principals = MappingProxyType(_copy_principals(principals))
@@ -285,10 +312,14 @@ class GatewayReadService:
     @property
     def supported_operations(self) -> frozenset[str]:
         """Advertise metadata only when the trusted provider owns its source."""
-
+        operations = SUPPORTED_OPERATIONS
+        if self._reconciliation is not None:
+            operations = operations | {RECONCILIATION_CUT_OPERATION}
+        if self._state_worker is None:
+            operations = operations - {"account.snapshot.typed"}
         if self._state_worker is None or not self._state_worker.instrument_metadata_available:
-            return SUPPORTED_OPERATIONS - {"account.instrument_metadata"}
-        return SUPPORTED_OPERATIONS
+            operations = operations - {"account.instrument_metadata"}
+        return operations
 
     def handle(
         self,
@@ -322,6 +353,24 @@ class GatewayReadService:
             raise GatewayServiceError("INVALID_ARGUMENTS")
         if any(type(key) is not str for key in arguments):
             raise GatewayServiceError("INVALID_ARGUMENTS")
+
+        if operation == RECONCILIATION_CUT_OPERATION:
+            _reject_unknown_arguments(arguments, frozenset())
+            inspector = self._reconciliation
+            if account.account_ref != inspector._account_ref:
+                raise GatewayServiceError("RECONCILIATION_ACCOUNT_MISMATCH")
+            # Only the inspector's own server-owned allowlist (exact principal
+            # objects with a live grant) may obtain evidence; a trimmed
+            # per-strategy view never reaches this path.
+            try:
+                candidate = inspector.inspect(principal)
+                report = inspector.position_report(candidate)
+            except Exception as exc:
+                code = getattr(exc, "code", None)
+                if type(code) is not str or not code.isupper():
+                    code = "RECONCILIATION_UNAVAILABLE"
+                raise GatewayServiceError(code) from None
+            return MappingProxyType({"report": report})
 
         if operation == "account.instrument_metadata":
             _reject_unknown_arguments(arguments, frozenset({"instrument_id", "exchange_id"}))
@@ -542,10 +591,26 @@ class GatewayReadService:
             )
             return MappingProxyType({"consumer_progress": _consumer_progress_result(progress)})
 
-        if operation == "account.snapshot":
+        if operation in {"account.snapshot", "account.snapshot.typed"}:
             _reject_unknown_arguments(arguments, frozenset({"limit"}))
             limit = arguments.get("limit", _DEFAULT_READ_LIMIT)
             _validate_read_arguments(None, limit, cursor_allowed=False)
+            if operation == "account.snapshot.typed" and (
+                self._state_worker is None
+                or journal_strategy_scope != self._state_worker.state_scope
+                or (
+                    scope.strategy_ref is None
+                    and account.account_read_strategy_scope != self._state_worker.state_scope
+                )
+                or (
+                    scope.strategy_ref is not None
+                    and (
+                        scope.strategy_ref not in account.shared_fact_strategy_refs
+                        or account.shared_account_facts_scope != self._state_worker.state_scope
+                    )
+                )
+            ):
+                raise GatewayServiceError("ACCOUNT_WIDE_READ_NOT_CONFIGURED")
             batch = self._journal.read_after(
                 principal,
                 account.journal_account_scope,
@@ -553,11 +618,14 @@ class GatewayReadService:
                 cursor=None,
                 limit=limit,  # type: ignore[arg-type]  # validated above.
             )
-            return self._with_state_status(
+            result = self._with_state_status(
                 _batch_result(batch, include_snapshot_source=True),
-                operation=operation,
+                operation="account.snapshot",
                 strategy_scope=journal_strategy_scope,
             )
+            if operation == "account.snapshot":
+                return result
+            return _typed_account_snapshot_result(result)
 
         _reject_unknown_arguments(arguments, frozenset())
         batch = self._journal.read_after(
@@ -863,6 +931,46 @@ def _snapshot_result(
             "captured_at": snapshot.captured_at,
         }
     )
+
+
+def _typed_account_snapshot_result(result: Mapping[str, object]) -> Mapping[str, object]:
+    """Convert a checked canonical account baseline without changing its cursor.
+
+    Account-wide ACL, worker binding and state freshness are checked by the
+    caller. A typed value remains a Gateway declaration, not provider proof.
+    """
+    from bt_api_base.wire_codec_v1 import (
+        WireCodecError,
+        account_observation_to_typed_map,
+    )
+
+    status = result.get("state_status")
+    snapshot = result.get("snapshot")
+    if not isinstance(status, Mapping) or status.get("ready") is not True:
+        raise GatewayServiceError("SESSION_NOT_READY")
+    if not isinstance(snapshot, Mapping):
+        raise GatewayServiceError("ACCOUNT_BASELINE_UNAVAILABLE")
+    payload = snapshot.get("payload")
+    if not isinstance(payload, Mapping):
+        raise GatewayServiceError("ACCOUNT_BASELINE_UNAVAILABLE")
+    try:
+        source_version = payload["schema_version"]
+        observation = AccountObservation.from_dict(payload["observation"])
+        typed = account_observation_to_typed_map(observation)
+    except (KeyError, TypeError, ValueError, WireCodecError):
+        raise GatewayServiceError("ACCOUNT_TYPED_OBSERVATION_INVALID") from None
+    typed_payload = {
+        "schema_id": "sdk.account.state.typed",
+        "schema_version": 1,
+        "source_schema_version": source_version,
+        "session_generation": payload["session_generation"],
+        "observation": typed,
+    }
+    copied_snapshot = dict(snapshot)
+    copied_snapshot["payload"] = typed_payload
+    copied = dict(result)
+    copied["snapshot"] = copied_snapshot
+    return MappingProxyType(copied)
 
 
 def _state_result_matches_worker(
