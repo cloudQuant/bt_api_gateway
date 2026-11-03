@@ -276,6 +276,161 @@ class GatewayEventJournal:
             )
         return event
 
+    def append_execution_fact(
+        self,
+        account_scope: str,
+        strategy_scope: str,
+        event_id: str,
+        kind: str,
+        payload: Mapping[str, Any],
+        *,
+        fact_digest: str,
+        bind_order_route: str | None = None,
+        observed_at: float | None = None,
+    ) -> tuple[GatewayAccountEvent, bool]:
+        """Append one execution fact once; return ``(event, created)``.
+
+        ``event_id`` is a provider fact id (iteration 60, R2-C). A redelivered
+        fact with the same ``fact_digest`` (the payload's own field) is a
+        duplicate and returns the original event with ``created=False`` even
+        when its observation time differs; another digest under the same id is
+        refused with ``EXECUTION_FACT_CONFLICT``. ``bind_order_route`` records
+        in the same transaction that this provider order id routes to
+        ``strategy_scope`` (a different earlier route is a conflict).
+        """
+        if type(fact_digest) is not str or payload.get("fact_digest") != fact_digest:
+            raise GatewayEventJournalError(
+                "EXECUTION_FACT_INVALID", "fact digest does not match the payload"
+            )
+        event_time = self._clock() if observed_at is None else observed_at
+        _require_time(event_time, "observed_at")
+        candidate = GatewayAccountEvent(
+            account_scope=account_scope,
+            strategy_scope=strategy_scope,
+            sequence=1,
+            event_id=event_id,
+            kind=kind,
+            payload=payload,
+            observed_at=event_time,
+        )
+        fingerprint = _event_fingerprint(candidate)
+        with self._transaction() as connection:
+            self._reject_managed_view_write(connection, account_scope, strategy_scope)
+            self._reject_state_stream(connection, account_scope, strategy_scope)
+            if bind_order_route is not None:
+                _require_text(bind_order_route, "bind_order_route")
+                route = connection.execute(
+                    """
+                    SELECT strategy_scope FROM gateway_execution_order_routes
+                    WHERE account_scope = ? AND order_id = ?
+                    """,
+                    (account_scope, bind_order_route),
+                ).fetchone()
+                if route is None:
+                    connection.execute(
+                        """
+                        INSERT INTO gateway_execution_order_routes
+                            (account_scope, order_id, strategy_scope)
+                        VALUES (?, ?, ?)
+                        """,
+                        (account_scope, bind_order_route, strategy_scope),
+                    )
+                elif str(route["strategy_scope"]) != strategy_scope:
+                    raise GatewayEventJournalError(
+                        "EXECUTION_ROUTE_CONFLICT", "order id is routed to another stream"
+                    )
+            existing = connection.execute(
+                """
+                SELECT e.* FROM gateway_event_dedupe d
+                JOIN gateway_events e
+                  ON e.account_scope = d.account_scope
+                 AND e.strategy_scope = d.strategy_scope
+                 AND e.sequence = d.sequence
+                WHERE d.account_scope = ? AND d.strategy_scope = ? AND d.event_id = ?
+                """,
+                (account_scope, strategy_scope, event_id),
+            ).fetchone()
+            if existing is None and connection.execute(
+                """
+                SELECT 1 FROM gateway_event_dedupe
+                WHERE account_scope = ? AND strategy_scope = ? AND event_id = ?
+                """,
+                (account_scope, strategy_scope, event_id),
+            ).fetchone():
+                # Compacted under a snapshot: the fact is known, its content is not.
+                raise GatewayEventJournalError(
+                    "EXECUTION_FACT_COMPACTED", "fact id was compacted and cannot be compared"
+                )
+            if existing is not None:
+                stored = self._event_from_row(existing)
+                if stored.kind != kind or stored.payload.get("fact_digest") != fact_digest:
+                    raise GatewayEventJournalError(
+                        "EXECUTION_FACT_CONFLICT", "fact id was reused with different content"
+                    )
+                return stored, False
+            sequence_row = connection.execute(
+                """
+                SELECT latest_sequence FROM gateway_event_sequences
+                WHERE account_scope = ? AND strategy_scope = ?
+                """,
+                (account_scope, strategy_scope),
+            ).fetchone()
+            sequence = self._next_sequence(
+                int(sequence_row["latest_sequence"]) if sequence_row else 0
+            )
+            connection.execute(
+                """
+                INSERT INTO gateway_event_sequences
+                    (account_scope, strategy_scope, latest_sequence)
+                VALUES (?, ?, ?)
+                ON CONFLICT(account_scope, strategy_scope)
+                DO UPDATE SET latest_sequence = excluded.latest_sequence
+                """,
+                (account_scope, strategy_scope, sequence),
+            )
+            event = replace(candidate, sequence=sequence)
+            connection.execute(
+                """
+                INSERT INTO gateway_events (
+                    account_scope, strategy_scope, sequence, event_id, kind,
+                    payload_json, observed_at, fingerprint
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    account_scope,
+                    strategy_scope,
+                    sequence,
+                    event_id,
+                    kind,
+                    event.payload_json,
+                    event_time,
+                    fingerprint,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO gateway_event_dedupe (
+                    account_scope, strategy_scope, event_id, sequence, fingerprint, observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (account_scope, strategy_scope, event_id, sequence, fingerprint, event_time),
+            )
+        return event, True
+
+    def execution_order_route(self, account_scope: str, order_id: str) -> str | None:
+        """Return the execution stream a provider order id was routed to, if any."""
+        _require_text(account_scope, "account_scope")
+        _require_text(order_id, "order_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT strategy_scope FROM gateway_execution_order_routes
+                WHERE account_scope = ? AND order_id = ?
+                """,
+                (account_scope, order_id),
+            ).fetchone()
+        return None if row is None else str(row["strategy_scope"])
+
     def capture_snapshot(
         self,
         account_scope: str,
@@ -2399,6 +2554,12 @@ class GatewayEventJournal:
                     account_key_digest TEXT NOT NULL,
                     source_cursor INTEGER NOT NULL CHECK (source_cursor > 0),
                     PRIMARY KEY (account_scope, source_scope)
+                );
+                CREATE TABLE IF NOT EXISTS gateway_execution_order_routes (
+                    account_scope TEXT NOT NULL,
+                    order_id TEXT NOT NULL,
+                    strategy_scope TEXT NOT NULL,
+                    PRIMARY KEY (account_scope, order_id)
                 );
                 CREATE TABLE IF NOT EXISTS gateway_account_views (
                     account_scope TEXT NOT NULL,

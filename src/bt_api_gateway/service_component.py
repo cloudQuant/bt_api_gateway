@@ -101,6 +101,10 @@ SUPPORTED_OPERATIONS = frozenset(
         "account.snapshot.typed",
     }
 )
+#: Operations that accept ``stream="execution"`` (iteration 60, R2-C).
+_EXECUTION_STREAM_OPERATIONS = frozenset(
+    {"account.head", "account.read_after", "account.ack", "account.progress"}
+)
 #: Opt-in, outside the default set: advertised only when the trusted host
 #: assembled a reconciliation inspector (iteration 60, acceptance G2).
 RECONCILIATION_CUT_OPERATION = "account.reconciliation_cut"
@@ -194,6 +198,11 @@ class GatewayServiceAccountScope:
     account_read_strategy_scope: str | None = None
     shared_account_facts_scope: str | None = None
     shared_fact_strategy_refs: Iterable[str] = field(default_factory=frozenset)
+    #: Iteration 60 R2-C: ``strategy_ref`` -> that strategy's execution event
+    #: stream (terminal orders and fills), selected with ``stream="execution"``.
+    execution_scope_map: Mapping[str, str] = field(default_factory=dict)
+    #: Execution stream for an account-wide (``strategy_ref=None``) request.
+    account_execution_scope: str | None = None
 
     def __post_init__(self) -> None:
         _require_wire_text(self.account_ref, "INVALID_ACCOUNT_SCOPE")
@@ -233,8 +242,30 @@ class GatewayServiceAccountScope:
             if account_strategy_scope in copied.values():
                 raise GatewayServiceError("AMBIGUOUS_ACCOUNT_READ_SCOPE")
 
+        if not isinstance(self.execution_scope_map, Mapping):
+            raise GatewayServiceError("INVALID_EXECUTION_SCOPE_MAP")
+        executions: dict[str, str] = {}
+        for strategy_ref, execution_scope in self.execution_scope_map.items():
+            _require_wire_text(strategy_ref, "INVALID_EXECUTION_SCOPE_MAP")
+            _require_wire_text(execution_scope, "INVALID_EXECUTION_SCOPE_MAP")
+            executions[strategy_ref] = execution_scope
+        account_execution = self.account_execution_scope
+        if account_execution is not None:
+            _require_wire_text(account_execution, "INVALID_EXECUTION_SCOPE_MAP")
+        execution_scopes = list(executions.values()) + (
+            [] if account_execution is None else [account_execution]
+        )
+        other_scopes = set(copied.values()) | {
+            value for value in (shared_scope, account_strategy_scope) if value is not None
+        }
+        if len(set(execution_scopes)) != len(execution_scopes) or set(execution_scopes) & (
+            other_scopes
+        ):
+            raise GatewayServiceError("AMBIGUOUS_EXECUTION_SCOPE_MAP")
+
         object.__setattr__(self, "strategy_scope_map", MappingProxyType(copied))
         object.__setattr__(self, "shared_fact_strategy_refs", shared_refs)
+        object.__setattr__(self, "execution_scope_map", MappingProxyType(executions))
 
 
 class GatewayReadService:
@@ -372,6 +403,23 @@ class GatewayReadService:
             raise GatewayServiceError("UNKNOWN_PRINCIPAL")
         if type(scope) is not WireScope:
             raise GatewayServiceError("INVALID_SCOPE")
+        if (
+            isinstance(arguments, Mapping)
+            and "stream" in arguments
+            and operation in _EXECUTION_STREAM_OPERATIONS
+        ):
+            if any(type(key) is not str for key in arguments):
+                raise GatewayServiceError("INVALID_ARGUMENTS")
+            return self._handle_execution_stream(
+                operation,
+                principal_ref=principal_ref,
+                principal=principal,
+                scope=scope,
+                account=self._resolve_account(scope),
+                arguments=arguments,
+                identity=identity,
+                result_fits=result_fits,
+            )
         account, journal_strategy_scope = self._resolve_scope(scope)
         if not isinstance(arguments, Mapping):
             raise GatewayServiceError("INVALID_ARGUMENTS")
@@ -668,6 +716,119 @@ class GatewayReadService:
             )
         return MappingProxyType(result)
 
+    def _handle_execution_stream(
+        self,
+        operation: str,
+        *,
+        principal_ref: str,
+        principal: GatewayPrincipal,
+        scope: WireScope,
+        account: GatewayServiceAccountScope,
+        arguments: Mapping[str, object],
+        identity: WireIdentity | None,
+        result_fits: Callable[[Mapping[str, object]], bool] | None,
+    ) -> Mapping[str, object]:
+        """Serve one strategy's execution event stream (iteration 60, R2-C).
+
+        The stream is resolved only from the server-owned ``execution_scope_map``
+        (the wire scope's ``strategy_ref``) and the journal ACL applies as for
+        every stream. Replies carry no account ``state_status``: execution
+        events are an event log, not the account state baseline.
+        """
+
+        if arguments.get("stream") != "execution":
+            raise GatewayServiceError("UNKNOWN_STREAM")
+        if scope.strategy_ref is None:
+            execution_scope = account.account_execution_scope
+        else:
+            execution_scope = account.execution_scope_map.get(scope.strategy_ref)
+        if execution_scope is None:
+            raise GatewayServiceError("EXECUTION_STREAM_NOT_CONFIGURED")
+        rest = {key: value for key, value in arguments.items() if key != "stream"}
+        if operation == "account.head":
+            _reject_unknown_arguments(rest, frozenset())
+            batch = self._journal.read_after(
+                principal, account.journal_account_scope, execution_scope, cursor=None, limit=1
+            )
+            return MappingProxyType({"latest_cursor": batch.latest_cursor})
+        if operation == "account.read_after":
+            _reject_unknown_arguments(
+                rest, frozenset({"cursor", "limit", "track_delivery", "stream_epoch"})
+            )
+            cursor = rest.get("cursor")
+            limit = rest.get("limit", _DEFAULT_READ_LIMIT)
+            _validate_read_arguments(cursor, limit, cursor_allowed=True)
+            if rest.get("track_delivery", False) is not True:
+                if "stream_epoch" in rest or "track_delivery" in rest:
+                    raise GatewayServiceError("INVALID_ARGUMENTS")
+                batch = self._journal.read_after(
+                    principal,
+                    account.journal_account_scope,
+                    execution_scope,
+                    cursor=cursor,  # type: ignore[arg-type]  # validated above.
+                    limit=limit,  # type: ignore[arg-type]  # validated above.
+                )
+                return _batch_result(batch, include_snapshot_source=False)
+            if result_fits is not None and not callable(result_fits):
+                raise GatewayServiceError("INVALID_RESULT_FITNESS_CHECK")
+            consumer_ref = self._consumer_ref(
+                identity,
+                principal_ref=principal_ref,
+                principal=principal,
+                scope=scope,
+                account=account,
+                journal_strategy_scope=execution_scope,
+            )
+
+            def result_of(batch: GatewayReadBatch, progress: GatewayConsumerProgress):
+                result = dict(_batch_result(batch, include_snapshot_source=False))
+                result["consumer_progress"] = _consumer_progress_result(progress)
+                return MappingProxyType(result)
+
+            def page_fits(batch: GatewayReadBatch, progress: GatewayConsumerProgress) -> bool:
+                fits = result_fits(result_of(batch, progress))  # type: ignore[misc]
+                if type(fits) is not bool:
+                    raise GatewayServiceError("INVALID_RESULT_FITNESS_RESULT")
+                return fits
+
+            batch, progress = self._journal.read_for_consumer(
+                principal,
+                account.journal_account_scope,
+                execution_scope,
+                consumer_ref,
+                cursor=cursor,  # type: ignore[arg-type]  # validated above.
+                limit=limit,  # type: ignore[arg-type]  # validated above.
+                stream_epoch=cast("str | None", rest.get("stream_epoch")),
+                **({} if result_fits is None else {"page_fits": page_fits}),
+            )
+            return result_of(batch, progress)
+        consumer_ref = self._consumer_ref(
+            identity,
+            principal_ref=principal_ref,
+            principal=principal,
+            scope=scope,
+            account=account,
+            journal_strategy_scope=execution_scope,
+        )
+        if operation == "account.progress":
+            _reject_unknown_arguments(rest, frozenset())
+            progress = self._journal.consumer_progress(
+                principal, account.journal_account_scope, execution_scope, consumer_ref
+            )
+            return MappingProxyType({"consumer_progress": _consumer_progress_result(progress)})
+        _reject_unknown_arguments(rest, frozenset({"stream_epoch", "cursor"}))
+        if set(rest) != {"stream_epoch", "cursor"}:
+            raise GatewayServiceError("INVALID_ARGUMENTS")
+        progress = self._journal.acknowledge(
+            principal,
+            account.journal_account_scope,
+            execution_scope,
+            consumer_ref,
+            stream_epoch=cast("str", rest["stream_epoch"]),
+            cursor=cast("int", rest["cursor"]),
+        )
+        return MappingProxyType({"consumer_progress": _consumer_progress_result(progress)})
+
     def _consumer_ref(
         self,
         identity: WireIdentity | None,
@@ -801,6 +962,25 @@ class GatewayReadService:
             state_status=state_status,
             source_cursor=source_cursor,
         )
+
+    def _resolve_account(self, scope: WireScope) -> GatewayServiceAccountScope:
+        """Resolve only the account of ``scope`` (same checks as ``_resolve_scope``)."""
+        if (
+            scope.account_ref is None
+            or scope.account_refs
+            or (scope.strategy_ref is None and scope.run_id is not None)
+            or scope.manual_book_ref is not None
+            or scope.portfolio_ref is not None
+            or scope.group_id is not None
+            or scope.leg_id is not None
+        ):
+            raise GatewayServiceError("ACCOUNT_SCOPE_REQUIRED")
+        account = self._accounts.get(scope.account_ref)
+        if account is None:
+            raise GatewayServiceError("UNKNOWN_ACCOUNT")
+        if scope.execution_domain_ref != account.execution_domain_ref:
+            raise GatewayServiceError("EXECUTION_DOMAIN_DENIED")
+        return account
 
     def _resolve_scope(self, scope: WireScope) -> tuple[GatewayServiceAccountScope, str]:
         if (

@@ -53,6 +53,12 @@ from .event_journal import (
     GatewayEventJournal,
     GatewayEventJournalError,
 )
+from .execution_event_publisher import (
+    MAX_EXECUTION_BATCH,
+    GatewayExecutionEventError,
+    GatewayExecutionEventPublisher,
+    GatewayExecutionPublishResult,
+)
 from .router import GatewayCommandKind, GatewayPrincipal
 from .session_guard import LocalAccountSessionGuard, LocalAccountSessionGuardError
 
@@ -176,6 +182,7 @@ class GatewayAccountSessionWorker:
         clock: Callable[[], float] = time.time,
         monotonic_clock: Callable[[], float] = time.monotonic,
         clock_resolution_seconds: tuple[float, float] | None = None,
+        execution_publisher: GatewayExecutionEventPublisher | None = None,
     ) -> None:
         if type(account_key) is not AccountKey:
             raise GatewayAccountSessionWorkerError("INVALID_ACCOUNT_KEY")
@@ -216,6 +223,24 @@ class GatewayAccountSessionWorker:
         wall_resolution, monotonic_resolution = _clock_resolutions(
             clock, monotonic_clock, clock_resolution_seconds
         )
+        if execution_publisher is not None:
+            # Iteration 60 R2-C: typed terminal-order/per-fill observations.
+            if (
+                type(execution_publisher) is not GatewayExecutionEventPublisher
+                or execution_publisher.journal is not journal
+                or execution_publisher.account_key != account_key
+                or execution_publisher._account_scope != journal_account_scope
+            ):
+                raise GatewayAccountSessionWorkerError("INVALID_EXECUTION_PUBLISHER")
+            reserved = {state_scope, *(policy.view_scope for policy in canonical_view_policies)}
+            if execution_publisher.policy.scopes & reserved:
+                raise GatewayAccountSessionWorkerError("EXECUTION_SCOPE_CONFLICT")
+            if not callable(getattr(provider, "read_execution_observations", None)) or not callable(
+                getattr(provider, "confirm_execution_observations", None)
+            ):
+                raise GatewayAccountSessionWorkerError("PROVIDER_EXECUTION_EVENTS_UNAVAILABLE")
+        self._execution_publisher = execution_publisher
+        self._execution_status: str | None = None if execution_publisher is None else "idle"
         self._refresh_interval = _positive_seconds(refresh_interval_seconds)
         self._max_staleness = _positive_seconds(max_staleness_seconds)
         self._request_timeout = _positive_seconds(request_timeout_seconds)
@@ -451,15 +476,88 @@ class GatewayAccountSessionWorker:
         return self._refresh_impl()
 
     def maintain(self) -> None:
-        """Refresh once when due; this is the sole periodic query path."""
+        """Refresh once when due; this is the sole periodic query path.
+
+        With an execution publisher, every call also drains the provider's
+        pending execution observations into the account journal. A failed
+        drain is kept in ``execution_status`` and retried on the next call;
+        it never changes account-state readiness.
+        """
 
         self._check_owner()
         if self._state not in {"connected", "ready", "refresh_failed"}:
             return
         now = self._monotonic_now()
         due = self._next_refresh_monotonic
-        if due is None or now >= due:
-            self.refresh()
+        try:
+            if due is None or now >= due:
+                self.refresh()
+        finally:
+            if self._execution_publisher is not None and self._state in {
+                "connected",
+                "ready",
+                "refresh_failed",
+            }:
+                try:
+                    self.publish_execution_events()
+                except GatewayAccountSessionWorkerError:
+                    pass  # recorded in execution_status; retried next call
+
+    @property
+    def execution_status(self) -> str | None:
+        """``None`` (no publisher), ``idle``, ``published`` or ``failed:<CODE>``."""
+
+        return self._execution_status
+
+    def publish_execution_events(self) -> GatewayExecutionPublishResult | None:
+        """Drain pending provider execution observations into the journal once.
+
+        The provider keeps an observation until ``confirm_execution_observations``
+        is called after every append of the batch committed; a crash or failure
+        before that redelivers it, and the journal's fact ids make the
+        republication idempotent. Returns ``None`` without a publisher.
+        """
+
+        self._check_owner()
+        publisher = self._execution_publisher
+        if publisher is None:
+            return None
+        generation = self._generation
+        try:
+            if generation is None or self._state not in {"connected", "ready", "refresh_failed"}:
+                raise GatewayAccountSessionWorkerError("SESSION_NOT_ACTIVE")
+            self._assert_current_generation_owned(generation)
+            try:
+                items = self._provider.read_execution_observations(  # type: ignore[attr-defined]
+                    generation=generation,
+                    timeout=self._request_timeout,
+                    limit=MAX_EXECUTION_BATCH,
+                )
+            except Exception:
+                raise GatewayAccountSessionWorkerError("EXECUTION_EVENTS_READ_FAILED") from None
+            self._assert_current_generation_owned(generation)
+            if type(items) is not tuple or len(items) > MAX_EXECUTION_BATCH:
+                raise GatewayAccountSessionWorkerError("EXECUTION_EVENTS_INVALID")
+            if not items:
+                self._execution_status = "idle"
+                return GatewayExecutionPublishResult()
+            try:
+                result = publisher.publish(items)
+            except GatewayExecutionEventError as error:
+                raise GatewayAccountSessionWorkerError(error.code) from None
+            self._assert_current_generation_owned(generation)
+            try:
+                confirm = getattr(self._provider, "confirm_execution_observations")
+                confirmed = confirm(generation=generation, count=len(items))
+            except Exception:
+                raise GatewayAccountSessionWorkerError("EXECUTION_EVENTS_CONFIRM_FAILED") from None
+            if confirmed is not None:
+                raise GatewayAccountSessionWorkerError("EXECUTION_EVENTS_CONFIRM_FAILED")
+        except GatewayAccountSessionWorkerError as error:
+            self._execution_status = "failed:" + error.code
+            raise
+        self._execution_status = "published"
+        return result
 
     def recover(self) -> None:
         """Explicitly close and release before connecting under a fresh generation."""
