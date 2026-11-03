@@ -50,6 +50,7 @@ from bt_api_base.service_protocol import (
     WireRole,
     WireScope,
     encode_envelope,
+    envelope_to_wire_mapping,
 )
 
 MARKET_READ_AFTER_BOUNDED_OPERATION = "market.read_after_bounded"
@@ -1857,7 +1858,8 @@ def _parse_history_request(value: Mapping[str, object]) -> MarketHistoryRequest:
 
 def _envelope_mapping(envelope: WireEnvelope) -> Mapping[str, object]:
     try:
-        value = json.loads(encode_envelope(envelope, max_bytes=MAX_WIRE_MESSAGE_BYTES))
+        encode_envelope(envelope, max_bytes=MAX_WIRE_MESSAGE_BYTES)  # bounded and valid
+        value = envelope_to_wire_mapping(envelope)
     except Exception:
         raise GatewayMarketServiceError("INVALID_REPLAY_ENVELOPE") from None
     return MappingProxyType(value)
