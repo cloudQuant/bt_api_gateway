@@ -177,6 +177,20 @@ class GatewayReconciliationInspector:
             weakref.WeakKeyDictionary()
         )
 
+    def revoke_principal(self, principal_id: str) -> None:
+        """Drop ``principal_id`` from the server allowlist (runtime revocation).
+
+        Its issued handles stop being current at their next recheck
+        (``PRINCIPAL_DENIED``); evidence already returned keeps only its own
+        lease and is never extended.
+        """
+        self._check_owner()
+        if self._principals.pop(principal_id, None) is None:
+            raise GatewayReconciliationInspectionError("PRINCIPAL_DENIED")
+        for candidate, entry in list(self._issued.items()):
+            if entry[0].principal_id == principal_id:
+                self._issued.pop(candidate, None)
+
     def inspect(self, principal: GatewayPrincipal) -> GatewayReconciliationCandidate:
         """Inspect only for the exact server-registered principal object."""
         self._check_owner()

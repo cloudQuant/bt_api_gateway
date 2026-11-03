@@ -257,8 +257,10 @@ class GatewayMarketHub:
     per-peer enforcing transport. Topic filters alone are never authorization.
     The endpoint entitlement is separate from registration leases: pruning
     a registration releases upstream refs but does not revoke data access
-    from an already-authorized raw SUB socket. Revocation requires controlled
-    publisher shutdown/restart with a new audience map. Provider calls and
+    from an already-authorized raw SUB socket. Runtime revocation
+    (``revoke_principal_keys``) therefore needs a partitioned publisher bound
+    with a ``regrant`` callback that rebuilds the enforcing transport with the
+    narrower grants; see that method for its exact guarantees. Provider calls and
     mutating operations run on the constructing thread. A fresh opaque
     generation accompanies each provider acquisition; delayed events from an
     older acquisition are rejected before replay or publication.
@@ -366,6 +368,24 @@ class GatewayMarketHub:
         self._streams: dict[MarketSubscriptionKey, _MarketStream] = {}
         self._stream_by_id: dict[str, MarketSubscriptionKey] = {}
         self._registration_ref_count = 0
+        # Runtime authorization (iteration 60, G2): a monotonic generation,
+        # each registration's principal, and per (principal, key) re-grant
+        # floors ``(epoch, sequence)``: events at or below a floor were
+        # published while that principal was not authorized for the key.
+        self._authorization_generation = 1
+        self._registration_principals: dict[tuple[MarketSubscriptionKey, str], str] = {}
+        self._grant_floors: dict[tuple[str, MarketSubscriptionKey], tuple[str, int]] = {}
+        self._regrant: Callable[[Mapping[str, frozenset[str]]], object] | None = None
+        self._delivery_suspended = False
+        self._authorization_diagnostics = (
+            {
+                "authorization_revocations": 0,
+                "authorization_grants": 0,
+                "revoked_registrations": 0,
+                "authorization_floor_gaps": 0,
+                "publisher_regrant_failures": 0,
+            }
+        )
         for key in copied_keys:
             if key.stream_id in self._stream_by_id:
                 raise GatewayMarketHubError("STREAM_ID_COLLISION")
@@ -519,13 +539,19 @@ class GatewayMarketHub:
         publisher: Callable[[WireEnvelope], object],
         *,
         principal_stream_grants: Mapping[str, Collection[str]],
+        regrant: Callable[[Mapping[str, frozenset[str]]], object] | None = None,
     ) -> None:
         """Bind a trusted host's per-peer transport with the exact hub ACL.
 
         This is a trusted local composition interface, not an authentication
         proof. The host is responsible for constructing a transport that
         actually enforces these grants before invoking this method.
+        ``regrant(principal_stream_grants)``, when supplied, must make that
+        transport enforce new grants (rebuilding peer authorization) and
+        return ``True`` only once it does; it enables runtime revocation.
         """
+        if regrant is not None and not callable(regrant):
+            raise GatewayMarketHubError("PARTITIONED_PUBLISHER_GRANTS_INVALID")
 
         expected = {
             principal: frozenset(key.stream_id for key in allowed)
@@ -543,6 +569,162 @@ class GatewayMarketHub:
         if supplied != expected:
             raise GatewayMarketHubError("PARTITIONED_PUBLISHER_GRANTS_INVALID")
         self._set_publisher(publisher)
+        self._regrant = regrant
+
+    # -- runtime authorization (iteration 60, acceptance G2) -----------------
+
+    @property
+    def authorization_diagnostics(self) -> Mapping[str, int]:
+        """Finite counters for runtime grant changes and their enforcement."""
+        return MappingProxyType(dict(self._authorization_diagnostics))
+
+    @property
+    def authorization_generation(self) -> int:
+        """Monotonic generation; it increases on every runtime grant change."""
+        return self._authorization_generation
+
+    def principal_stream_grants(self) -> Mapping[str, frozenset[str]]:
+        """The current ``principal -> stream ids`` grants the transport must enforce."""
+        return MappingProxyType(
+            {
+                principal: frozenset(key.stream_id for key in allowed)
+                for principal, allowed in self._principal_allowed_keys.items()
+            }
+        )
+
+    def grant_floor(
+        self, principal_ref: str, key: MarketSubscriptionKey
+    ) -> tuple[str, int] | None:
+        """``(epoch, sequence)`` below which ``principal_ref`` may not read ``key``."""
+        return self._grant_floors.get((principal_ref, key))
+
+    def revoke_principal_keys(
+        self,
+        principal_ref: str,
+        keys: Collection[MarketSubscriptionKey] | None = None,
+    ) -> Mapping[str, object]:
+        """Revoke ``keys`` (default: all) from a running principal.
+
+        In order: the ACL is narrowed (every later subscribe, head, snapshot
+        and read_after of those keys is refused), the principal's
+        registrations on them are dropped (releasing an upstream nobody else
+        holds), and the bound ``regrant`` callback rebuilds the enforcing
+        transport so the principal's open SUB sockets stop receiving them.
+        If ``regrant`` is missing or fails, publication is suspended for
+        every stream (fail closed) until ``regrant`` succeeds through
+        ``resume_delivery``. Frames already delivered, or queued in a peer's
+        socket before the rebuild, cannot be recalled: a receiver must drop
+        frames it receives after learning of the revocation and resync.
+        """
+        self._check_owner()
+        self._ensure_open()
+        allowed = self._principal_allowed_keys.get(principal_ref)
+        if allowed is None:
+            raise GatewayMarketHubError("UNKNOWN_PRINCIPAL")
+        if not self._requires_partitioned_audience:
+            raise GatewayMarketHubError("REVOCATION_REQUIRES_PARTITIONED_PUBLISHER")
+        revoked = frozenset(allowed) if keys is None else frozenset(keys)
+        if any(type(key) is not MarketSubscriptionKey for key in revoked):
+            raise GatewayMarketHubError("INVALID_MARKET_KEY")
+        revoked &= allowed
+        acl = dict(self._principal_allowed_keys)
+        acl[principal_ref] = frozenset(allowed - revoked)
+        self._principal_allowed_keys = MappingProxyType(acl)
+        self._authorization_generation += 1
+        self._authorization_diagnostics["authorization_revocations"] += 1
+        dropped = 0
+        for key in revoked:
+            stream = self._streams[key]
+            self._grant_floors.pop((principal_ref, key), None)
+            owned = {
+                registration
+                for registration in stream.registrations
+                if self._registration_principals.get((key, registration)) == principal_ref
+            }
+            for registration in owned:
+                stream.registrations.discard(registration)
+                self._registration_principals.pop((key, registration), None)
+                self._registration_ref_count -= 1
+                dropped += 1
+            if not stream.registrations and stream.handle is not None:
+                self._attempt_release(stream)
+        self._authorization_diagnostics["revoked_registrations"] += dropped
+        transport = self._apply_regrant()
+        return MappingProxyType(
+            {
+                "principal_ref": principal_ref,
+                "authorization_generation": self._authorization_generation,
+                "revoked_stream_ids": tuple(sorted(key.stream_id for key in revoked)),
+                "dropped_registrations": dropped,
+                "transport_enforced": transport,
+            }
+        )
+
+    def grant_principal_keys(
+        self, principal_ref: str, keys: Collection[MarketSubscriptionKey]
+    ) -> Mapping[str, object]:
+        """Re-grant ``keys``; history published while revoked stays unreadable.
+
+        Each re-granted key records a floor at the stream's current
+        ``(epoch, head)``: ``read_after`` below it reports an
+        ``authorization_floor`` gap and ``snapshot`` hides an older event, so
+        the principal must resync from the floor, never from data it was not
+        authorized for. The principal must subscribe again.
+        """
+        self._check_owner()
+        self._ensure_open()
+        allowed = self._principal_allowed_keys.get(principal_ref)
+        if allowed is None:
+            raise GatewayMarketHubError("UNKNOWN_PRINCIPAL")
+        if not self._requires_partitioned_audience:
+            raise GatewayMarketHubError("REVOCATION_REQUIRES_PARTITIONED_PUBLISHER")
+        granted = frozenset(keys)
+        if not granted or any(
+            type(key) is not MarketSubscriptionKey or key not in self._key_universe
+            for key in granted
+        ):
+            raise GatewayMarketHubError("INVALID_MARKET_KEY")
+        added = granted - allowed
+        acl = dict(self._principal_allowed_keys)
+        acl[principal_ref] = frozenset(allowed | granted)
+        self._principal_allowed_keys = MappingProxyType(acl)
+        self._authorization_generation += 1
+        self._authorization_diagnostics["authorization_grants"] += 1
+        for key in added:
+            stream = self._streams[key]
+            self._grant_floors[(principal_ref, key)] = (stream.epoch, stream.sequence)
+        transport = self._apply_regrant()
+        return MappingProxyType(
+            {
+                "principal_ref": principal_ref,
+                "authorization_generation": self._authorization_generation,
+                "granted_stream_ids": tuple(sorted(key.stream_id for key in added)),
+                "transport_enforced": transport,
+            }
+        )
+
+    def resume_delivery(self) -> bool:
+        """Retry ``regrant`` after a failure; delivery resumes only on success."""
+        self._check_owner()
+        return self._apply_regrant()
+
+    @property
+    def delivery_suspended(self) -> bool:
+        return self._delivery_suspended
+
+    def _apply_regrant(self) -> bool:
+        regrant = self._regrant
+        grants = self.principal_stream_grants()
+        ok = False
+        if regrant is not None:
+            try:
+                ok = regrant(grants) is True
+            except Exception:
+                ok = False
+        if not ok:
+            self._authorization_diagnostics["publisher_regrant_failures"] += 1
+        self._delivery_suspended = not ok
+        return ok
 
     def _set_publisher(self, publisher: Callable[[WireEnvelope], object]) -> None:
         self._check_owner()
@@ -646,6 +828,7 @@ class GatewayMarketHub:
         # Reuse a retained handle after an uncertain failed stop; never start a
         # second upstream stream while the original handle is still owned.
         stream.registrations.add(registration_id)
+        self._registration_principals[(key, registration_id)] = principal_ref
         self._registration_ref_count += 1
         stream.pending_release = False
         return self._subscription_result(
@@ -670,6 +853,7 @@ class GatewayMarketHub:
             raise GatewayMarketHubError("PROVIDER_SUBSCRIBE_OUTCOME_UNKNOWN", retryable=True)
         if registration_id in stream.registrations:
             stream.registrations.remove(registration_id)
+            self._registration_principals.pop((key, registration_id), None)
             self._registration_ref_count -= 1
         if (
             not stream.registrations
@@ -712,6 +896,8 @@ class GatewayMarketHub:
             stale = stream.registrations - active
             if stale:
                 stream.registrations.difference_update(stale)
+                for registration in stale:
+                    self._registration_principals.pop((stream.key, registration), None)
                 pruned += len(stale)
                 self._registration_ref_count -= len(stale)
             if (
@@ -862,6 +1048,10 @@ class GatewayMarketHub:
         publisher = self._publisher
         if publisher is None:
             raise GatewayMarketHubError("PUBLISHER_NOT_CONFIGURED")
+        if self._delivery_suspended:
+            # A revocation whose transport rebuild is unconfirmed: no frame may
+            # reach a socket that might still carry the revoked grants.
+            raise GatewayMarketHubError("DELIVERY_SUSPENDED", retryable=True)
         if not isinstance(data, Mapping) or any(type(name) is not str for name in data):
             raise GatewayMarketHubError("INVALID_EVENT_DATA")
         _validate_utc_timestamp(observed_at_utc, "INVALID_OBSERVED_AT")
@@ -912,11 +1102,21 @@ class GatewayMarketHub:
             raise GatewayMarketHubError("PUBLISHER_FAILED", retryable=True)
         return envelope
 
-    def snapshot(self, key: MarketSubscriptionKey) -> Mapping[str, object]:
+    def snapshot(
+        self, key: MarketSubscriptionKey, *, principal_ref: str | None = None
+    ) -> Mapping[str, object]:
         """Return the latest retained event, explicitly not a full market state."""
         self._check_owner()
         stream = self._stream(key)
         latest = stream.events[-1].envelope if stream.events else None
+        floor = None if principal_ref is None else self._grant_floors.get((principal_ref, key))
+        if (
+            latest is not None
+            and floor is not None
+            and floor[0] == stream.epoch
+            and latest.header.sequence <= floor[1]
+        ):
+            latest = None  # published while this principal was not authorized
         return MappingProxyType(
             {
                 "snapshot_kind": "latest_event",
@@ -951,8 +1151,13 @@ class GatewayMarketHub:
         epoch: str,
         after: int,
         limit: int = DEFAULT_MARKET_READ_LIMIT,
+        principal_ref: str | None = None,
     ) -> Mapping[str, object]:
         """Read a bounded page only for the exact current stream epoch.
+
+        With ``principal_ref``, a cursor below that principal's re-grant floor
+        is an ``authorization_floor`` gap: events published while it was
+        revoked are never returned.
 
         An epoch mismatch or a cursor older than retained replay returns an
         explicit gap with no partial events; callers must resynchronize from
@@ -971,6 +1176,11 @@ class GatewayMarketHub:
             gap_reason = "cursor_too_old"
         elif after > stream.sequence:
             raise GatewayMarketHubError("CURSOR_AHEAD")
+        if gap_reason is None and principal_ref is not None:
+            floor = self._grant_floors.get((principal_ref, key))
+            if floor is not None and floor[0] == stream.epoch and after < floor[1]:
+                gap_reason = "authorization_floor"
+                self._authorization_diagnostics["authorization_floor_gaps"] += 1
 
         if gap_reason is not None:
             events: tuple[WireEnvelope, ...] = ()
@@ -1091,6 +1301,8 @@ class GatewayMarketHub:
         for stream in self._streams.values():
             self._registration_ref_count -= len(stream.registrations)
             stream.registrations.clear()
+        self._registration_principals.clear()
+        for stream in self._streams.values():
             if stream.handle is not None and not self._attempt_release(stream):
                 failed += 1
         if failed:
@@ -1364,7 +1576,7 @@ class GatewayMarketService:
         if operation == "market.head":
             return self._hub.head(key)
         if operation == "market.snapshot":
-            result = dict(self._hub.snapshot(key))
+            result = dict(self._hub.snapshot(key, principal_ref=principal_ref))
             event = result["event"]
             result["event"] = None if event is None else _envelope_mapping(event)
             return MappingProxyType(result)
@@ -1380,6 +1592,7 @@ class GatewayMarketService:
                 epoch=epoch,
                 after=after,  # type: ignore[arg-type]  # the hub validates the exact type.
                 limit=limit,  # type: ignore[arg-type]  # the hub validates the exact type.
+                principal_ref=principal_ref,
             )
         except GatewayMarketHubError as exc:
             raise GatewayMarketServiceError(exc.code, retryable=exc.retryable) from None

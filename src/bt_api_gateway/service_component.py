@@ -309,6 +309,30 @@ class GatewayReadService:
             self._view_policies = MappingProxyType({})
         self._state_worker = state_worker
 
+    #: Runtime authorization generation (iteration 60, G2): increases on revocation.
+    authorization_generation = 1
+
+    def revoke_principal(self, principal_ref: str) -> int:
+        """Revoke a running principal; return the new authorization generation.
+
+        Every later operation by ``principal_ref`` is refused
+        (``UNKNOWN_PRINCIPAL``), so its account stream polls fail and its
+        position reports become incomplete (reconciliation ``UNVERIFIED``);
+        the reconciliation inspector's allowlist drops it too. Replies already
+        returned cannot be recalled. Re-granting requires a new service
+        assembly with the principal and a client resync from the journal.
+        """
+        if type(principal_ref) is not str or principal_ref not in self._principals:
+            raise GatewayServiceError("UNKNOWN_PRINCIPAL")
+        remaining = {
+            ref: principal for ref, principal in self._principals.items() if ref != principal_ref
+        }
+        self._principals = MappingProxyType(remaining)
+        if self._reconciliation is not None:
+            self._reconciliation.revoke_principal(principal_ref)
+        self.authorization_generation += 1
+        return self.authorization_generation
+
     @property
     def supported_operations(self) -> frozenset[str]:
         """Advertise metadata only when the trusted provider owns its source."""

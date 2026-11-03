@@ -52,3 +52,19 @@ def test_typed_rejects_noncanonical_without_generic_fallback(tmp_path):
             service.handle('account.snapshot.typed', principal_ref='principal-a', scope=scope, arguments={})
     finally:
         worker.close()
+
+
+def test_every_gateway_operation_has_a_registered_wire_contract():
+    """60.08 (G5): typed where a Base contract exists, generic only if listed."""
+    from bt_api_base.wire_codec_v1 import service_operation_contract
+    from bt_api_gateway.service_component import (
+        RECONCILIATION_CUT_OPERATION,
+        SUPPORTED_OPERATIONS,
+    )
+
+    contracts = {
+        name: service_operation_contract(name)[0]
+        for name in SUPPORTED_OPERATIONS | {RECONCILIATION_CUT_OPERATION}
+    }
+    assert contracts.pop("account.snapshot.typed") == "typed"
+    assert set(contracts.values()) == {"generic"}
