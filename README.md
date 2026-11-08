@@ -42,8 +42,11 @@ from that same read-model version. This local contract does not implement
 remote authentication, a provider session/writer fence, upstream subscription
 sharing, or proof of a coherent provider account snapshot.
 
-The network transport (including the ZMQ adapter) remains a separate
-package and must authenticate clients before it creates a `GatewayPrincipal`.
+The default network transport is the separate `bt_api_transport_zmq` package.
+The SDK `gateway` extra installs it by default. Future middleware belongs in
+new transport packages behind the neutral service contracts. Transport must
+authenticate clients before it creates a `GatewayPrincipal`; Gateway does not
+implement another ZeroMQ stack.
 
 ## Role in the trading-system architecture
 
