@@ -14,9 +14,10 @@ import sqlite3
 import time
 import uuid
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import ContextManager
 
 from bt_api_base.direct_write_protocol import SettlementObservation, SettlementStatus
 from bt_api_base.gateway_direct_protocol import canonical_gateway_payload
@@ -1028,10 +1029,13 @@ class GatewayDirectCommandJournal:
         payload: object,
         *,
         ttl_seconds: float = 10.0,
+        reservation_fence: Callable[[], ContextManager[None]] | None = None,
     ) -> DirectCommandRecord:
         """Create a reservation; repeated keys never renew its original TTL.
 
         TTL is a first-creation lifecycle option, not part of the payload digest.
+        The optional trusted local fence stays held through the SQLite commit;
+        it must not perform native or network I/O. Existing keys bypass it.
         """
         strategy, request_key, principal = map(_text, (strategy, request_key, principal))
         if (
@@ -1043,7 +1047,9 @@ class GatewayDirectCommandJournal:
             raise DirectCommandJournalError("INVALID_TTL")
         encoded = _json(payload)
         digest = hashlib.sha256(encoded.encode("ascii")).hexdigest()
-        with self._transaction() as db:
+        if reservation_fence is not None and not callable(reservation_fence):
+            raise DirectCommandJournalError("INVALID_INPUT")
+        with ExitStack() as fence_stack, self._transaction() as db:
             row = self._find(db, strategy, request_key)
             if row is not None:
                 if (
@@ -1053,6 +1059,13 @@ class GatewayDirectCommandJournal:
                 ):
                     raise DirectCommandJournalError("REQUEST_CONFLICT")
                 return self._record(row)
+            if reservation_fence is not None:
+                manager = reservation_fence()
+                # Ignore a context manager's suppression result: a failed
+                # transaction must never be reported as a successful reserve.
+                enter, exit_ = type(manager).__enter__, type(manager).__exit__
+                enter(manager)
+                fence_stack.push(lambda *exc: (exit_(manager, *exc), False)[1])
             if (
                 db.execute(
                     "SELECT count(*) FROM direct_journal_commands WHERE account=?", (self._account,)

@@ -385,3 +385,18 @@ trades. A mismatch rejects the database without repair. Counts and cumulative
 fills update in the same transaction, and pending/event pages use dedicated
 indexes. These checks establish internal consistency, not the authenticity of
 a restored backup or protection against an arbitrary external database writer.
+
+
+## Reservation admission through commit
+
+`GatewayDirectCommandJournal.reserve(..., reservation_fence=...)` optionally
+accepts a trusted local context manager factory. A new reservation enters it
+inside the SQLite write transaction and holds it through commit or rollback.
+An existing identical reservation bypasses the fence without renewing TTL.
+The fence must not perform provider/network I/O; lock ordering is journal
+transaction before gate, and gate updaters must not acquire the journal while
+holding the gate. Context-manager suppression cannot hide a failed transaction.
+An exit error after commit is an uncertain response, not proof of rejection.
+This hook does not itself supply a startup/recovery admission policy.
+`GatewayDirectExecutionLedger.account_scope` is a read-only, owner-checked
+view of the account bound to its journal and guard.

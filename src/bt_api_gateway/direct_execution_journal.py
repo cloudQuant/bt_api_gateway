@@ -147,6 +147,12 @@ class GatewayDirectExecutionLedger:
         if os.getpid() != self._pid:
             raise DirectCommandJournalError("WRONG_OWNER")
 
+    @property
+    def account_scope(self) -> str:
+        """Return the bound account only while the original owner holds its guard."""
+        self._owned()
+        return self._journal.account_scope
+
     @contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:
         self._owned()

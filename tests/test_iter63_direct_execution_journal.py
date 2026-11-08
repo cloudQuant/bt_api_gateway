@@ -18,7 +18,7 @@ from bt_api_gateway.direct_command_journal import (
     GatewayDirectCommandJournal,
 )
 from bt_api_gateway.direct_execution_journal import GatewayDirectExecutionLedger
-from bt_api_gateway.session_guard import LocalAccountSessionGuard
+from bt_api_gateway.session_guard import LocalAccountSessionGuard, LocalAccountSessionGuardError
 
 
 INSTRUMENT = MarketInstrumentKey("ctp", "SHFE", "simnow", "future", "rb2601", "rb2601")
@@ -263,6 +263,29 @@ def test_guard_thread_and_capacity_duplicate(setup):
     thread.start()
     thread.join(timeout=2)
     assert reads == ["1"] and errors == ["WRONG_OWNER"]
+
+
+def test_account_scope_requires_owner_and_is_read_only(setup):
+    _, ledger, guard, _ = setup
+    assert ledger.account_scope == "acct"
+    with pytest.raises(AttributeError):
+        ledger.account_scope = "different"
+    errors = []
+
+    def other_thread():
+        try:
+            ledger.account_scope
+        except DirectCommandJournalError as exc:
+            errors.append(exc.code)
+
+    thread = threading.Thread(target=other_thread)
+    thread.start()
+    thread.join(timeout=2)
+    assert not thread.is_alive() and errors == ["WRONG_OWNER"]
+    guard.release()
+    with pytest.raises(LocalAccountSessionGuardError) as error:
+        _ = ledger.account_scope
+    assert error.value.code == "SESSION_NOT_OWNED"
 
 
 def test_trade_unknown_venue_cannot_be_claimed_by_another_strategy(setup):
