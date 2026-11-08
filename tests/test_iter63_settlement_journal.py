@@ -31,6 +31,21 @@ def owned(tmp_path):
     guard.release()
 
 
+def _drop_v4_for_v2(db):
+    for name in (
+        "direct_execution_meta",
+        "direct_execution_facts",
+        "direct_execution_aliases",
+        "direct_execution_trades",
+        "direct_execution_positions",
+        "direct_execution_totals",
+        "direct_execution_events",
+        "direct_execution_conflicts",
+    ):
+        db.execute(f"DROP TABLE {name}")
+    db.execute("DROP TABLE direct_journal_settlement")
+
+
 def begin(journal, item=None, marker="marker-1", **kwargs):
     return journal.settlement_begin(
         item or obs(),
@@ -88,7 +103,7 @@ def test_v2_upgrade_is_explicit_guarded_atomic_and_preserves_records(owned):
     journal, guard, path = owned
     order = journal.reserve("s", "one", "p", {"symbol": "rb"})
     with sqlite3.connect(path) as db:
-        db.execute("DROP TABLE direct_journal_settlement")
+        _drop_v4_for_v2(db)
         db.execute("UPDATE direct_journal_meta SET schema_version=2")
     journal._schema_version = 2  # model an already-open v2 object
     assert journal.get("s", "one", "p") == order
@@ -127,7 +142,7 @@ def test_v2_upgrade_is_explicit_guarded_atomic_and_preserves_records(owned):
     with sqlite3.connect(path) as db:
         assert db.execute(
             "SELECT schema_version, revision FROM direct_journal_meta"
-        ).fetchone() == (3, before + 1)
+        ).fetchone() == (4, before + 1)
     with pytest.raises(DirectCommandJournalError, match="SCHEMA_OR_CAPACITY_MISMATCH"):
         journal.get("s", "one", "p")
     assert begin(upgraded).newly_started
@@ -136,7 +151,7 @@ def test_v2_upgrade_is_explicit_guarded_atomic_and_preserves_records(owned):
 def test_existing_db_without_migration_is_never_accepted_or_recreated(owned):
     journal, _, path = owned
     with sqlite3.connect(path) as db:
-        db.execute("DROP TABLE direct_journal_settlement")
+        _drop_v4_for_v2(db)
         db.execute("UPDATE direct_journal_meta SET schema_version=2")
     with pytest.raises(DirectCommandJournalError):
         GatewayDirectCommandJournal(
@@ -166,7 +181,7 @@ def test_upgrade_rejects_mutated_v2_schema_or_data_without_writes(owned, mutatio
     journal, guard, path = owned
     journal.reserve("s", "one", "p", {"symbol": "rb"})
     with sqlite3.connect(path) as db:
-        db.execute("DROP TABLE direct_journal_settlement")
+        _drop_v4_for_v2(db)
         db.execute("UPDATE direct_journal_meta SET schema_version=2")
         if mutation == "partial_index":
             db.execute("DROP INDEX direct_journal_native_identity")
@@ -236,7 +251,7 @@ def test_upgrade_rejects_mutated_v2_schema_or_data_without_writes(owned, mutatio
 def test_upgrade_failure_after_ddl_rolls_back_schema_and_revision(owned, monkeypatch):
     journal, guard, path = owned
     with sqlite3.connect(path) as db:
-        db.execute("DROP TABLE direct_journal_settlement")
+        _drop_v4_for_v2(db)
         db.execute("UPDATE direct_journal_meta SET schema_version=2")
         baseline = db.execute("SELECT schema_version,revision FROM direct_journal_meta").fetchone()
     original = GatewayDirectCommandJournal._create_settlement_table
@@ -274,7 +289,7 @@ def test_upgrade_failure_after_ddl_rolls_back_schema_and_revision(owned, monkeyp
 def test_upgrade_rejects_wrong_account_guard_and_generation(owned, tmp_path):
     journal, guard, path = owned
     with sqlite3.connect(path) as db:
-        db.execute("DROP TABLE direct_journal_settlement")
+        _drop_v4_for_v2(db)
         db.execute("UPDATE direct_journal_meta SET schema_version=2")
         baseline = db.execute("SELECT schema_version,revision FROM direct_journal_meta").fetchone()
     other_dir = tmp_path / "other-guards"
@@ -330,7 +345,7 @@ def test_upgrade_preserves_unknown_identity_strong_keys_and_release(owned):
         "s", "released", second.reservation_id, second.digest, "p", "release-op", 1
     )
     with sqlite3.connect(path) as db:
-        db.execute("DROP TABLE direct_journal_settlement")
+        _drop_v4_for_v2(db)
         db.execute("UPDATE direct_journal_meta SET schema_version=2")
         before_keys = db.execute("SELECT * FROM direct_journal_strong_keys").fetchall()
         before_releases = db.execute("SELECT * FROM direct_journal_releases").fetchall()

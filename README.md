@@ -1,4 +1,4 @@
-# bt_api_gateway
+﻿# bt_api_gateway
 
 Provider-neutral shared-account gateway contracts and a durable command router.
 
@@ -309,7 +309,7 @@ generation match; zero remaining TTL is not durable expiry or NOT_SENT.
 
 ### Iteration 63 daily settlement journal
 
-Journal schema v3 adds settlement records to the same anchored SQLite database.
+Journal schema v4 retains settlement records introduced by v3 in the same anchored SQLite database.
 The account/route/trading-day key retains its initial observation, native and
 owner generations, and optional attempt marker. ATTEMPTING is durable before
 confirmation; UNKNOWN retains the attempt; CONFIRMED requires a trusted
@@ -317,10 +317,11 @@ provider observation supplied by the SDK owner. An existing daily record never
 grants another send marker. A fresh confirmed read may create a record without
 a send attempt. Commands and settlement records share the configured capacity.
 
-Existing v2 databases require explicit `upgrade_v2` with the matching acquired
-account guard, saved journal identity and revision anchor. The transaction
-validates the old schema and record relationships, rejects extra triggers,
-retains command/release/identity data, adds the table and advances the revision.
+Existing v2 and v3 databases require explicit `upgrade_v2` or `upgrade_v3`
+with the matching acquired account guard, saved journal identity and revision
+anchor. Each transaction validates the old schema and record relationships,
+rejects extra triggers, retains command/release/identity/settlement data, adds
+the v4 execution tables and advances the revision once.
 Failure rolls back; it never replaces the old database with an empty one.
 Older objects cannot write after the schema upgrade. Schema upgrade checks do
 not establish the authority of a restored backup or fence external writers.
@@ -354,3 +355,33 @@ server-time or reconciliation capabilities. Its read-only `accounts` mapping
 lets the SDK verify public account routing against the command binding. This
 read model owns no native lifecycle and grants no trading authority; local tests
 are not deployment or account acceptance.
+
+### Iteration 63 same-database execution ledger
+
+`GatewayDirectExecutionLedger(journal, guard)` persists normalized return facts,
+strong-key attribution, learned venue aliases, trade deduplication, strategy net
+quantity deltas and immutable strategy events in the original command database.
+These writes share one transaction. Learned aliases leave the original dispatch
+identity and command version unchanged, so an in-flight dispatch can still finish.
+
+Inputs are `GatewayReturnFact` values from trusted local adapters. Unmatched
+returns remain unattributed; they are not automatically external trades. Conflicting
+trade content or identity is retained without overwriting an already applied
+quantity. Order cumulative fills never update positions. `position()` returns
+`None` for an absent projection and the string `"0"` for a known zero net delta.
+Neither value establishes an account baseline, cost, fees or closeable capacity.
+
+`execution_max_facts` defaults to 100000 (maximum 1000000), is persisted and must
+match on reopen. New unique facts at capacity are rejected; existing duplicates
+remain readable. Pending reconciliation scans bounded pages fairly. Event reads
+are trusted local reads with a global sequence filtered by strategy, not an
+authenticated RPC or an ACK protocol. Native polling, complete recovery queries,
+external baselines, state reduction and network consumption still require SDK
+composition and validation. Local synthetic tests are not account acceptance.
+
+Reopen verifies the exact schema, canonical facts, references and event sequence,
+then reconstructs net quantities and per-order cumulative fills from applied
+trades. A mismatch rejects the database without repair. Counts and cumulative
+fills update in the same transaction, and pending/event pages use dedicated
+indexes. These checks establish internal consistency, not the authenticity of
+a restored backup or protection against an arbitrary external database writer.
