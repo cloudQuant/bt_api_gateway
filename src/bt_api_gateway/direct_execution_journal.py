@@ -18,7 +18,10 @@ from decimal import Decimal, localcontext
 
 from bt_api_base.direct_write_protocol import DirectExecutionEventKind
 from bt_api_base.gateway_execution_protocol import GatewayReturnFact
-from bt_api_base.gateway_execution_stream_protocol import GatewayCancelErrorAttribution
+from bt_api_base.gateway_execution_stream_protocol import (
+    GatewayCancelErrorAttribution,
+    GatewayPlaceErrorAttribution,
+)
 from bt_api_base.market_protocol import MarketInstrumentKey
 
 from .direct_command_journal import (
@@ -128,6 +131,7 @@ class ExecutionEvent:
     command_digest: str
     command_principal: str
     cancel_attribution: GatewayCancelErrorAttribution | None = None
+    place_attribution: GatewayPlaceErrorAttribution | None = None
 
 
 @dataclass(frozen=True)
@@ -196,11 +200,15 @@ class GatewayDirectExecutionLedger:
         self._owned()
         with journal._transaction() as db:
             self._owned()
-            journal._verify_v2_upgrade_integrity(db, schema_version=7)
+            journal._verify_v2_upgrade_integrity(db, schema_version=8)
             journal._verify_v4_identity_integrity(db)
             _verify_execution_integrity(db, journal.account_scope, journal._execution_max_facts)
             _verify_consumer_integrity(db, journal.account_scope)
             _verify_cancel_error_integrity(db, journal.account_scope, journal._execution_max_facts)
+            from .direct_place_journal import _verify_place_integrity
+
+            _verify_place_integrity(db, journal.account_scope, journal._max_records)
+            _verify_place_error_integrity(db, journal, journal._execution_max_facts)
             self._owned()
 
     def _owned(self) -> None:
@@ -433,6 +441,139 @@ class GatewayDirectExecutionLedger:
                 before_commit()
             return result
 
+    def ingest_place_error(
+        self,
+        fact: GatewayReturnFact,
+        *,
+        place_key: str,
+        prepared_digest: str,
+        source_binding: Mapping[str, object],
+        before_commit: Callable[[], None] | None = None,
+    ) -> ExecutionIngestResult:
+        """Atomically append a source-validated place error and its attempt association."""
+        self._owned()
+        if type(fact) is not GatewayReturnFact or (
+            before_commit is not None and not callable(before_commit)
+        ):
+            raise DirectCommandJournalError("INVALID_INPUT")
+        try:
+            fact = GatewayReturnFact.from_mapping(fact.to_mapping())
+            place_key = _text(place_key)
+            prepared_digest = _text(prepared_digest)
+            if not isinstance(source_binding, Mapping) or not source_binding:
+                raise ValueError("source")
+            source_json = _json(dict(source_binding))
+            if (
+                fact.schema_version != 3
+                or fact.kind is not DirectExecutionEventKind.ORDER_ERROR
+                or fact.place_request_key != place_key
+                or not fact.error_code
+                or fact.status is not None
+            ):
+                raise ValueError("place fact")
+        except Exception as exc:
+            raise DirectCommandJournalError("INVALID_INPUT") from exc
+        if fact.account_scope != self._journal.account_scope:
+            raise DirectCommandJournalError("ACCOUNT_MISMATCH")
+        digest = fact.fact_digest()
+        account = self._journal.account_scope
+        with self._write() as db:
+            command = _validate_place_error_link(
+                db, self._journal, fact, place_key, prepared_digest, source_json
+            )
+            row = db.execute(
+                "SELECT * FROM direct_execution_facts WHERE account=? AND fact_digest=?",
+                (account, digest),
+            ).fetchone()
+            side = db.execute(
+                "SELECT * FROM direct_place_error_attribution WHERE account=? AND fact_digest=?",
+                (account, digest),
+            ).fetchone()
+            if row is not None:
+                if (
+                    side is None
+                    or side["reservation_id"] != command.reservation_id
+                    or side["prepared_digest"] != prepared_digest
+                    or side["place_key"] != place_key
+                    or side["source_binding_json"] != source_json
+                    or row["disposition"] != "ATTRIBUTED"
+                    or row["reservation_id"] != command.reservation_id
+                    or row["event_sequence"] is None
+                ):
+                    raise DirectCommandJournalError("PLACE_ATTRIBUTION_CONFLICT")
+                stored_fact = GatewayReturnFact.from_mapping(json.loads(row["fact_json"]))
+                stored_attribution = _event_place_attribution(
+                    db,
+                    self._journal,
+                    stored_fact,
+                    digest,
+                    row["reservation_id"],
+                    command.strategy_scope,
+                )
+                event = db.execute(
+                    "SELECT * FROM direct_execution_events WHERE account=? AND sequence=?",
+                    (account, row["event_sequence"]),
+                ).fetchone()
+                if (
+                    stored_fact.fact_digest() != digest
+                    or stored_attribution is None
+                    or stored_attribution.prepared_digest != prepared_digest
+                    or event is None
+                    or event["strategy"] != command.strategy_scope
+                    or event["fact_digest"] != digest
+                    or event["fact_json"] != row["fact_json"]
+                ):
+                    raise DirectCommandJournalError("INVALID_DATABASE")
+                result = self._result(db, row, applied=False)
+            else:
+                if side is not None:
+                    raise DirectCommandJournalError("INVALID_DATABASE")
+                count = db.execute(
+                    "SELECT fact_count FROM direct_execution_meta WHERE account=?", (account,)
+                ).fetchone()[0]
+                if count >= self._journal._execution_max_facts:
+                    raise DirectCommandJournalError("EXECUTION_CAPACITY_EXCEEDED")
+                db.execute(
+                    "INSERT INTO direct_execution_facts VALUES (?, ?, ?, 'UNATTRIBUTED', 'UNMATCHED', NULL, NULL, 0)",
+                    (account, digest, _json(fact.to_mapping())),
+                )
+                db.execute(
+                    "UPDATE direct_execution_meta SET fact_count=fact_count+1 WHERE account=?",
+                    (account,),
+                )
+                self._process(db, digest, fact)
+                row = db.execute(
+                    "SELECT * FROM direct_execution_facts WHERE account=? AND fact_digest=?",
+                    (account, digest),
+                ).fetchone()
+                if (
+                    row["disposition"] != "ATTRIBUTED"
+                    or row["reservation_id"] != command.reservation_id
+                    or row["event_sequence"] is None
+                    or row["applied"]
+                ):
+                    raise DirectCommandJournalError("PLACE_ATTRIBUTION_CONFLICT")
+                db.execute(
+                    "INSERT INTO direct_place_error_attribution VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        account,
+                        digest,
+                        command.reservation_id,
+                        prepared_digest,
+                        place_key,
+                        source_json,
+                    ),
+                )
+                self._journal._bump(db)
+                row = db.execute(
+                    "SELECT * FROM direct_execution_facts WHERE account=? AND fact_digest=?",
+                    (account, digest),
+                ).fetchone()
+                result = self._result(db, row, applied=False)
+            if before_commit is not None:
+                before_commit()
+            return result
+
     def reconcile_pending(self, *, limit: int = 256) -> tuple[ExecutionIngestResult, ...]:
         self._owned()
         _limit(limit)
@@ -568,6 +709,9 @@ class GatewayDirectExecutionLedger:
             attribution = _event_cancel_attribution(
                 db, row["account"], fact, row["fact_digest"], reservation, row["strategy"]
             )
+            place_attribution = _event_place_attribution(
+                db, self._journal, fact, row["fact_digest"], reservation, row["strategy"]
+            )
             return ExecutionEvent(
                 row["sequence"],
                 row["strategy"],
@@ -578,6 +722,7 @@ class GatewayDirectExecutionLedger:
                 digest,
                 principal,
                 attribution,
+                place_attribution,
             )
         except Exception as exc:
             raise DirectCommandJournalError("INVALID_DATABASE") from exc
@@ -1066,7 +1211,7 @@ _VALID_REASONS = {
 
 
 def _verify_execution_integrity(
-    db: sqlite3.Connection, account: str, capacity: int, *, allow_v2: bool = True
+    db: sqlite3.Connection, account: str, capacity: int, *, max_fact_version: int = 3
 ) -> None:
     """Reconstruct persisted execution projections on open, without provider I/O."""
     try:
@@ -1095,7 +1240,7 @@ def _verify_execution_integrity(
                 raise ValueError("fact status")
             raw = json.loads(row["fact_json"])
             fact = GatewayReturnFact.from_mapping(raw)
-            if not allow_v2 and fact.schema_version != 1:
+            if fact.schema_version > max_fact_version:
                 raise ValueError("legacy fact version")
             if row["reason"] == "CANCEL_NOT_SENT_CONTRADICTION" and (
                 fact.schema_version != 2 or fact.kind is not DirectExecutionEventKind.CANCEL_ERROR
@@ -1389,7 +1534,7 @@ def _event_cancel_attribution(db, account, fact, fact_digest, reservation_id, st
         "SELECT * FROM direct_cancel_error_attribution WHERE account=? AND fact_digest=?",
         (account, fact_digest),
     ).fetchone()
-    if fact.schema_version == 1:
+    if fact.schema_version != 2:
         if side is not None:
             raise DirectCommandJournalError("INVALID_DATABASE")
         return None
@@ -1489,5 +1634,152 @@ def _verify_cancel_error_integrity(db, account, capacity):
         }
         if actual != expected:
             raise ValueError("missing cancel association")
+    except Exception as exc:
+        raise DirectCommandJournalError("INVALID_DATABASE") from exc
+
+
+def _validate_place_error_link(db, journal, fact, place_key, prepared_digest, source_json):
+    """Recheck one place key against the original command and sealed preparation."""
+    from .direct_place_journal import _find_place_by_key, _get_prepared
+
+    if (
+        type(fact) is not GatewayReturnFact
+        or fact.schema_version != 3
+        or fact.kind is not DirectExecutionEventKind.ORDER_ERROR
+        or fact.status is not None
+        or fact.place_request_key != place_key
+        or not fact.error_code
+        or fact.account_scope != journal.account_scope
+    ):
+        raise DirectCommandJournalError("INVALID_FACT")
+    command = _find_place_by_key(db, journal, place_key)
+    if command is None:
+        raise DirectCommandJournalError("PLACE_PREPARATION_NOT_FOUND")
+    try:
+        prepared = _get_prepared(db, journal.account_scope, command.reservation_id)
+        source = json.loads(source_json)
+        if (
+            prepared is None
+            or type(source) is not dict
+            or not source
+            or _json(source) != source_json
+            or _json(dict(prepared.source_binding)) != source_json
+            or prepared.digest() != prepared_digest
+            or fact.identity is None
+            or _json(fact.identity.to_dict()) != _json(prepared.identity.to_dict())
+            or fact.route != prepared.identity.exchange_name
+            or fact.trading_day != prepared.trading_day
+            or type(fact.session_generation) is not int
+            or fact.session_generation != prepared.session_generation
+            or fact.instrument.native_symbol != prepared.symbol
+        ):
+            raise ValueError("place source association")
+    except Exception as exc:
+        raise DirectCommandJournalError("PLACE_ATTRIBUTION_CONFLICT") from exc
+    return command
+
+
+def _event_place_attribution(db, journal, fact, fact_digest, reservation_id, strategy):
+    side = db.execute(
+        "SELECT * FROM direct_place_error_attribution WHERE account=? AND fact_digest=?",
+        (journal.account_scope, fact_digest),
+    ).fetchone()
+    if fact.schema_version != 3:
+        if side is not None:
+            raise DirectCommandJournalError("INVALID_DATABASE")
+        return None
+    if side is None:
+        raise DirectCommandJournalError("INVALID_DATABASE")
+    try:
+        command = _validate_place_error_link(
+            db,
+            journal,
+            fact,
+            side["place_key"],
+            side["prepared_digest"],
+            side["source_binding_json"],
+        )
+        if (
+            side["reservation_id"] != command.reservation_id
+            or command.reservation_id != reservation_id
+            or command.strategy_scope != strategy
+        ):
+            raise ValueError("place mismatch")
+        return GatewayPlaceErrorAttribution(side["prepared_digest"])
+    except Exception as exc:
+        raise DirectCommandJournalError("INVALID_DATABASE") from exc
+
+
+def _verify_place_error_integrity(db, journal, capacity):
+    """Each v3 fact must retain its exact preparation, command and event."""
+    account = journal.account_scope
+    try:
+        sides = db.execute(
+            "SELECT * FROM direct_place_error_attribution LIMIT ?", (capacity + 1,)
+        ).fetchall()
+        if len(sides) > capacity:
+            raise ValueError("place association capacity")
+        expected = set()
+        for side in sides:
+            if side["account"] != account:
+                raise ValueError("place association account")
+            row = db.execute(
+                "SELECT * FROM direct_execution_facts WHERE account=? AND fact_digest=?",
+                (account, side["fact_digest"]),
+            ).fetchone()
+            if (
+                row is None
+                or row["disposition"] != "ATTRIBUTED"
+                or row["event_sequence"] is None
+                or row["applied"]
+            ):
+                raise ValueError("place fact")
+            fact = GatewayReturnFact.from_mapping(json.loads(row["fact_json"]))
+            if fact.fact_digest() != side["fact_digest"]:
+                raise ValueError("place fact digest")
+            command = _validate_place_error_link(
+                db,
+                journal,
+                fact,
+                side["place_key"],
+                side["prepared_digest"],
+                side["source_binding_json"],
+            )
+            if (
+                _event_place_attribution(
+                    db,
+                    journal,
+                    fact,
+                    side["fact_digest"],
+                    row["reservation_id"],
+                    command.strategy_scope,
+                )
+                is None
+            ):
+                raise ValueError("place association")
+            event = db.execute(
+                "SELECT * FROM direct_execution_events WHERE account=? AND sequence=?",
+                (account, row["event_sequence"]),
+            ).fetchone()
+            if (
+                event is None
+                or event["strategy"] != command.strategy_scope
+                or event["fact_digest"] != side["fact_digest"]
+                or event["fact_json"] != row["fact_json"]
+            ):
+                raise ValueError("place event")
+            expected.add(side["fact_digest"])
+        facts = db.execute(
+            "SELECT fact_digest,fact_json FROM direct_execution_facts LIMIT ?", (capacity + 1,)
+        ).fetchall()
+        if len(facts) > capacity:
+            raise ValueError("fact capacity")
+        actual = {
+            row["fact_digest"]
+            for row in facts
+            if json.loads(row["fact_json"]).get("schema_version") == 3
+        }
+        if actual != expected:
+            raise ValueError("missing place association")
     except Exception as exc:
         raise DirectCommandJournalError("INVALID_DATABASE") from exc

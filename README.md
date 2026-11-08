@@ -458,3 +458,10 @@ These classes are trusted local composition surfaces. They do not provide a canc
 ### Iteration 63 R17: atomic cancellation error attribution
 
 Direct journal schema v7 adds cancellation-error association in the existing database. An explicit validated v6 upgrade preserves old preparations and fact digests without inventing source evidence. The cancel-key namespace resolves one durable attempt; ingest_cancel_error verifies the prepared digest, source labels and original-order association and commits the fact, attempt association and existing strategy event together. A trusted pre-commit callback rechecks the provider source. Event reads and strict reopen validate the association again. Cancellation errors never change the original order, applied trade quantities or cancellation send state; NOT_SENT contradictions remain evidence. These local contracts require trusted provider/SDK composition and do not establish venue cancellation by themselves.
+
+
+### Iteration 63 R19 prepared PLACE persistence
+
+The existing command database uses schema v8. Explicit `upgrade_v7` (and the existing earlier-version upgrade entrypoints) retains old records without inventing missing native preparation. New prepared PLACE requests persist their exact value, digest and operation-specific keys in the same transaction as the native dispatch marker. No new account owner or separate command database is introduced.
+
+Source-associated insert errors enter through `ingest_place_error`, which checks the original preparation and command within the fact/association/event transaction. Generic ingestion rejects the new fact version. Reads and database reopen cross-check association ownership. These observations do not finish the original command, release quantities, or discard later trades. Account authentication, native source validation and final grant checks remain the responsibility of SDK/provider composition.

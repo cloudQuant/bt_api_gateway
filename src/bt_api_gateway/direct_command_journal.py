@@ -182,7 +182,7 @@ class GatewayDirectCommandJournal:
             with self._connection() as db, self._transaction_on(db):
                 self._verify_schema(db)
                 self._assert_anchor(db)
-                self._verify_v2_upgrade_integrity(db, schema_version=7)
+                self._verify_v2_upgrade_integrity(db, schema_version=8)
                 self._verify_v4_identity_integrity(db)
                 from .direct_execution_journal import _verify_execution_integrity
 
@@ -196,6 +196,11 @@ class GatewayDirectCommandJournal:
                 from .direct_execution_journal import _verify_cancel_error_integrity
 
                 _verify_cancel_error_integrity(db, self._account, self._execution_max_facts)
+                from .direct_place_journal import _verify_place_integrity
+                from .direct_execution_journal import _verify_place_error_integrity
+
+                _verify_place_integrity(db, self._account, self._max_records)
+                _verify_place_error_integrity(db, self, self._execution_max_facts)
         except sqlite3.DatabaseError as exc:
             raise DirectCommandJournalError("INVALID_DATABASE") from exc
 
@@ -264,8 +269,11 @@ class GatewayDirectCommandJournal:
                 from .direct_execution_journal import _create_cancel_error_table
 
                 _create_cancel_error_table(db)
+                from .direct_place_journal import _create_place_tables
+
+                _create_place_tables(db)
                 db.execute(
-                    "INSERT INTO direct_journal_meta VALUES (?, 7, ?, ?, 0)",
+                    "INSERT INTO direct_journal_meta VALUES (?, 8, ?, ?, 0)",
                     (self._account, max_records, self._journal_id),
                 )
         return self
@@ -294,7 +302,7 @@ class GatewayDirectCommandJournal:
         ):
             raise DirectCommandJournalError("INVALID_INPUT")
         self._max_records = max_records
-        self._schema_version = 7
+        self._schema_version = 8
         self._execution_max_facts = execution_max_facts
         self._clock = clock
         self._timeout = timeout_seconds
@@ -333,7 +341,7 @@ class GatewayDirectCommandJournal:
         clock: Callable[[], float] = time.monotonic,
         timeout_seconds: float = 5.0,
     ) -> GatewayDirectCommandJournal:
-        """Explicitly upgrade an anchored v2 journal to v7 under the account guard."""
+        """Explicitly upgrade an anchored v2 journal to v8 under the account guard."""
         return cls._upgrade_legacy(
             database_path,
             account_scope,
@@ -363,7 +371,7 @@ class GatewayDirectCommandJournal:
         clock: Callable[[], float] = time.monotonic,
         timeout_seconds: float = 5.0,
     ) -> GatewayDirectCommandJournal:
-        """Explicitly upgrade an anchored v3 journal to v7 under the account guard."""
+        """Explicitly upgrade an anchored v3 journal to v8 under the account guard."""
         return cls._upgrade_legacy(
             database_path,
             account_scope,
@@ -469,6 +477,36 @@ class GatewayDirectCommandJournal:
         )
 
     @classmethod
+    def upgrade_v7(
+        cls,
+        database_path,
+        account_scope,
+        *,
+        generation,
+        guard,
+        expected_journal_id,
+        minimum_revision,
+        max_records=100000,
+        execution_max_facts=100000,
+        clock=time.monotonic,
+        timeout_seconds=5.0,
+    ) -> GatewayDirectCommandJournal:
+        """Upgrade an anchored v7 database with existing fact associations intact."""
+        return cls._upgrade_legacy(
+            database_path,
+            account_scope,
+            generation=generation,
+            guard=guard,
+            expected_journal_id=expected_journal_id,
+            minimum_revision=minimum_revision,
+            max_records=max_records,
+            execution_max_facts=execution_max_facts,
+            clock=clock,
+            timeout_seconds=timeout_seconds,
+            old_version=7,
+        )
+
+    @classmethod
     def _upgrade_legacy(
         cls,
         database_path,
@@ -525,18 +563,25 @@ class GatewayDirectCommandJournal:
                     _verify_execution_integrity,
                     _verify_consumer_integrity,
                     _create_cancel_error_table,
+                    _verify_cancel_error_integrity,
                 )
+                from .direct_place_journal import _create_place_tables
                 from .direct_cancel_journal import _create_cancel_tables, _verify_cancel_integrity
 
                 if old_version >= 4:
                     self._verify_v4_identity_integrity(db)
                     _verify_execution_integrity(
-                        db, self._account, self._execution_max_facts, allow_v2=False
+                        db,
+                        self._account,
+                        self._execution_max_facts,
+                        max_fact_version=(2 if old_version >= 7 else 1),
                     )
                     if old_version >= 5:
                         _verify_consumer_integrity(db, self._account)
                     if old_version >= 6:
                         _verify_cancel_integrity(db, self._account, self._max_records)
+                    if old_version >= 7:
+                        _verify_cancel_error_integrity(db, self._account, self._execution_max_facts)
                 else:
                     if old_version == 2:
                         self._create_settlement_table(db)
@@ -545,9 +590,11 @@ class GatewayDirectCommandJournal:
                     _create_consumer_table(db)
                 if old_version < 6:
                     _create_cancel_tables(db)
-                _create_cancel_error_table(db)
+                if old_version < 7:
+                    _create_cancel_error_table(db)
+                _create_place_tables(db)
                 db.execute(
-                    "UPDATE direct_journal_meta SET schema_version=7, revision=revision+1 WHERE account=?",
+                    "UPDATE direct_journal_meta SET schema_version=8, revision=revision+1 WHERE account=?",
                     (self._account,),
                 )
                 owned()
@@ -613,6 +660,17 @@ class GatewayDirectCommandJournal:
 
             expected["direct_cancel_error_attribution"] = _CANCEL_ERROR_DDL
             automatic.add("sqlite_autoindex_direct_cancel_error_attribution_1")
+        if schema_version >= 8:
+            from .direct_place_journal import _PLACE_DDL
+
+            expected.update(_PLACE_DDL)
+            automatic.update(
+                {
+                    "sqlite_autoindex_direct_place_preparations_1",
+                    "sqlite_autoindex_direct_place_keys_1",
+                    "sqlite_autoindex_direct_place_error_attribution_1",
+                }
+            )
         actual = {row[0] for row in db.execute("SELECT name FROM sqlite_master")}
         if actual != set(expected) | automatic:
             raise DirectCommandJournalError("INVALID_DATABASE")
@@ -830,7 +888,7 @@ class GatewayDirectCommandJournal:
         except (ValueError, TypeError, KeyError, DirectCommandJournalError) as exc:
             raise DirectCommandJournalError("INVALID_DATABASE") from exc
 
-    def _verify_schema(self, db: sqlite3.Connection, *, schema_version: int = 7) -> None:
+    def _verify_schema(self, db: sqlite3.Connection, *, schema_version: int = 8) -> None:
         objects = {
             row[0]
             for row in db.execute("SELECT name FROM sqlite_master WHERE type IN ('table','index')")
@@ -1379,6 +1437,7 @@ class GatewayDirectCommandJournal:
         strong_identity_keys: tuple[str, ...],
         *,
         before_dispatch: Callable[[], None] | None = None,
+        prepared_place: object | None = None,
     ) -> DispatchStart:
         """Begin dispatch under the write transaction and an optional local recheck.
 
@@ -1397,6 +1456,17 @@ class GatewayDirectCommandJournal:
         with self._transaction() as db:
             row = self._bound(db, strategy, request_key, reservation_id, digest, principal)
             if row["status"] in ("DISPATCHING", "SENT", "NOT_SENT", "UNKNOWN"):
+                if prepared_place is not None:
+                    from .direct_place_journal import _get_prepared, _validate_prepared
+
+                    old_prepared = _get_prepared(db, self._account, reservation_id)
+                    raw_prepared, digest_prepared = _validate_prepared(prepared_place, row)
+                    if (
+                        old_prepared is None
+                        or _json(old_prepared.to_mapping()) != raw_prepared
+                        or old_prepared.digest() != digest_prepared
+                    ):
+                        raise DirectCommandJournalError("PLACE_PREPARATION_CONFLICT")
                 if row["native_identity_json"] != identity or row["strong_keys_json"] != keys_json:
                     raise DirectCommandJournalError("IDENTITY_CONFLICT")
                 prior_version = row["version"] - (1 if row["status"] == "DISPATCHING" else 2)
@@ -1442,6 +1512,22 @@ class GatewayDirectCommandJournal:
                 return DispatchStart(
                     self._record(self._require(db, strategy, request_key, principal)), False
                 )
+            prepared_raw = prepared_digest = None
+            if prepared_place is not None:
+                from .direct_place_journal import _validate_prepared
+
+                candidate = dict(row)
+                candidate["native_identity_json"] = identity
+                prepared_raw, prepared_digest = _validate_prepared(prepared_place, candidate)
+                for key in prepared_place.request_keys:
+                    if (
+                        db.execute(
+                            "SELECT 1 FROM direct_place_keys WHERE account=? AND strong_key=?",
+                            (self._account, key),
+                        ).fetchone()
+                        is not None
+                    ):
+                        raise DirectCommandJournalError("PLACE_KEY_CONFLICT")
             db.execute(
                 "UPDATE direct_journal_commands SET status='DISPATCHING', version=version+1, native_identity_json=?, strong_keys_json=? WHERE account=? AND strategy=? AND request_key=?",
                 (identity, keys_json, self._account, strategy, request_key),
@@ -1451,10 +1537,36 @@ class GatewayDirectCommandJournal:
                     "INSERT INTO direct_journal_strong_keys VALUES (?, ?, ?)",
                     (self._account, key, reservation_id),
                 )
+            if prepared_place is not None:
+                db.execute(
+                    "INSERT INTO direct_place_preparations VALUES (?, ?, ?, ?)",
+                    (self._account, reservation_id, prepared_raw, prepared_digest),
+                )
+                for key in prepared_place.request_keys:
+                    db.execute(
+                        "INSERT INTO direct_place_keys VALUES (?, ?, ?)",
+                        (self._account, key, reservation_id),
+                    )
             self._bump(db)
             return DispatchStart(
                 self._record(self._require(db, strategy, request_key, principal)), True
             )
+
+    def get_prepared_place(self, reservation_id: str):
+        """Read the prepared value bound to one exact original reservation."""
+        from .direct_place_journal import _get_prepared
+
+        reservation_id = _text(reservation_id)
+        with self._transaction() as db:
+            return _get_prepared(db, self._account, reservation_id)
+
+    def find_place_by_request_key(self, key: str):
+        """Resolve only the typed place-key namespace; no authentication is implied."""
+        from .direct_place_journal import _find_place_by_key
+
+        key = _text(key)
+        with self._transaction() as db:
+            return _find_place_by_key(db, self, key)
 
     def finish(
         self,

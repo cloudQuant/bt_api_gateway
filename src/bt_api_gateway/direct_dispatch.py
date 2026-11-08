@@ -278,6 +278,7 @@ class _CommitPort:
         self._request_fence = request_fence
         self.identity: dict[str, object] | None = None
         self.keys: tuple[str, ...] = ()
+        self.prepared_digest: str | None = None
         self._attempted = False
         self._known_not_new = False
         self._closed = False
@@ -294,6 +295,10 @@ class _CommitPort:
         self._attempted = True
         if type(record) is not PreDispatchRecord or record.identity is None:
             raise DirectDispatchError("COMMIT_RECORD_INVALID")
+        try:
+            record.to_dict()  # Revalidate any sealed prepared value before persistence.
+        except Exception:
+            raise DirectDispatchError("COMMIT_RECORD_INVALID") from None
         # This injected projection must be pure; do it before the short fence.
         try:
             keys = self._owner._identity_keys(record.identity)
@@ -325,6 +330,9 @@ class _CommitPort:
             self._owner._admitted(current)
             self._owner._owned()
             self.identity, self.keys = identity, keys
+            self.prepared_digest = (
+                None if record.prepared_place is None else record.prepared_place.digest()
+            )
 
             def before_dispatch() -> None:
                 # Lock order: request fence (registry) -> journal SQLite.
@@ -345,6 +353,7 @@ class _CommitPort:
                 identity,
                 keys,
                 before_dispatch=before_dispatch,
+                prepared_place=record.prepared_place,
             )
             if not result.newly_started:
                 self._known_not_new = True
@@ -358,6 +367,10 @@ class _CommitPort:
         row = self._owner._journal.get(
             self._record.strategy_scope, self._record.request_key, self._record.principal
         )
+        if self.prepared_digest is not None:
+            prepared = self._owner._journal.get_prepared_place(self._record.reservation_id)
+            if prepared is None or prepared.digest() != self.prepared_digest:
+                return None
         if (
             row.status != "DISPATCHING"
             or row.reservation_id != self._record.reservation_id
