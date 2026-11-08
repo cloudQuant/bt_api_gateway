@@ -17,7 +17,8 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+
+from bt_api_base.gateway_direct_protocol import canonical_gateway_payload
 
 from .database_identity import SQLiteFileIdentity
 from .router import _validate_redacted
@@ -88,41 +89,20 @@ def _text(value: object) -> str:
 
 
 def _json(value: object, *, scalar_map: bool = False) -> str:
-    count = 0
-
-    def check(item: Any, depth: int) -> None:
-        nonlocal count
-        count += 1
-        if count > 4096 or depth > 16:
-            raise DirectCommandJournalError("INVALID_PAYLOAD")
-        if item is None or type(item) in (bool, int, str):
-            if isinstance(item, str) and len(item) > 16384:
-                raise DirectCommandJournalError("INVALID_PAYLOAD")
-            if type(item) is int and not -(2**63) <= item < 2**63:
-                raise DirectCommandJournalError("INVALID_PAYLOAD")
-            return
-        if type(item) is list and not scalar_map:
-            for nested in item:
-                check(nested, depth + 1)
-            return
-        if type(item) is dict and (not scalar_map or depth == 0):
-            for key, nested in item.items():
-                if not isinstance(key, str) or not key or len(key) > 256:
-                    raise DirectCommandJournalError("INVALID_PAYLOAD")
-                check(nested, depth + 1)
-            return
-        raise DirectCommandJournalError("INVALID_PAYLOAD")
-
-    check(value, 0)
-    if scalar_map and (type(value) is not dict or not value):
-        raise DirectCommandJournalError("INVALID_PAYLOAD")
     try:
+        if scalar_map and (
+            type(value) is not dict
+            or not value
+            or any(
+                item is not None and type(item) not in (bool, int, str)
+                for item in value.values()
+            )
+        ):
+            raise ValueError("invalid scalar map")
+        result = canonical_gateway_payload(value)
         _validate_redacted(value)
-        result = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     except (ValueError, TypeError, RecursionError) as exc:
         raise DirectCommandJournalError("INVALID_PAYLOAD") from exc
-    if len(result.encode("ascii")) > 65536:
-        raise DirectCommandJournalError("INVALID_PAYLOAD")
     return result
 
 

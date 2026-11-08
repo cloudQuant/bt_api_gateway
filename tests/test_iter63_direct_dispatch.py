@@ -815,3 +815,40 @@ def test_lease_recheck_after_waiting_for_sqlite_lock_blocks_marker(setup, monkey
         invoke(dispatcher, row, request_fence=fence)
     assert scopes == [1, 1] and checks == [1]
     assert sent == [] and journal.get("s", "one", "principal").status == "RESERVED"
+
+
+@pytest.mark.parametrize(
+    "bad_field",
+    [
+        {"api_key": "synthetic"},
+        {"API-Key": "synthetic"},
+        {"apiKey": "synthetic"},
+        {"extra": "x" * 257},
+        {"extra": "\ud800"},
+        {"extra": 1.25},
+        {"extra": {"nested": 1}},
+        {str(i): "x" for i in range(129)},
+    ],
+)
+def test_unrepresentable_extra_identity_field_rejects_before_commit_and_send(setup, bad_field):
+    journal, guard = setup
+    row = reserve(journal)
+    sent = []
+    # The identity has usable strong session fields; a separate malformed
+    # extra field must still fail before the durable marker is written.
+    value = NativeOrderIdentity(
+        "TEST", "ref", {"trading_day": "20300101", "front_id": 1, "session_id": 7}, 1
+    )
+    object.__setattr__(value, "fields", {**value.fields, **bad_field})
+
+    def native(payload, port, scope):
+        marker = port.commit(marker_record(payload, scope, value))
+        if marker:
+            sent.append(marker)
+        return NativeDispatchOutcome(True, value, marker)
+
+    with pytest.raises(DirectDispatchError, match="PRE_DISPATCH_FAILED"):
+        invoke(build(journal, guard, native), row)
+    observed = journal.get("s", "one", "principal")
+    assert observed.status == "RESERVED" and observed.native_identity_json is None
+    assert observed.strong_identity_keys == () and sent == []

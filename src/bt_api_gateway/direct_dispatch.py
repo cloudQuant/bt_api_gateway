@@ -15,6 +15,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from bt_api_base.direct_write_protocol import NativeOrderIdentity, PreDispatchRecord, WriteOperation
+from bt_api_base.gateway_direct_protocol import (
+    GatewayDirectProtocolError,
+    validate_gateway_native_identity,
+)
 
 from .direct_command_journal import DirectCommandRecord, GatewayDirectCommandJournal, _json
 from .session_guard import LocalAccountSessionGuard
@@ -74,8 +78,10 @@ class NativeDispatchOutcome:
 def _identity(identity: NativeOrderIdentity, route: str) -> dict[str, object]:
     if type(identity) is not NativeOrderIdentity or identity.exchange_name != route:
         raise DirectDispatchError("IDENTITY_INVALID")
-    if identity.client_order_id is None and not identity.fields:
-        raise DirectDispatchError("IDENTITY_INVALID")
+    try:
+        validate_gateway_native_identity(identity)
+    except GatewayDirectProtocolError:
+        raise DirectDispatchError("IDENTITY_INVALID") from None
     try:
         fields_json = _json(dict(identity.fields))
     except Exception:

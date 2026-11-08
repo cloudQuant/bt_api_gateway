@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [{name = "cloudQuant", email = "yunjinqi@gmail.com"}]
-dependencies = ["bt_api_base>=0.15.8", "msgpack>=1.1"]
+dependencies = ["bt_api_base>=0.16.0.dev63", "msgpack>=1.1"]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff>=0.6", "mypy>=1.10"]
