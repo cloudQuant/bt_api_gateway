@@ -988,8 +988,8 @@ def test_learned_venue_key_blocks_later_command_dispatch(setup):
 
 def test_consumer_sparse_replay_ack_identity_and_reopen(setup):
     journal, ledger, guard, path = setup
-    command(journal)
-    command(journal, strategy="s2", key="req2", anchor="session-b")
+    first_command, _ = command(journal)
+    second_command, _ = command(journal, strategy="s2", key="req2", anchor="session-b")
     ledger.ingest(fact(kind=DirectExecutionEventKind.ORDER, status=DirectOrderStatus.ACCEPTED))
     ledger.ingest(
         fact(
@@ -1057,6 +1057,33 @@ def test_consumer_sparse_replay_ack_identity_and_reopen(setup):
         "s1", principal_id="p", consumer_ref="c", result_fits=lambda _: True
     )
     assert [event.sequence for event in replay.events] == [1, 3]
+    for event in replay.events:
+        assert (
+            event.request_key,
+            event.reservation_id,
+            event.command_digest,
+            event.command_principal,
+        ) == (
+            first_command.request_key,
+            first_command.reservation_id,
+            first_command.digest,
+            first_command.principal,
+        )
+        assert event.command_principal != "p"
+    other = ledger.read_events("s2")[0]
+    assert (
+        other.sequence,
+        other.request_key,
+        other.reservation_id,
+        other.command_digest,
+        other.command_principal,
+    ) == (
+        2,
+        second_command.request_key,
+        second_command.reservation_id,
+        second_command.digest,
+        second_command.principal,
+    )
     assert revision(journal) == before
     reopened = GatewayDirectCommandJournal(
         path,
@@ -1314,6 +1341,10 @@ def test_consumer_complete_envelope_budget_shrinks_page_and_rejects_first_atomic
                     "sequence": event.sequence,
                     "strategy_scope": event.strategy_scope,
                     "fact_digest": event.fact_digest,
+                    "request_key": event.request_key,
+                    "reservation_id": event.reservation_id,
+                    "command_digest": event.command_digest,
+                    "command_principal": event.command_principal,
                     "fact": event.fact.to_mapping(),
                 }
                 for event in page.events
@@ -1416,3 +1447,116 @@ def test_consumer_integrity_rejects_over_capacity_with_bounded_scan(setup, monke
         if sql.lower().lstrip().startswith("select * from direct_execution_consumers")
     ]
     assert scans == ["select * from direct_execution_consumers limit 3"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing_fact", "missing_command", "foreign_reservation", "strategy", "digest", "sequence"],
+)
+def test_event_read_rejects_corrupt_command_association_without_advancing(setup, mutation):
+    journal, ledger, guard, path = setup
+    first, _ = command(journal)
+    second, _ = command(journal, key="req2", anchor="session-b")
+    ledger.ingest(fact(kind=DirectExecutionEventKind.ORDER, status=DirectOrderStatus.ACCEPTED))
+    with sqlite3.connect(path) as db:
+        if mutation == "missing_fact":
+            db.execute("DELETE FROM direct_execution_facts")
+        elif mutation == "missing_command":
+            db.execute(
+                "DELETE FROM direct_journal_commands WHERE reservation_id=?",
+                (first.reservation_id,),
+            )
+        elif mutation == "foreign_reservation":
+            db.execute(
+                "UPDATE direct_execution_facts SET reservation_id=?", (second.reservation_id,)
+            )
+        elif mutation == "strategy":
+            db.execute(
+                "UPDATE direct_journal_commands SET strategy='other' WHERE reservation_id=?",
+                (first.reservation_id,),
+            )
+        elif mutation == "digest":
+            db.execute(
+                "UPDATE direct_journal_commands SET digest=? WHERE reservation_id=?",
+                ("0" * 64, first.reservation_id),
+            )
+        else:
+            db.execute("UPDATE direct_execution_facts SET event_sequence=99")
+    with pytest.raises(DirectCommandJournalError, match="INVALID_DATABASE"):
+        ledger.read_events("s1")
+    with pytest.raises(DirectCommandJournalError, match="INVALID_DATABASE"):
+        ledger.read_for_consumer(
+            "s1", principal_id="consumer", consumer_ref="c", result_fits=lambda _: True
+        )
+    assert (
+        ledger.consumer_progress("s1", principal_id="consumer", consumer_ref="c").offered_sequence
+        == 0
+    )
+
+
+def test_ledger_exact_journal_binding_same_pid_thread_and_wrong_pid(setup, monkeypatch):
+    from bt_api_gateway import direct_execution_journal as module
+
+    journal, ledger, guard, path = setup
+    results = []
+    thread = threading.Thread(
+        target=lambda: results.extend([ledger.is_bound_to(journal), ledger.is_bound_to(object())])
+    )
+    thread.start()
+    thread.join()
+    assert results == [True, False]
+    with monkeypatch.context() as patch:
+        patch.setattr(module.os, "getpid", lambda: ledger._pid + 1)
+        with pytest.raises(DirectCommandJournalError, match="WRONG_OWNER"):
+            ledger.is_bound_to(journal)
+
+
+def test_ack_response_budget_checked_before_update(setup):
+    from dataclasses import asdict
+
+    journal, ledger, guard, path = setup
+    command(journal)
+    ledger.ingest(fact(kind=DirectExecutionEventKind.ORDER, status=DirectOrderStatus.ACCEPTED))
+    page = ledger.read_for_consumer(
+        "s1", principal_id="consumer", consumer_ref="c", result_fits=lambda _: True
+    )
+
+    def response_size(progress):
+        return len(
+            json.dumps(
+                {
+                    "request_id": "r",
+                    "status": "OK",
+                    "progress": asdict(progress),
+                    "metadata": "x" * 128,
+                }
+            ).encode("utf-8")
+        )
+
+    baseline = ledger.consumer_progress("s1", principal_id="consumer", consumer_ref="c")
+    args = dict(principal_id="consumer", consumer_ref="c", sequence=1, expected_epoch=page.epoch)
+    with pytest.raises(DirectCommandJournalError, match="PAGE_TOO_LARGE"):
+        ledger.acknowledge(
+            "s1",
+            **args,
+            result_fits=lambda progress: (
+                response_size(progress) <= len(json.dumps(asdict(progress)).encode("utf-8"))
+            ),
+        )
+    with pytest.raises(DirectCommandJournalError, match="INVALID_INPUT"):
+        ledger.acknowledge("s1", **args, result_fits=lambda progress: 1)
+    with pytest.raises(DirectCommandJournalError, match="INVALID_INPUT"):
+        ledger.acknowledge("s1", **args, result_fits=1)
+
+    def fail(progress):
+        raise RuntimeError("budget failure")
+
+    with pytest.raises(RuntimeError, match="budget failure"):
+        ledger.acknowledge("s1", **args, result_fits=fail)
+    assert ledger.consumer_progress("s1", principal_id="consumer", consumer_ref="c") == baseline
+    assert (
+        ledger.acknowledge(
+            "s1", **args, result_fits=lambda progress: response_size(progress) < 10000
+        ).acknowledged_sequence
+        == 1
+    )

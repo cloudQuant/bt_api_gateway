@@ -423,3 +423,19 @@ authenticate callers or reassert native/guard health. Remote ACL, the client's
 atomic projection/cursor transaction and network ACK composition remain separate
 work. Explicit v4 migration preserves facts, commands and events atomically;
 normal opening never silently migrates a database.
+
+## Attributed execution delivery metadata
+
+Execution reads now join each event to its attributed fact and original command
+in the same transaction. The returned request key, reservation ID, command
+digest and command principal preserve that association; missing or inconsistent
+links fail instead of silently skipping an event. `is_bound_to` checks only
+same-process exact journal identity, without asserting guard freshness.
+
+ACK accepts a trusted `result_fits` callback evaluated before its update in the
+same transaction. Network composition must supply this check. A reply-budget
+failure leaves progress unchanged; a lost reply can still follow a committed
+ACK. These storage APIs do not authenticate callers. The SDK separately supplies
+the explicit execution-stream operations and lifecycle. The bounded association
+query uses SQLite JSON functions; target-engine and platform acceptance remain
+separate from local tests.

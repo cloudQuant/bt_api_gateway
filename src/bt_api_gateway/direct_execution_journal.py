@@ -25,6 +25,7 @@ from .direct_command_journal import (
     GatewayDirectCommandJournal,
     _json,
     _text,
+    payload_digest,
 )
 from .session_guard import LocalAccountSessionGuard
 
@@ -114,6 +115,10 @@ class ExecutionEvent:
     strategy_scope: str
     fact_digest: str
     fact: GatewayReturnFact
+    request_key: str
+    reservation_id: str
+    command_digest: str
+    command_principal: str
 
 
 @dataclass(frozen=True)
@@ -204,6 +209,11 @@ class GatewayDirectExecutionLedger:
     def _check_pid(self) -> None:
         if os.getpid() != self._pid:
             raise DirectCommandJournalError("WRONG_OWNER")
+
+    def is_bound_to(self, journal: object) -> bool:
+        """Check exact same-process journal identity without asserting guard freshness."""
+        self._check_pid()
+        return self._journal is journal
 
     @property
     def account_scope(self) -> str:
@@ -345,6 +355,84 @@ class GatewayDirectExecutionLedger:
             ).fetchone()
             return None if row is None else row[0]
 
+    def _event_rows(self, db, strategy, after_sequence, limit):
+        try:
+            return db.execute(
+                """SELECT e.*, f.fact_json AS stored_fact_json,
+                          f.disposition AS fact_disposition,
+                          f.event_sequence AS fact_event_sequence,
+                          f.reservation_id AS fact_reservation_id,
+                          c.reservation_id AS command_reservation_id,
+                          c.strategy AS command_strategy, c.request_key AS command_request_key,
+                          c.principal AS command_principal, c.digest AS command_digest,
+                          c.payload_json AS command_payload_json,
+                          c.strong_keys_json AS command_strong_keys_json,
+                          c.native_identity_json AS command_native_identity_json,
+                          c.status AS command_status,
+                          CASE WHEN json_type(e.fact_json, '$.identity_keys')='array'
+                                    AND json_array_length(e.fact_json, '$.identity_keys') BETWEEN 1 AND 16
+                          THEN (SELECT count(*) FROM direct_journal_strong_keys AS k
+                                WHERE k.account=e.account AND k.reservation_id=c.reservation_id
+                                AND k.strong_key IN
+                                  (SELECT value FROM json_each(e.fact_json, '$.identity_keys')))
+                          ELSE -1 END AS owned_identity_count
+                   FROM direct_execution_events AS e
+                   LEFT JOIN direct_execution_facts AS f
+                     ON f.account=e.account AND f.fact_digest=e.fact_digest
+                   LEFT JOIN direct_journal_commands AS c
+                     ON c.account=f.account AND c.reservation_id=f.reservation_id
+                   WHERE e.account=? AND e.strategy=? AND e.sequence>?
+                   ORDER BY e.sequence LIMIT ?""",
+                (self._journal.account_scope, strategy, after_sequence, limit),
+            ).fetchall()
+        except sqlite3.DatabaseError as exc:
+            raise DirectCommandJournalError("INVALID_DATABASE") from exc
+
+    def _event_from_row(self, row):
+        try:
+            fact = GatewayReturnFact.from_mapping(json.loads(row["fact_json"]))
+            payload = json.loads(row["command_payload_json"])
+            native = json.loads(row["command_native_identity_json"])
+            original_keys = json.loads(row["command_strong_keys_json"])
+            request_key = _text(row["command_request_key"])
+            reservation = _text(row["command_reservation_id"])
+            principal = _text(row["command_principal"])
+            digest = row["command_digest"]
+            if (
+                row["fact_disposition"] != "ATTRIBUTED"
+                or row["fact_event_sequence"] != row["sequence"]
+                or row["stored_fact_json"] != row["fact_json"]
+                or row["fact_reservation_id"] != reservation
+                or row["command_strategy"] != row["strategy"]
+                or row["command_status"] not in {"DISPATCHING", "SENT", "UNKNOWN", "NOT_SENT"}
+                or fact.account_scope != row["account"]
+                or fact.fact_digest() != row["fact_digest"]
+                or _json(fact.to_mapping()) != row["fact_json"]
+                or _json(payload) != row["command_payload_json"]
+                or payload_digest(payload) != digest
+                or not isinstance(original_keys, list)
+                or not set(fact.binding_keys) <= set(original_keys)
+                or not fact.identity_keys
+                or row["owned_identity_count"] != len(fact.identity_keys)
+                or not isinstance(native, dict)
+                or native.get("exchange_name") != fact.route
+                or not isinstance(payload, dict)
+                or payload.get("symbol") != fact.instrument.native_symbol
+            ):
+                raise ValueError("event command association")
+            return ExecutionEvent(
+                row["sequence"],
+                row["strategy"],
+                row["fact_digest"],
+                fact,
+                request_key,
+                reservation,
+                digest,
+                principal,
+            )
+        except Exception as exc:
+            raise DirectCommandJournalError("INVALID_DATABASE") from exc
+
     def read_events(
         self, strategy_scope: str, *, after_sequence: int = 0, limit: int = 256
     ) -> tuple[ExecutionEvent, ...]:
@@ -353,19 +441,8 @@ class GatewayDirectExecutionLedger:
             raise DirectCommandJournalError("INVALID_INPUT")
         _limit(limit)
         with self._read() as db:
-            rows = db.execute(
-                "SELECT * FROM direct_execution_events WHERE account=? AND strategy=? AND sequence>? ORDER BY sequence LIMIT ?",
-                (self._journal.account_scope, strategy, after_sequence, limit),
-            ).fetchall()
-            return tuple(
-                ExecutionEvent(
-                    row["sequence"],
-                    row["strategy"],
-                    row["fact_digest"],
-                    GatewayReturnFact.from_mapping(json.loads(row["fact_json"])),
-                )
-                for row in rows
-            )
+            rows = self._event_rows(db, strategy, after_sequence, limit)
+            return tuple(self._event_from_row(row) for row in rows)
 
     def _consumer_identity(self, strategy_scope: str, principal_id: str, consumer_ref: str):
         strategy, principal, consumer = map(_text, (strategy_scope, principal_id, consumer_ref))
@@ -446,19 +523,8 @@ class GatewayDirectExecutionLedger:
                 if row is None or expected_epoch != epoch or after_sequence > offered:
                     raise DirectCommandJournalError("INVALID_SEQUENCE")
                 self._require_event(db, account, strategy, after_sequence)
-            rows = db.execute(
-                "SELECT * FROM direct_execution_events WHERE account=? AND strategy=? AND sequence>? ORDER BY sequence LIMIT ?",
-                (account, strategy, after_sequence, limit + 1),
-            ).fetchall()
-            events = tuple(
-                ExecutionEvent(
-                    r["sequence"],
-                    r["strategy"],
-                    r["fact_digest"],
-                    GatewayReturnFact.from_mapping(json.loads(r["fact_json"])),
-                )
-                for r in rows[:limit]
-            )
+            rows = self._event_rows(db, strategy, after_sequence, limit + 1)
+            events = tuple(self._event_from_row(row) for row in rows[:limit])
             count = len(events)
             while True:
                 selected = events[:count]
@@ -501,14 +567,17 @@ class GatewayDirectExecutionLedger:
         consumer_ref: str,
         sequence: int,
         expected_epoch: str,
+        result_fits: Callable[[ExecutionConsumerProgress], bool] | None = None,
     ) -> ExecutionConsumerProgress:
-        """Persist a monotonic local acknowledgment without granting authority."""
+        """Persist an ACK; the optional budget check must be trusted and pure."""
         strategy, principal, consumer, epoch = self._consumer_identity(
             strategy_scope, principal_id, consumer_ref
         )
         self._sequence(sequence)
         if expected_epoch != epoch:
             raise DirectCommandJournalError("EPOCH_MISMATCH")
+        if result_fits is not None and not callable(result_fits):
+            raise DirectCommandJournalError("INVALID_INPUT")
         account = self._journal.account_scope
         with self._read() as db:
             row = self._consumer_row(db, account, strategy, principal, consumer)
@@ -516,12 +585,19 @@ class GatewayDirectExecutionLedger:
                 raise DirectCommandJournalError("INVALID_SEQUENCE")
             self._require_event(db, account, strategy, sequence)
             ack = max(row[1], sequence)
+            progress = ExecutionConsumerProgress(strategy, principal, consumer, epoch, row[0], ack)
+            if result_fits is not None:
+                fits = result_fits(progress)
+                if type(fits) is not bool:
+                    raise DirectCommandJournalError("INVALID_INPUT")
+                if not fits:
+                    raise DirectCommandJournalError("PAGE_TOO_LARGE")
             if ack != row[1]:
                 db.execute(
                     "UPDATE direct_execution_consumers SET acknowledged_sequence=? WHERE account=? AND principal=? AND consumer=? AND strategy=?",
                     (ack, account, principal, consumer, strategy),
                 )
-            return ExecutionConsumerProgress(strategy, principal, consumer, epoch, row[0], ack)
+            return progress
 
     def pending(self, *, limit: int = 256) -> tuple[ExecutionPending, ...]:
         _limit(limit)
