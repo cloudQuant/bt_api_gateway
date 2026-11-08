@@ -1781,7 +1781,7 @@ class GatewayMarketService:
                     require_source_descriptor=require_source_descriptor,
                 )
                 acquired.append(key)
-                snapshot = dict(self._hub.snapshot(key))
+                snapshot = dict(self._hub.snapshot(key, principal_ref=principal_ref))
                 event = snapshot["event"]
                 snapshot["event"] = None if event is None else dict(_envelope_mapping(event))
                 head = dict(self._hub.head(key))

@@ -731,12 +731,12 @@ def test_market_bootstrap_many_returns_rejected_after_confirmed_partial_rollback
     snapshot = hub.snapshot
     calls = 0
 
-    def fail_second_snapshot(key: MarketSubscriptionKey):
+    def fail_second_snapshot(key: MarketSubscriptionKey, *, principal_ref: str | None = None):
         nonlocal calls
         calls += 1
         if key == second:
             raise RuntimeError("synthetic snapshot serialization failure")
-        return snapshot(key)
+        return snapshot(key, principal_ref=principal_ref)
 
     monkeypatch.setattr(hub, "snapshot", fail_second_snapshot)
     result = service.handle(
