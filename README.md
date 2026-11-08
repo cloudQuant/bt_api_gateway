@@ -474,3 +474,51 @@ Direct journal schema v7 adds cancellation-error association in the existing dat
 The existing command database uses schema v8. Explicit `upgrade_v7` (and the existing earlier-version upgrade entrypoints) retains old records without inventing missing native preparation. New prepared PLACE requests persist their exact value, digest and operation-specific keys in the same transaction as the native dispatch marker. No new account owner or separate command database is introduced.
 
 Source-associated insert errors enter through `ingest_place_error`, which checks the original preparation and command within the fact/association/event transaction. Generic ingestion rejects the new fact version. Reads and database reopen cross-check association ownership. These observations do not finish the original command, release quantities, or discard later trades. Account authentication, native source validation and final grant checks remain the responsibility of SDK/provider composition.
+
+
+### Iteration 63 R23: bounded asynchronous market bootstrap
+
+A trusted provider exposing all of `begin_subscribe`, `subscription_ready` and
+`probe_source` enables the three operations `market.bootstrap_begin`,
+`market.bootstrap_status` and `market.bootstrap_cancel`. All provider progress
+checks must be nonblocking. The async service refuses its old synchronous
+`market.subscribe` and `market.bootstrap_many` RPCs before provider calls;
+ordinary synchronous providers keep their existing capabilities.
+
+Begin takes a 32-character lowercase hexadecimal `operation_id`, 1–20 unique
+`subscriptions`, and optional `refresh_existing` (default false). Status and
+cancel take only the operation ID. The authenticated registration scopes the ID.
+Repeated identical content retrieves the original operation; conflicting content
+is refused. Cancelling an unknown ID leaves a tombstone so a late begin cannot
+start it. `not_found` does not prove that a request was never sent.
+
+Pending references count toward capacity and protect the original upstream;
+they are not active event consumers. A shared key acquires one handle. Each
+reference retains its operation owner token so an old cancellation cannot remove
+a newer subscription. `refresh_existing=True` can borrow the original active
+reference under the same principal and registration to obtain fresh snapshots
+and, when requested, source descriptors. Cancelling the refresh never releases
+a borrowed reference. Once an active response has been offered, one member
+leaving does not implicitly cancel the other members; stale cached responses
+are withheld and retained references remain explicit.
+
+Defaults are 16 operation records per registration, 128 per Hub, a 30-second
+startup deadline and 32 progress steps per maintenance call. Retained results
+have a 32 MiB aggregate limit plus the wire response limit. Pending and terminal
+records both count; they are not silently evicted to permit ID reuse. A trusted
+composition can configure bounds. Registration expiry removes a record only
+once its cleanup is confirmed. Pending-only handles can finish source reset/ACK
+without draining events before activation.
+
+A fresh async begin requires an explicit `result_fits` callback; the SDK Host
+supplies the complete response budget. A trusted local caller with no wire
+budget must explicitly select its own check. An active result cannot be offered
+without the full check. Repeating a query with a smaller response budget does
+not recreate the operation. Revocation, epoch changes, unavailable delivery and
+unconfirmed unsubscribe retain their original identities and cleanup state;
+`cancelled` is never shorthand for an uncertain release.
+
+These are registration-scoped in-memory market-resource records. They neither
+replace the durable trading journal nor attest provider/account readiness.
+Local synthetic and loopback results are separate from complete deployment,
+platform, native-account and whole-iteration acceptance.

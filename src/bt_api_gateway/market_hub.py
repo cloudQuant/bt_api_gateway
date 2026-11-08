@@ -66,13 +66,18 @@ MARKET_OPERATIONS = frozenset(
 )
 # Potential operations for trusted capability discovery. ``SUPPORTED_OPERATIONS``
 # remains the five-operation default for callers that have not configured history.
+ASYNC_BOOTSTRAP_OPERATIONS = frozenset(
+    {"market.bootstrap_begin", "market.bootstrap_status", "market.bootstrap_cancel"}
+)
 MARKET_HISTORY_OPERATION = "market.history"
 ALL_MARKET_OPERATIONS = MARKET_OPERATIONS | frozenset({MARKET_HISTORY_OPERATION})
 MARKET_OPERATIONS_WITH_BOUNDED_READ_AFTER = MARKET_OPERATIONS | frozenset(
     {MARKET_READ_AFTER_BOUNDED_OPERATION}
 )
-ALL_MARKET_OPERATIONS_WITH_BOUNDED_READ_AFTER = ALL_MARKET_OPERATIONS | frozenset(
-    {MARKET_READ_AFTER_BOUNDED_OPERATION}
+ALL_MARKET_OPERATIONS_WITH_BOUNDED_READ_AFTER = (
+    ALL_MARKET_OPERATIONS
+    | ASYNC_BOOTSTRAP_OPERATIONS
+    | frozenset({MARKET_READ_AFTER_BOUNDED_OPERATION})
 )
 SUPPORTED_OPERATIONS = MARKET_OPERATIONS
 DEFAULT_MARKET_READ_LIMIT = 100
@@ -240,12 +245,44 @@ class _MarketStream:
     sequence: int = 0
     handle: object | None = None
     registrations: set[str] = field(default_factory=set)
+    pending_refs: dict[str, str] = field(default_factory=dict)
+    ref_owners: dict[str, str] = field(default_factory=dict)
     starting: bool = False
     start_uncertain: bool = False
     releasing: bool = False
     pending_release: bool = False
     needs_new_epoch: bool = False
     generation: str | None = None
+
+
+@dataclass
+class _BootstrapJob:
+    operation_id: str
+    registration_id: str
+    principal_ref: str
+    registration: GatewayMarketRegistration
+    payload: tuple[tuple[MarketSubscriptionKey, bool], ...] | None
+    token: str
+    deadline: float
+    status: str = "pending"
+    code: str = ""
+    index: int = 0
+    phase: str = "start"
+    descriptors: dict[MarketSubscriptionKey, MarketSourceDescriptor] = field(default_factory=dict)
+    items: list[dict[str, object]] = field(default_factory=list)
+    epochs: dict[MarketSubscriptionKey, str] = field(default_factory=dict)
+    waiting: dict[MarketSubscriptionKey, tuple[object | None, str | None]] = field(
+        default_factory=dict
+    )
+    result: dict[str, object] | None = None
+    result_size: int = 0
+    first_reply: bool = False
+    refresh_existing: bool = False
+    borrowed: dict[MarketSubscriptionKey, str] = field(default_factory=dict)
+    owned_handles: dict[MarketSubscriptionKey, tuple[object, str | None]] = field(
+        default_factory=dict
+    )
+    uncertain: set[MarketSubscriptionKey] = field(default_factory=set)
 
 
 class GatewayMarketHub:
@@ -285,11 +322,46 @@ class GatewayMarketHub:
         principal_allowed_history_keys: Mapping[str, Collection[MarketSubscriptionKey]]
         | None = None,
         provider_cleanup_confirmed: Callable[[], bool] | None = None,
+        bootstrap_clock: Callable[[], float] = time.monotonic,
+        bootstrap_timeout_seconds: float = 30.0,
+        bootstrap_max_jobs_per_registration: int = 16,
+        bootstrap_max_jobs: int = 128,
+        bootstrap_max_result_bytes: int = 32 * 1024 * 1024,
     ) -> None:
         if not callable(getattr(provider, "subscribe", None)) or not callable(
             getattr(provider, "unsubscribe", None)
         ):
             raise GatewayMarketHubError("INVALID_PROVIDER")
+        async_methods = tuple(
+            callable(getattr(provider, name, None))
+            for name in ("begin_subscribe", "subscription_ready", "probe_source")
+        )
+        if any(async_methods) and not all(async_methods):
+            raise GatewayMarketHubError("INVALID_ASYNC_PROVIDER")
+        if (
+            not callable(bootstrap_clock)
+            or type(bootstrap_timeout_seconds) not in (int, float)
+            or not math.isfinite(bootstrap_timeout_seconds)
+            or bootstrap_timeout_seconds <= 0
+            or any(
+                type(value) is not int or value <= 0
+                for value in (
+                    bootstrap_max_jobs_per_registration,
+                    bootstrap_max_jobs,
+                    bootstrap_max_result_bytes,
+                )
+            )
+        ):
+            raise GatewayMarketHubError("INVALID_BOOTSTRAP_CONFIGURATION")
+        self._async_bootstrap = all(async_methods)
+        self._bootstrap_clock = bootstrap_clock
+        self._bootstrap_timeout = float(bootstrap_timeout_seconds)
+        self._bootstrap_per_registration = bootstrap_max_jobs_per_registration
+        self._bootstrap_max_jobs = bootstrap_max_jobs
+        self._bootstrap_max_result_bytes = bootstrap_max_result_bytes
+        self._bootstrap_jobs: dict[tuple[str, str], _BootstrapJob] = {}
+        self._bootstrap_result_bytes = 0
+        self._bootstrap_cursor = 0
         if type(max_replay_events) is not int or max_replay_events <= 0:
             raise GatewayMarketHubError("INVALID_REPLAY_LIMIT")
         if max_replay_events > MAX_MARKET_REPLAY_EVENTS:
@@ -381,15 +453,13 @@ class GatewayMarketHub:
         self._grant_floors: dict[tuple[str, MarketSubscriptionKey], tuple[str, int]] = {}
         self._regrant: Callable[[Mapping[str, frozenset[str]]], object] | None = None
         self._delivery_suspended = False
-        self._authorization_diagnostics = (
-            {
-                "authorization_revocations": 0,
-                "authorization_grants": 0,
-                "revoked_registrations": 0,
-                "authorization_floor_gaps": 0,
-                "publisher_regrant_failures": 0,
-            }
-        )
+        self._authorization_diagnostics = {
+            "authorization_revocations": 0,
+            "authorization_grants": 0,
+            "revoked_registrations": 0,
+            "authorization_floor_gaps": 0,
+            "publisher_regrant_failures": 0,
+        }
         for key in copied_keys:
             if key.stream_id in self._stream_by_id:
                 raise GatewayMarketHubError("STREAM_ID_COLLISION")
@@ -442,7 +512,10 @@ class GatewayMarketHub:
     @property
     def supported_operations(self) -> frozenset[str]:
         """Operations available from this configured hub instance."""
-        return ALL_MARKET_OPERATIONS if self._history_provider is not None else MARKET_OPERATIONS
+        operations = (
+            ALL_MARKET_OPERATIONS if self._history_provider is not None else MARKET_OPERATIONS
+        )
+        return operations | ASYNC_BOOTSTRAP_OPERATIONS if self._async_bootstrap else operations
 
     @property
     def history_enabled(self) -> bool:
@@ -473,7 +546,7 @@ class GatewayMarketHub:
         pending = sum(
             1
             for stream in self._streams.values()
-            if stream.handle is not None and not stream.registrations
+            if stream.handle is not None and not stream.registrations and not stream.pending_refs
         )
         active_upstreams = sum(
             1
@@ -596,9 +669,7 @@ class GatewayMarketHub:
             }
         )
 
-    def grant_floor(
-        self, principal_ref: str, key: MarketSubscriptionKey
-    ) -> tuple[str, int] | None:
+    def grant_floor(self, principal_ref: str, key: MarketSubscriptionKey) -> tuple[str, int] | None:
         """``(epoch, sequence)`` below which ``principal_ref`` may not read ``key``."""
         return self._grant_floors.get((principal_ref, key))
 
@@ -636,6 +707,14 @@ class GatewayMarketHub:
         self._principal_allowed_keys = MappingProxyType(acl)
         self._authorization_generation += 1
         self._authorization_diagnostics["authorization_revocations"] += 1
+        for job in self._bootstrap_jobs.values():
+            if (
+                job.principal_ref == principal_ref
+                and job.payload is not None
+                and any(key in revoked for key, _ in job.payload)
+                and (job.status == "pending" or (job.status == "active" and not job.first_reply))
+            ):
+                self._bootstrap_cancel(job, "MARKET_KEY_DENIED", final="rejected")
         dropped = 0
         for key in revoked:
             stream = self._streams[key]
@@ -643,14 +722,15 @@ class GatewayMarketHub:
             owned = {
                 registration
                 for registration in stream.registrations
-                if self._registration_principals.get((key, registration)) == principal_ref
+                if (self._registration_principals.get((key, registration)) == principal_ref)
             }
             for registration in owned:
                 stream.registrations.discard(registration)
+                stream.ref_owners.pop(registration, None)
                 self._registration_principals.pop((key, registration), None)
                 self._registration_ref_count -= 1
                 dropped += 1
-            if not stream.registrations and stream.handle is not None:
+            if not stream.registrations and not stream.pending_refs and stream.handle is not None:
                 self._attempt_release(stream)
         self._authorization_diagnostics["revoked_registrations"] += dropped
         transport = self._apply_regrant()
@@ -762,6 +842,10 @@ class GatewayMarketHub:
         if stream.start_uncertain:
             raise GatewayMarketHubError("PROVIDER_SUBSCRIBE_OUTCOME_UNKNOWN", retryable=True)
 
+        if registration_id in stream.pending_refs or (
+            stream.pending_refs and not stream.registrations
+        ):
+            raise GatewayMarketHubError("STREAM_TRANSITION_IN_PROGRESS", retryable=True)
         already_subscribed = registration_id in stream.registrations
         if already_subscribed:
             descriptor = self._describe_source(stream) if require_source_descriptor else None
@@ -776,6 +860,7 @@ class GatewayMarketHub:
         if (
             stream.handle is not None
             and not stream.registrations
+            and not stream.pending_refs
             and not self._attempt_release(stream)
         ):
             # A failed final unsubscribe leaves an uncertain handle. Retry the
@@ -857,10 +942,12 @@ class GatewayMarketHub:
             raise GatewayMarketHubError("PROVIDER_SUBSCRIBE_OUTCOME_UNKNOWN", retryable=True)
         if registration_id in stream.registrations:
             stream.registrations.remove(registration_id)
+            stream.ref_owners.pop(registration_id, None)
             self._registration_principals.pop((key, registration_id), None)
             self._registration_ref_count -= 1
         if (
             not stream.registrations
+            and not stream.pending_refs
             and stream.handle is not None
             and not self._attempt_release(stream)
         ):
@@ -892,20 +979,29 @@ class GatewayMarketHub:
         active = frozenset(
             _copy_reference_set(active_registration_ids, "INVALID_ACTIVE_REGISTRATIONS")
         )
+        for job in tuple(self._bootstrap_jobs.values()):
+            if job.registration_id not in active and (
+                job.status in {"pending", "active"}
+                or (job.status == "unknown" and job.code == "BOOTSTRAP_STALE")
+            ):
+                self._bootstrap_cancel(job, "REGISTRATION_EXPIRED", final="cancelled")
+        self._bootstrap_advance(32)
         pruned = 0
         released = 0
         for stream in self._streams.values():
             if stream.starting or stream.releasing:
                 continue
-            stale = stream.registrations - active
+            stale = (stream.registrations - active) - stream.ref_owners.keys()
             if stale:
                 stream.registrations.difference_update(stale)
                 for registration in stale:
                     self._registration_principals.pop((stream.key, registration), None)
+                    stream.ref_owners.pop(registration, None)
                 pruned += len(stale)
                 self._registration_ref_count -= len(stale)
             if (
                 not stream.registrations
+                and not stream.pending_refs
                 and stream.handle is not None
                 and self._attempt_release(stream)
             ):
@@ -913,8 +1009,9 @@ class GatewayMarketHub:
         pending = sum(
             1
             for stream in self._streams.values()
-            if stream.handle is not None and not stream.registrations
+            if stream.handle is not None and not stream.registrations and not stream.pending_refs
         )
+        self._bootstrap_forget_inactive(active)
         self._drain_provider_events()
         return MappingProxyType(
             {
@@ -927,14 +1024,14 @@ class GatewayMarketHub:
     def _drain_provider_events(self) -> None:
         """Poll active provider handles fairly under a strict per-maintain cap."""
         poller = self._provider_poller
-        if poller is None:
+        if poller is None and self._provider_epoch_resetter is None:
             return
         streams = tuple(
             stream
             for stream in self._streams.values()
             if (
                 stream.handle is not None
-                and stream.registrations
+                and (stream.registrations or stream.pending_refs)
                 and not stream.starting
                 and not stream.releasing
                 and not stream.pending_release
@@ -989,6 +1086,9 @@ class GatewayMarketHub:
                     self._source_diagnostics["provider_epoch_reset_failures"] += 1
                     exhausted.add(stream_index)
                     continue
+            if not stream.registrations or poller is None:
+                exhausted.add(stream_index)
+                continue
             self._source_diagnostics["provider_poll_calls"] += 1
             try:
                 batch = poller(stream.handle, limit=1)
@@ -1302,6 +1402,14 @@ class GatewayMarketHub:
         self._check_owner()
         if any(stream.starting for stream in self._streams.values()):
             raise GatewayMarketHubError("PROVIDER_START_IN_PROGRESS", retryable=True)
+        for job in self._bootstrap_jobs.values():
+            if job.status in {"pending", "active"} or (
+                job.status == "unknown" and job.code == "BOOTSTRAP_STALE"
+            ):
+                self._bootstrap_cancel(job, "HUB_CLOSED", final="cancelled")
+            if job.status == "cancelling":
+                while job.index < len(job.payload or ()):
+                    self._bootstrap_cleanup_step(job)
         confirmed = False
         if self._provider_cleanup_confirmed is not None:
             try:
@@ -1316,6 +1424,8 @@ class GatewayMarketHub:
                 stream.start_uncertain = False
                 stream.pending_release = False
                 stream.registrations.clear()
+                stream.pending_refs.clear()
+                stream.ref_owners.clear()
             self._registration_ref_count = 0
             self._registration_principals.clear()
             return
@@ -1326,12 +1436,293 @@ class GatewayMarketHub:
         for stream in self._streams.values():
             self._registration_ref_count -= len(stream.registrations)
             stream.registrations.clear()
+            stream.pending_refs.clear()
+            stream.ref_owners.clear()
         self._registration_principals.clear()
         for stream in self._streams.values():
             if stream.handle is not None and not self._attempt_release(stream):
                 failed += 1
         if failed:
             raise GatewayMarketHubError("PROVIDER_UNSUBSCRIBE_FAILED", retryable=True)
+
+    def _bootstrap_cancel(self, job: _BootstrapJob, code: str, *, final: str) -> None:
+        if job.result_size:
+            self._bootstrap_result_bytes -= job.result_size
+            job.result_size = 0
+            job.result = None
+        job.items.clear()
+        job.descriptors.clear()
+        job.status = "cancelling"
+        job.code = code
+        job.phase = final
+        job.index = 0
+        if not job.payload:
+            self._bootstrap_check_cleanup(job)
+
+    def _bootstrap_cleanup_step(self, job: _BootstrapJob) -> None:
+        payload = job.payload or ()
+        if job.index < len(payload):
+            key, _ = payload[job.index]
+            job.index += 1
+            stream = self._streams[key]
+            owned = False
+            if stream.pending_refs.get(job.registration_id) == job.token:
+                del stream.pending_refs[job.registration_id]
+                if key not in job.borrowed:
+                    self._registration_ref_count -= 1
+                    owned = True
+            if stream.ref_owners.get(job.registration_id) == job.token:
+                stream.ref_owners.pop(job.registration_id, None)
+                stream.registrations.discard(job.registration_id)
+                self._registration_principals.pop((key, job.registration_id), None)
+                self._registration_ref_count -= 1
+                owned = True
+            if owned and not stream.registrations and not stream.pending_refs:
+                if stream.start_uncertain:
+                    job.waiting[key] = (None, None)
+                elif stream.handle is not None:
+                    handle, generation = stream.handle, stream.generation
+                    if not self._attempt_release(stream):
+                        job.waiting[key] = (handle, generation)
+        self._bootstrap_check_cleanup(job)
+
+    def _bootstrap_check_cleanup(self, job: _BootstrapJob) -> None:
+        for key, (handle, generation) in tuple(job.waiting.items()):
+            stream = self._streams[key]
+            if handle is None:
+                if not stream.start_uncertain:
+                    del job.waiting[key]
+            elif (
+                stream.handle is not handle
+                or stream.generation != generation
+                or stream.registrations
+                or stream.pending_refs
+            ):
+                del job.waiting[key]
+        if job.index >= len(job.payload or ()) and not job.waiting:
+            job.status = job.phase
+
+    def _bootstrap_forget_inactive(self, active: frozenset[str]) -> None:
+        for ident, job in tuple(self._bootstrap_jobs.items()):
+            if job.registration_id not in active and (
+                job.status in {"cancelled", "rejected"}
+                or (
+                    job.status == "unknown"
+                    and job.code != "BOOTSTRAP_STALE"
+                    and not any(self._streams[key].start_uncertain for key in job.uncertain)
+                )
+            ):
+                self._bootstrap_result_bytes -= job.result_size
+                del self._bootstrap_jobs[ident]
+
+    def _bootstrap_advance(self, budget: int) -> None:
+        jobs = tuple(self._bootstrap_jobs.values())
+        if not jobs:
+            return
+        for _ in range(budget):
+            job = jobs[self._bootstrap_cursor % len(jobs)]
+            self._bootstrap_cursor = (self._bootstrap_cursor + 1) % len(jobs)
+            if job.status == "cancelling":
+                self._bootstrap_cleanup_step(job)
+                continue
+            if job.status != "pending":
+                continue
+            if self._bootstrap_clock() >= job.deadline:
+                self._bootstrap_cancel(job, "BOOTSTRAP_TIMEOUT", final="rejected")
+                continue
+            if not self.ready or self.delivery_suspended:
+                continue
+            try:
+                self._bootstrap_step(job)
+            except GatewayMarketHubError as exc:
+                self._bootstrap_cancel(job, exc.code, final="rejected")
+            except Exception:
+                self._bootstrap_cancel(job, "BOOTSTRAP_FAILED", final="rejected")
+
+    def _bootstrap_step(self, job: _BootstrapJob) -> None:
+        assert job.payload is not None
+        if job.index == len(job.payload):
+            result = {"operation_id": job.operation_id, "status": "active", "items": job.items}
+            try:
+                encoded = json.dumps(
+                    result, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+                ).encode("utf-8", errors="strict")
+            except Exception:
+                raise GatewayMarketHubError("INVALID_BOOTSTRAP_REPLY") from None
+            if len(encoded) > MAX_WIRE_MESSAGE_BYTES - 8192:
+                raise GatewayMarketHubError("BATCH_REPLY_TOO_LARGE")
+            delta = len(encoded) - job.result_size
+            if self._bootstrap_result_bytes + delta > self._bootstrap_max_result_bytes:
+                raise GatewayMarketHubError("BOOTSTRAP_RESULT_CAPACITY")
+            job.result = result
+            job.result_size = len(encoded)
+            self._bootstrap_result_bytes += delta
+            job.status = "active"
+            return
+        key, require_descriptor = job.payload[job.index]
+        stream = self._authorize_key(job.principal_ref, key)
+        if stream.pending_refs.get(job.registration_id) != job.token:
+            raise GatewayMarketHubError("BOOTSTRAP_STALE")
+        borrowed_owner = job.borrowed.get(key)
+        if borrowed_owner is not None and (
+            stream.ref_owners.get(job.registration_id) != borrowed_owner
+            or self._registration_principals.get((key, job.registration_id)) != job.principal_ref
+        ):
+            raise GatewayMarketHubError("BOOTSTRAP_STALE")
+        if job.phase == "start":
+            if stream.handle is None:
+                if stream.start_uncertain:
+                    raise GatewayMarketHubError("PROVIDER_SUBSCRIBE_OUTCOME_UNKNOWN")
+                next_epoch = self._new_epoch() if stream.needs_new_epoch else None
+                if next_epoch == stream.epoch:
+                    raise GatewayMarketHubError("EPOCH_FACTORY_REUSED_VALUE")
+                generation = secrets.token_urlsafe(32)
+                try:
+                    handle = self._provider.begin_subscribe(key, generation=generation)  # type: ignore[attr-defined]
+                except Exception:
+                    stream.start_uncertain = True
+                    raise GatewayMarketHubError("PROVIDER_SUBSCRIBE_OUTCOME_UNKNOWN") from None
+                if handle is None:
+                    stream.start_uncertain = True
+                    raise GatewayMarketHubError("PROVIDER_SUBSCRIBE_OUTCOME_UNKNOWN")
+                stream.handle, stream.generation = handle, generation
+                stream.pending_release = False
+                if next_epoch is not None:
+                    stream.epoch, stream.sequence = next_epoch, 0
+                    stream.events.clear()
+                    stream.replay_bytes = 0
+                    stream.needs_new_epoch = False
+            job.phase = "ready"
+            return
+        if stream.handle is None or stream.generation is None:
+            raise GatewayMarketHubError("BOOTSTRAP_STALE")
+        if job.phase == "ready":
+            try:
+                ready = self._provider.subscription_ready(stream.handle)  # type: ignore[attr-defined]
+            except Exception:
+                raise GatewayMarketHubError("PROVIDER_SUBSCRIBE_FAILED") from None
+            if type(ready) is not bool:
+                raise GatewayMarketHubError("PROVIDER_SUBSCRIBE_FAILED")
+            if ready:
+                job.phase = "descriptor" if require_descriptor else "activate"
+            return
+        if job.phase == "descriptor":
+            try:
+                descriptor = self._provider.probe_source(  # type: ignore[attr-defined]
+                    stream.handle,
+                    key=key,
+                    generation=stream.generation,
+                    stream_id=key.stream_id,
+                    epoch=stream.epoch,
+                )
+                if descriptor is None:
+                    return
+                if type(descriptor) is not MarketSourceDescriptor:
+                    raise ValueError
+                descriptor = MarketSourceDescriptor.from_dict(descriptor.to_dict())
+                if (
+                    descriptor.key != key
+                    or descriptor.stream_id != key.stream_id
+                    or descriptor.epoch != stream.epoch
+                    or descriptor.provider != key.instrument.provider
+                ):
+                    raise ValueError
+            except Exception:
+                raise GatewayMarketHubError("MARKET_SOURCE_DESCRIPTOR_UNAVAILABLE") from None
+            job.descriptors[key] = descriptor
+            job.phase = "activate"
+            return
+        if job.phase != "activate":
+            raise GatewayMarketHubError("BOOTSTRAP_FAILED")
+        descriptor = job.descriptors.get(key)
+        if descriptor is not None and descriptor.epoch != stream.epoch:
+            raise GatewayMarketHubError("MARKET_SOURCE_DESCRIPTOR_UNAVAILABLE")
+        snapshot = dict(self.snapshot(key, principal_ref=job.principal_ref))
+        event = snapshot["event"]
+        snapshot["event"] = None if event is None else dict(_envelope_mapping(event))
+        item = {
+            "subscription": dict(
+                self._subscription_result(
+                    stream,
+                    already_subscribed=borrowed_owner is not None,
+                    source_descriptor=descriptor,
+                )
+            ),
+            "snapshot": snapshot,
+            "head": dict(self.head(key)),
+        }
+        try:
+            item_size = len(
+                json.dumps(item, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode(
+                    "utf-8", errors="strict"
+                )
+            )
+        except Exception:
+            raise GatewayMarketHubError("INVALID_BOOTSTRAP_REPLY") from None
+        if job.result_size + item_size > MAX_WIRE_MESSAGE_BYTES - 8192:
+            raise GatewayMarketHubError("BATCH_REPLY_TOO_LARGE")
+        if self._bootstrap_result_bytes + item_size > self._bootstrap_max_result_bytes:
+            raise GatewayMarketHubError("BOOTSTRAP_RESULT_CAPACITY")
+        self._bootstrap_result_bytes += item_size
+        job.result_size += item_size
+        del stream.pending_refs[job.registration_id]
+        if borrowed_owner is None:
+            stream.registrations.add(job.registration_id)
+            stream.ref_owners[job.registration_id] = job.token
+            self._registration_principals[(key, job.registration_id)] = job.principal_ref
+            assert stream.handle is not None
+            job.owned_handles[key] = (stream.handle, stream.generation)
+        job.epochs[key] = stream.epoch
+        job.items.append(item)
+        job.index += 1
+        job.phase = "start"
+
+    def _bootstrap_view(self, job: _BootstrapJob) -> dict[str, object]:
+        if job.status == "active":
+            stale = any(
+                key not in self._principal_allowed_keys.get(job.principal_ref, ())
+                or self._streams[key].ref_owners.get(job.registration_id)
+                != job.borrowed.get(key, job.token)
+                or self._streams[key].epoch != job.epochs.get(key)
+                for key, _ in job.payload or ()
+            )
+            if stale:
+                if not job.first_reply:
+                    self._bootstrap_cancel(job, "BOOTSTRAP_STALE", final="rejected")
+                else:
+                    if job.result_size:
+                        self._bootstrap_result_bytes -= job.result_size
+                    job.result_size = 0
+                    job.result = None
+                    job.items.clear()
+                    job.descriptors.clear()
+                    job.status = "unknown"
+                    job.code = "BOOTSTRAP_STALE"
+        if job.status == "active":
+            assert job.result is not None
+            return job.result
+        result: dict[str, object] = {"operation_id": job.operation_id, "status": job.status}
+        if job.status in {"cancelling", "cancelled", "rejected", "unknown"}:
+            result["code"] = job.code
+        if job.status == "unknown":
+            if job.code == "BOOTSTRAP_STALE":
+                job.uncertain = {
+                    key
+                    for key, _ in job.payload or ()
+                    if (
+                        self._streams[key].ref_owners.get(job.registration_id)
+                        == job.borrowed.get(key, job.token)
+                    )
+                    or (
+                        key in job.owned_handles
+                        and self._streams[key].handle is job.owned_handles[key][0]
+                        and self._streams[key].generation == job.owned_handles[key][1]
+                        and not self._streams[key].registrations
+                        and not self._streams[key].pending_refs
+                    )
+                }
+            result["uncertain_stream_ids"] = tuple(sorted(key.stream_id for key in job.uncertain))
+        return result
 
     def _authorize_key(self, principal_ref: str, key: MarketSubscriptionKey) -> _MarketStream:
         _require_reference(principal_ref, "INVALID_PRINCIPAL_REF")
@@ -1515,6 +1906,11 @@ class GatewayMarketService:
         self._hub._check_owner()
         self._validate_registration(self._hub, registration_id, registration)
         existing = self._registrations.get(registration_id)
+        if any(
+            job.registration_id == registration_id and job.registration != registration
+            for job in self._hub._bootstrap_jobs.values()
+        ):
+            raise GatewayMarketServiceError("REGISTRATION_REBIND_DENIED")
         if existing is not None and existing != registration:
             raise GatewayMarketServiceError("REGISTRATION_REBIND_DENIED")
         if existing is None and len(self._registrations) >= MAX_MARKET_REGISTRATIONS:
@@ -1549,6 +1945,15 @@ class GatewayMarketService:
             raise GatewayMarketServiceError("UNSUPPORTED_OPERATION")
         self._resolve_registration(principal_ref, scope, registration_id)
         raw = _require_arguments(arguments)
+        if self._hub._async_bootstrap and operation in {
+            "market.subscribe",
+            "market.bootstrap_many",
+        }:
+            raise GatewayMarketServiceError("ASYNC_BOOTSTRAP_REQUIRED")
+        if operation in ASYNC_BOOTSTRAP_OPERATIONS:
+            return self._handle_async_bootstrap(
+                operation, principal_ref, registration_id, raw, result_fits
+            )
         if operation == "market.bootstrap_many":
             return self._handle_bootstrap_many(
                 principal_ref=principal_ref,
@@ -1692,6 +2097,202 @@ class GatewayMarketService:
         if low == 0:
             raise GatewayMarketServiceError("REPLAY_PAGE_TOO_LARGE")
         return candidate(low)
+
+    def _handle_async_bootstrap(
+        self,
+        operation: str,
+        principal_ref: str,
+        registration_id: str,
+        raw: Mapping[str, object],
+        result_fits: Callable[[Mapping[str, object]], bool] | None,
+    ) -> Mapping[str, object]:
+        """Refresh existing refs without ownership transfer; descriptors are opt-in per item."""
+        hub = self._hub
+        if operation == "market.bootstrap_begin":
+            if set(raw) not in (
+                {"operation_id", "subscriptions"},
+                {"operation_id", "subscriptions", "refresh_existing"},
+            ):
+                raise GatewayMarketServiceError("INVALID_ARGUMENTS")
+        else:
+            _require_exact_arguments(raw, {"operation_id"})
+        operation_id = raw["operation_id"]
+        if type(operation_id) is not str or re.fullmatch(r"[0-9a-f]{32}", operation_id) is None:
+            raise GatewayMarketServiceError("INVALID_OPERATION_ID")
+        ident = (registration_id, operation_id)
+        job = hub._bootstrap_jobs.get(ident)
+        if job is not None and job.registration != self._registrations[registration_id]:
+            raise GatewayMarketServiceError("REGISTRATION_REBIND_DENIED")
+        if operation == "market.bootstrap_begin":
+            refresh_existing = raw.get("refresh_existing", False)
+            if type(refresh_existing) is not bool:
+                raise GatewayMarketServiceError("INVALID_ARGUMENTS")
+            raw_items = raw["subscriptions"]
+            if type(raw_items) not in (tuple, list) or not 1 <= len(raw_items) <= 20:
+                raise GatewayMarketServiceError("INVALID_BOOTSTRAP_BATCH")
+            parsed = []
+            seen = set()
+            for item in raw_items:
+                if not isinstance(item, Mapping) or set(item) not in (
+                    {"key"},
+                    {"key", "require_source_descriptor"},
+                ):
+                    raise GatewayMarketServiceError("INVALID_BOOTSTRAP_BATCH")
+                requested = item.get("require_source_descriptor", False)
+                if type(requested) is not bool:
+                    raise GatewayMarketServiceError("INVALID_BOOTSTRAP_BATCH")
+                key = _parse_key(item["key"])
+                if key in seen:
+                    raise GatewayMarketServiceError("DUPLICATE_MARKET_KEY")
+                seen.add(key)
+                parsed.append((key, requested))
+            payload = tuple(parsed)
+            if job is not None:
+                if job.payload is not None and (
+                    job.payload != payload or job.refresh_existing != refresh_existing
+                ):
+                    raise GatewayMarketServiceError("OPERATION_ID_CONFLICT")
+            else:
+                if not callable(result_fits):
+                    raise GatewayMarketServiceError("REPLY_BUDGET_REQUIRED")
+                job = self._new_bootstrap_job(operation_id, registration_id, principal_ref, payload)
+                job.refresh_existing = refresh_existing
+                try:
+                    if not hub.ready or hub.delivery_suspended:
+                        raise GatewayMarketHubError("MARKET_NOT_READY")
+                    hub._ensure_open()
+                    if hub._publisher is None:
+                        raise GatewayMarketHubError("PUBLISHER_NOT_CONFIGURED")
+                    for key, _ in payload:
+                        stream = hub._authorize_key(principal_ref, key)
+                        if registration_id in stream.pending_refs:
+                            raise GatewayMarketHubError("MARKET_ALREADY_SUBSCRIBED")
+                        if registration_id in stream.registrations:
+                            owner = stream.ref_owners.get(registration_id)
+                            if (
+                                not refresh_existing
+                                or owner is None
+                                or hub._registration_principals.get((key, registration_id))
+                                != principal_ref
+                            ):
+                                raise GatewayMarketHubError("MARKET_ALREADY_SUBSCRIBED")
+                            job.borrowed[key] = owner
+                        if stream.start_uncertain:
+                            job.uncertain.add(key)
+                            continue
+                        if (
+                            stream.starting
+                            or stream.releasing
+                            or stream.pending_release
+                            or (
+                                stream.handle is not None
+                                and not stream.registrations
+                                and not stream.pending_refs
+                            )
+                        ):
+                            raise GatewayMarketHubError("STREAM_TRANSITION_IN_PROGRESS")
+                    if (
+                        hub._registration_ref_count + len(payload) - len(job.borrowed)
+                        > MAX_MARKET_REGISTRATION_REFS
+                    ):
+                        raise GatewayMarketHubError("REGISTRATION_REF_LIMIT_EXCEEDED")
+                    if job.uncertain:
+                        job.status, job.code = "unknown", "BATCH_SUBSCRIBE_OUTCOME_UNKNOWN"
+                    else:
+                        for key, _ in payload:
+                            hub._streams[key].pending_refs[registration_id] = job.token
+                            if key not in job.borrowed:
+                                hub._registration_ref_count += 1
+                except GatewayMarketHubError as exc:
+                    job.status, job.code = "rejected", exc.code
+        elif operation == "market.bootstrap_cancel":
+            if job is None:
+                job = self._new_bootstrap_job(operation_id, registration_id, principal_ref, None)
+                job.status, job.code = "cancelled", "BOOTSTRAP_CANCELLED"
+            elif job.status in {"pending", "active"} or (
+                job.status == "unknown" and job.code == "BOOTSTRAP_STALE"
+            ):
+                hub._bootstrap_cancel(job, "BOOTSTRAP_CANCELLED", final="cancelled")
+        elif job is None:
+            result = {"operation_id": operation_id, "status": "not_found"}
+            if result_fits is not None:
+                if not callable(result_fits):
+                    raise GatewayMarketServiceError("INVALID_REPLY_SIZE_CHECKER")
+                try:
+                    fits = result_fits(result)
+                except Exception:
+                    raise GatewayMarketServiceError("INVALID_REPLY_SIZE_CHECKER") from None
+                if type(fits) is not bool:
+                    raise GatewayMarketServiceError("INVALID_REPLY_SIZE_CHECKER")
+                if not fits:
+                    raise GatewayMarketServiceError("REPLY_TOO_LARGE")
+            return MappingProxyType(result)
+        assert job is not None
+        if job.status == "pending":
+            hub._bootstrap_advance(1)
+        elif job.status == "cancelling":
+            hub._bootstrap_cleanup_step(job)
+        result = hub._bootstrap_view(job)
+        if job.status == "active" and (not hub.ready or hub.delivery_suspended):
+            result = {
+                "operation_id": operation_id,
+                "status": "unknown",
+                "code": "MARKET_NOT_READY",
+                "uncertain_stream_ids": tuple(
+                    sorted(
+                        key.stream_id
+                        for key, _ in job.payload or ()
+                        if hub._streams[key].ref_owners.get(registration_id)
+                        == job.borrowed.get(key, job.token)
+                    )
+                ),
+            }
+        if result["status"] == "active" and not callable(result_fits):
+            raise GatewayMarketServiceError("REPLY_BUDGET_REQUIRED")
+        if result_fits is not None:
+            if not callable(result_fits):
+                raise GatewayMarketServiceError("INVALID_REPLY_SIZE_CHECKER")
+            try:
+                fits = result_fits(result)
+            except Exception:
+                raise GatewayMarketServiceError("INVALID_REPLY_SIZE_CHECKER") from None
+            if type(fits) is not bool:
+                raise GatewayMarketServiceError("INVALID_REPLY_SIZE_CHECKER")
+            if not fits:
+                if result["status"] == "active" and not job.first_reply:
+                    hub._bootstrap_cancel(job, "BATCH_REPLY_TOO_LARGE", final="rejected")
+                    hub._bootstrap_cleanup_step(job)
+                    raise GatewayMarketServiceError("REPLY_TOO_LARGE")
+                raise GatewayMarketServiceError("REPLY_TOO_LARGE")
+        if result["status"] == "active":
+            job.first_reply = True
+        return MappingProxyType(json.loads(json.dumps(result, allow_nan=False)))
+
+    def _new_bootstrap_job(
+        self,
+        operation_id: str,
+        registration_id: str,
+        principal_ref: str,
+        payload: tuple[tuple[MarketSubscriptionKey, bool], ...] | None,
+    ) -> _BootstrapJob:
+        hub = self._hub
+        if (
+            len(hub._bootstrap_jobs) >= hub._bootstrap_max_jobs
+            or sum(job.registration_id == registration_id for job in hub._bootstrap_jobs.values())
+            >= hub._bootstrap_per_registration
+        ):
+            raise GatewayMarketServiceError("BOOTSTRAP_JOB_CAPACITY")
+        job = _BootstrapJob(
+            operation_id,
+            registration_id,
+            principal_ref,
+            self._registrations[registration_id],
+            payload,
+            secrets.token_urlsafe(32),
+            hub._bootstrap_clock() + hub._bootstrap_timeout,
+        )
+        hub._bootstrap_jobs[(registration_id, operation_id)] = job
+        return job
 
     def _handle_bootstrap_many(
         self,
