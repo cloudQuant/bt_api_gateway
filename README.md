@@ -252,3 +252,29 @@ mypy                         # configured in pyproject.toml
 
 CI runs the tests on Python 3.10–3.13, Ruff (lint and format), mypy, and a
 wheel/sdist build on every push to `dev` and every pull request.
+
+## Iteration 63 internal command journal (development slice)
+
+`bt_api_gateway.direct_command_journal.GatewayDirectCommandJournal` adds bounded
+two-phase command storage. It is independent of the existing router and is not
+yet a trading owner or authenticated service. `create` exclusively creates a
+new database; reopening requires the externally retained journal identity and
+minimum revision. Recovery pages share one revision and reject intervening
+mutations. The external anchor may lag later commits, so these checks alone do
+not certify a restored backup.
+
+Reserve binds a strategy/request key, principal label and canonical payload to
+a UUID without allocating a native OrderRef. Release, expiry and dispatch
+compete in SQLite transactions. Dispatch persists the native identity and
+provider-neutral strong keys with unique ownership; retries never grant a new
+start. Terminal tombstones are retained. Identity keys, authentication, writer
+fencing and generation lifetime must be supplied by the trusted owner; labels
+and storage states do not prove provider facts or that a request was unsent.
+
+The current storage TTL is 10 seconds by default, bounded to 30 seconds, in the
+owner generation's monotonic clock domain. Payload numeric quantities must use
+canonical decimal strings or integers; binary floats are rejected. Native
+identity keys must be complete, sorted and unique. Recovery exposes all records
+to the trusted owner, not to unauthenticated remote clients. No provider sends,
+strategy ledger integration, automatic takeover or production route is enabled
+by this module. Version `0.2.0.dev63` is a development build, not release acceptance.
