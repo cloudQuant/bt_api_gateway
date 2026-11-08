@@ -6,14 +6,15 @@ net delta of applied trades in this journal, never an account baseline.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
 import threading
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal, localcontext
-from typing import Iterator
 
 from bt_api_base.direct_write_protocol import DirectExecutionEventKind
 from bt_api_base.gateway_execution_protocol import GatewayReturnFact
@@ -40,6 +41,43 @@ _EXECUTION_DDL = {
     "direct_execution_facts_pending": "CREATE INDEX direct_execution_facts_pending ON direct_execution_facts(account, disposition)",
     "direct_execution_events_strategy": "CREATE INDEX direct_execution_events_strategy ON direct_execution_events(account, strategy, sequence)",
 }
+
+
+_CONSUMER_DDL = "CREATE TABLE direct_execution_consumers (account TEXT NOT NULL, principal TEXT NOT NULL, consumer TEXT NOT NULL, strategy TEXT NOT NULL, offered_sequence INTEGER NOT NULL, acknowledged_sequence INTEGER NOT NULL, PRIMARY KEY(account, principal, consumer, strategy))"
+_MAX_CONSUMERS = 8192
+
+
+def _create_consumer_table(db: sqlite3.Connection) -> None:
+    db.execute(_CONSUMER_DDL)
+
+
+def _verify_consumer_integrity(db: sqlite3.Connection, account: str) -> None:
+    try:
+        rows = db.execute(
+            "SELECT * FROM direct_execution_consumers LIMIT ?", (_MAX_CONSUMERS + 1,)
+        ).fetchall()
+        if len(rows) > _MAX_CONSUMERS:
+            raise ValueError("consumer capacity")
+        for row in rows:
+            if row["account"] != account:
+                raise ValueError("consumer account")
+            for name in ("principal", "consumer", "strategy"):
+                _text(row[name])
+            offered, ack = row["offered_sequence"], row["acknowledged_sequence"]
+            if type(offered) is not int or type(ack) is not int or not 0 <= ack <= offered < 2**63:
+                raise ValueError("consumer sequence")
+            for sequence in (offered, ack):
+                if (
+                    sequence
+                    and db.execute(
+                        "SELECT 1 FROM direct_execution_events WHERE account=? AND strategy=? AND sequence=?",
+                        (account, row["strategy"], sequence),
+                    ).fetchone()
+                    is None
+                ):
+                    raise ValueError("consumer event")
+    except Exception as exc:
+        raise DirectCommandJournalError("INVALID_DATABASE") from exc
 
 
 def _create_execution_tables(db: sqlite3.Connection, account: str, max_facts: int) -> None:
@@ -76,6 +114,25 @@ class ExecutionEvent:
     strategy_scope: str
     fact_digest: str
     fact: GatewayReturnFact
+
+
+@dataclass(frozen=True)
+class ExecutionConsumerProgress:
+    strategy_scope: str
+    principal_id: str
+    consumer_ref: str
+    epoch: str
+    offered_sequence: int
+    acknowledged_sequence: int
+
+
+@dataclass(frozen=True)
+class ExecutionEventPage:
+    events: tuple[ExecutionEvent, ...]
+    epoch: str
+    offered_sequence: int
+    acknowledged_sequence: int
+    has_more: bool
 
 
 @dataclass(frozen=True)
@@ -125,9 +182,10 @@ class GatewayDirectExecutionLedger:
         self._owned()
         with journal._transaction() as db:
             self._owned()
-            journal._verify_v2_upgrade_integrity(db, schema_version=4)
+            journal._verify_v2_upgrade_integrity(db, schema_version=5)
             journal._verify_v4_identity_integrity(db)
             _verify_execution_integrity(db, journal.account_scope, journal._execution_max_facts)
+            _verify_consumer_integrity(db, journal.account_scope)
             self._owned()
 
     def _owned(self) -> None:
@@ -308,6 +366,162 @@ class GatewayDirectExecutionLedger:
                 )
                 for row in rows
             )
+
+    def _consumer_identity(self, strategy_scope: str, principal_id: str, consumer_ref: str):
+        strategy, principal, consumer = map(_text, (strategy_scope, principal_id, consumer_ref))
+        epoch = hashlib.sha256(
+            _json([self._journal.journal_id, self._journal.account_scope, strategy]).encode("ascii")
+        ).hexdigest()
+        return strategy, principal, consumer, epoch
+
+    @staticmethod
+    def _consumer_row(db, account, strategy, principal, consumer):
+        return db.execute(
+            "SELECT offered_sequence,acknowledged_sequence FROM direct_execution_consumers WHERE account=? AND principal=? AND consumer=? AND strategy=?",
+            (account, principal, consumer, strategy),
+        ).fetchone()
+
+    @staticmethod
+    def _sequence(value):
+        if type(value) is not int or not 0 <= value < 2**63:
+            raise DirectCommandJournalError("INVALID_INPUT")
+        return value
+
+    @staticmethod
+    def _require_event(db, account, strategy, sequence):
+        if (
+            sequence
+            and db.execute(
+                "SELECT 1 FROM direct_execution_events WHERE account=? AND strategy=? AND sequence=?",
+                (account, strategy, sequence),
+            ).fetchone()
+            is None
+        ):
+            raise DirectCommandJournalError("INVALID_SEQUENCE")
+
+    def consumer_progress(
+        self, strategy_scope: str, *, principal_id: str, consumer_ref: str
+    ) -> ExecutionConsumerProgress:
+        """Return local cursor state; labels do not authenticate the consumer."""
+        strategy, principal, consumer, epoch = self._consumer_identity(
+            strategy_scope, principal_id, consumer_ref
+        )
+        with self._read() as db:
+            row = self._consumer_row(db, self._journal.account_scope, strategy, principal, consumer)
+            return ExecutionConsumerProgress(
+                strategy, principal, consumer, epoch, *(tuple(row) if row else (0, 0))
+            )
+
+    def read_for_consumer(
+        self,
+        strategy_scope: str,
+        *,
+        principal_id: str,
+        consumer_ref: str,
+        result_fits: Callable[[ExecutionEventPage], bool],
+        after_sequence: int = 0,
+        expected_epoch: str | None = None,
+        limit: int = 256,
+    ) -> ExecutionEventPage:
+        """Offer a bounded page transactionally; result_fits must be trusted and pure.
+
+        The callback runs inside the SQLite transaction and must not perform I/O
+        or reenter this journal. An empty page creates no consumer and needs no
+        acknowledgment. No authorization or guard freshness is implied.
+        """
+        strategy, principal, consumer, epoch = self._consumer_identity(
+            strategy_scope, principal_id, consumer_ref
+        )
+        self._sequence(after_sequence)
+        _limit(limit)
+        if expected_epoch is not None and expected_epoch != epoch:
+            raise DirectCommandJournalError("EPOCH_MISMATCH")
+        if not callable(result_fits):
+            raise DirectCommandJournalError("INVALID_INPUT")
+        account = self._journal.account_scope
+        with self._read() as db:
+            row = self._consumer_row(db, account, strategy, principal, consumer)
+            offered, ack = tuple(row) if row else (0, 0)
+            if after_sequence:
+                if row is None or expected_epoch != epoch or after_sequence > offered:
+                    raise DirectCommandJournalError("INVALID_SEQUENCE")
+                self._require_event(db, account, strategy, after_sequence)
+            rows = db.execute(
+                "SELECT * FROM direct_execution_events WHERE account=? AND strategy=? AND sequence>? ORDER BY sequence LIMIT ?",
+                (account, strategy, after_sequence, limit + 1),
+            ).fetchall()
+            events = tuple(
+                ExecutionEvent(
+                    r["sequence"],
+                    r["strategy"],
+                    r["fact_digest"],
+                    GatewayReturnFact.from_mapping(json.loads(r["fact_json"])),
+                )
+                for r in rows[:limit]
+            )
+            count = len(events)
+            while True:
+                selected = events[:count]
+                new_offer = max(offered, selected[-1].sequence) if selected else offered
+                page = ExecutionEventPage(selected, epoch, new_offer, ack, len(rows) > count)
+                fits = result_fits(page)
+                if type(fits) is not bool:
+                    raise DirectCommandJournalError("INVALID_INPUT")
+                if fits:
+                    break
+                if count <= 1:
+                    raise DirectCommandJournalError("PAGE_TOO_LARGE")
+                count -= 1
+            if selected and (row is None or new_offer > offered):
+                if row is None:
+                    if (
+                        db.execute(
+                            "SELECT count(*) FROM direct_execution_consumers WHERE account=?",
+                            (account,),
+                        ).fetchone()[0]
+                        >= _MAX_CONSUMERS
+                    ):
+                        raise DirectCommandJournalError("CONSUMER_CAPACITY_EXCEEDED")
+                    db.execute(
+                        "INSERT INTO direct_execution_consumers VALUES (?, ?, ?, ?, ?, 0)",
+                        (account, principal, consumer, strategy, new_offer),
+                    )
+                else:
+                    db.execute(
+                        "UPDATE direct_execution_consumers SET offered_sequence=? WHERE account=? AND principal=? AND consumer=? AND strategy=?",
+                        (new_offer, account, principal, consumer, strategy),
+                    )
+            return page
+
+    def acknowledge(
+        self,
+        strategy_scope: str,
+        *,
+        principal_id: str,
+        consumer_ref: str,
+        sequence: int,
+        expected_epoch: str,
+    ) -> ExecutionConsumerProgress:
+        """Persist a monotonic local acknowledgment without granting authority."""
+        strategy, principal, consumer, epoch = self._consumer_identity(
+            strategy_scope, principal_id, consumer_ref
+        )
+        self._sequence(sequence)
+        if expected_epoch != epoch:
+            raise DirectCommandJournalError("EPOCH_MISMATCH")
+        account = self._journal.account_scope
+        with self._read() as db:
+            row = self._consumer_row(db, account, strategy, principal, consumer)
+            if row is None or sequence > row[0]:
+                raise DirectCommandJournalError("INVALID_SEQUENCE")
+            self._require_event(db, account, strategy, sequence)
+            ack = max(row[1], sequence)
+            if ack != row[1]:
+                db.execute(
+                    "UPDATE direct_execution_consumers SET acknowledged_sequence=? WHERE account=? AND principal=? AND consumer=? AND strategy=?",
+                    (ack, account, principal, consumer, strategy),
+                )
+            return ExecutionConsumerProgress(strategy, principal, consumer, epoch, row[0], ack)
 
     def pending(self, *, limit: int = 256) -> tuple[ExecutionPending, ...]:
         _limit(limit)

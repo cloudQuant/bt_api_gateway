@@ -182,11 +182,14 @@ class GatewayDirectCommandJournal:
             with self._connection() as db, self._transaction_on(db):
                 self._verify_schema(db)
                 self._assert_anchor(db)
-                self._verify_v2_upgrade_integrity(db, schema_version=4)
+                self._verify_v2_upgrade_integrity(db, schema_version=5)
                 self._verify_v4_identity_integrity(db)
                 from .direct_execution_journal import _verify_execution_integrity
 
                 _verify_execution_integrity(db, self._account, self._execution_max_facts)
+                from .direct_execution_journal import _verify_consumer_integrity
+
+                _verify_consumer_integrity(db, self._account)
         except sqlite3.DatabaseError as exc:
             raise DirectCommandJournalError("INVALID_DATABASE") from exc
 
@@ -246,8 +249,11 @@ class GatewayDirectCommandJournal:
                 from .direct_execution_journal import _create_execution_tables
 
                 _create_execution_tables(db, self._account, self._execution_max_facts)
+                from .direct_execution_journal import _create_consumer_table
+
+                _create_consumer_table(db)
                 db.execute(
-                    "INSERT INTO direct_journal_meta VALUES (?, 4, ?, ?, 0)",
+                    "INSERT INTO direct_journal_meta VALUES (?, 5, ?, ?, 0)",
                     (self._account, max_records, self._journal_id),
                 )
         return self
@@ -276,7 +282,7 @@ class GatewayDirectCommandJournal:
         ):
             raise DirectCommandJournalError("INVALID_INPUT")
         self._max_records = max_records
-        self._schema_version = 4
+        self._schema_version = 5
         self._execution_max_facts = execution_max_facts
         self._clock = clock
         self._timeout = timeout_seconds
@@ -315,7 +321,7 @@ class GatewayDirectCommandJournal:
         clock: Callable[[], float] = time.monotonic,
         timeout_seconds: float = 5.0,
     ) -> GatewayDirectCommandJournal:
-        """Explicitly upgrade an anchored v2 journal to v4 under the account guard."""
+        """Explicitly upgrade an anchored v2 journal to v5 under the account guard."""
         return cls._upgrade_legacy(
             database_path,
             account_scope,
@@ -345,7 +351,7 @@ class GatewayDirectCommandJournal:
         clock: Callable[[], float] = time.monotonic,
         timeout_seconds: float = 5.0,
     ) -> GatewayDirectCommandJournal:
-        """Explicitly upgrade an anchored v3 journal to v4 under the account guard."""
+        """Explicitly upgrade an anchored v3 journal to v5 under the account guard."""
         return cls._upgrade_legacy(
             database_path,
             account_scope,
@@ -358,6 +364,36 @@ class GatewayDirectCommandJournal:
             clock=clock,
             timeout_seconds=timeout_seconds,
             old_version=3,
+        )
+
+    @classmethod
+    def upgrade_v4(
+        cls,
+        database_path,
+        account_scope,
+        *,
+        generation,
+        guard,
+        expected_journal_id,
+        minimum_revision,
+        max_records=100000,
+        execution_max_facts=100000,
+        clock=time.monotonic,
+        timeout_seconds=5.0,
+    ) -> GatewayDirectCommandJournal:
+        """Explicitly upgrade an anchored v4 journal under the account guard."""
+        return cls._upgrade_legacy(
+            database_path,
+            account_scope,
+            generation=generation,
+            guard=guard,
+            expected_journal_id=expected_journal_id,
+            minimum_revision=minimum_revision,
+            max_records=max_records,
+            execution_max_facts=execution_max_facts,
+            clock=clock,
+            timeout_seconds=timeout_seconds,
+            old_version=4,
         )
 
     @classmethod
@@ -411,13 +447,22 @@ class GatewayDirectCommandJournal:
                 self._assert_anchor(db, schema_version=old_version)
                 self._verify_v2_upgrade_integrity(db, schema_version=old_version)
                 owned()
-                if old_version == 2:
-                    self._create_settlement_table(db)
-                from .direct_execution_journal import _create_execution_tables
+                from .direct_execution_journal import (
+                    _create_consumer_table,
+                    _create_execution_tables,
+                    _verify_execution_integrity,
+                )
 
-                _create_execution_tables(db, self._account, self._execution_max_facts)
+                if old_version == 4:
+                    self._verify_v4_identity_integrity(db)
+                    _verify_execution_integrity(db, self._account, self._execution_max_facts)
+                else:
+                    if old_version == 2:
+                        self._create_settlement_table(db)
+                    _create_execution_tables(db, self._account, self._execution_max_facts)
+                _create_consumer_table(db)
                 db.execute(
-                    "UPDATE direct_journal_meta SET schema_version=4, revision=revision+1 WHERE account=?",
+                    "UPDATE direct_journal_meta SET schema_version=5, revision=revision+1 WHERE account=?",
                     (self._account,),
                 )
                 owned()
@@ -447,7 +492,7 @@ class GatewayDirectCommandJournal:
                 "CREATE TABLE direct_journal_settlement (account TEXT NOT NULL, exchange_name TEXT NOT NULL, trading_day TEXT NOT NULL, account_binding TEXT NOT NULL, owner_generation TEXT NOT NULL, initial_session_generation INTEGER NOT NULL, initial_observation_id TEXT NOT NULL, marker_id TEXT, status TEXT NOT NULL, version INTEGER NOT NULL, confirmation_observation_id TEXT, PRIMARY KEY(account, exchange_name, trading_day))"
             )
             automatic.add("sqlite_autoindex_direct_journal_settlement_1")
-        if schema_version == 4:
+        if schema_version >= 4:
             from .direct_execution_journal import _EXECUTION_DDL
 
             expected.update(_EXECUTION_DDL)
@@ -462,6 +507,11 @@ class GatewayDirectCommandJournal:
                     "sqlite_autoindex_direct_execution_conflicts_1",
                 }
             )
+        if schema_version >= 5:
+            from .direct_execution_journal import _CONSUMER_DDL
+
+            expected["direct_execution_consumers"] = _CONSUMER_DDL
+            automatic.add("sqlite_autoindex_direct_execution_consumers_1")
         actual = {row[0] for row in db.execute("SELECT name FROM sqlite_master")}
         if actual != set(expected) | automatic:
             raise DirectCommandJournalError("INVALID_DATABASE")
@@ -537,7 +587,7 @@ class GatewayDirectCommandJournal:
                     "SELECT account, strong_key, reservation_id FROM direct_journal_strong_keys"
                 )
             }
-            if schema_version == 4:
+            if schema_version >= 4:
                 for alias in db.execute(
                     "SELECT account,strong_key,reservation_id FROM direct_execution_aliases"
                 ):
@@ -679,7 +729,7 @@ class GatewayDirectCommandJournal:
         except (ValueError, TypeError, KeyError, DirectCommandJournalError) as exc:
             raise DirectCommandJournalError("INVALID_DATABASE") from exc
 
-    def _verify_schema(self, db: sqlite3.Connection, *, schema_version: int = 4) -> None:
+    def _verify_schema(self, db: sqlite3.Connection, *, schema_version: int = 5) -> None:
         objects = {
             row[0]
             for row in db.execute("SELECT name FROM sqlite_master WHERE type IN ('table','index')")
@@ -778,8 +828,8 @@ class GatewayDirectCommandJournal:
                 raise DirectCommandJournalError("INVALID_DATABASE")
             if tuple(row[2] for row in db.execute(f"PRAGMA index_info({index})")) != index_columns:
                 raise DirectCommandJournalError("INVALID_DATABASE")
-        if schema_version == 4:
-            self._verify_exact_ddl(db, 4)
+        if schema_version >= 4:
+            self._verify_exact_ddl(db, schema_version)
             from .direct_execution_journal import _verify_execution_schema
 
             _verify_execution_schema(db, self._account, self._execution_max_facts)
@@ -802,7 +852,7 @@ class GatewayDirectCommandJournal:
             raise DirectCommandJournalError("JOURNAL_ID_MISMATCH")
         if type(revision) is not int or revision < self._minimum_revision:
             raise DirectCommandJournalError("REVISION_ROLLBACK")
-        if (self._schema_version if schema_version is None else schema_version) == 4:
+        if (self._schema_version if schema_version is None else schema_version) >= 4:
             row = db.execute("SELECT account,max_facts FROM direct_execution_meta").fetchall()
             if len(row) != 1 or tuple(row[0]) != (self._account, self._execution_max_facts):
                 raise DirectCommandJournalError("EXECUTION_CAPACITY_MISMATCH")
@@ -1438,6 +1488,6 @@ class GatewayDirectCommandJournal:
     def _transaction(self) -> Iterator[sqlite3.Connection]:
         with self._connection() as db, self._transaction_on(db):
             self._assert_anchor(db)
-            if self._schema_version == 4:
-                self._verify_exact_ddl(db, 4)
+            if self._schema_version >= 4:
+                self._verify_exact_ddl(db, self._schema_version)
             yield db

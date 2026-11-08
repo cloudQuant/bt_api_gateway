@@ -309,7 +309,7 @@ generation match; zero remaining TTL is not durable expiry or NOT_SENT.
 
 ### Iteration 63 daily settlement journal
 
-Journal schema v4 retains settlement records introduced by v3 in the same anchored SQLite database.
+Journal schema v5 retains settlement records introduced by v3 in the same anchored SQLite database.
 The account/route/trading-day key retains its initial observation, native and
 owner generations, and optional attempt marker. ATTEMPTING is durable before
 confirmation; UNKNOWN retains the attempt; CONFIRMED requires a trusted
@@ -317,11 +317,11 @@ provider observation supplied by the SDK owner. An existing daily record never
 grants another send marker. A fresh confirmed read may create a record without
 a send attempt. Commands and settlement records share the configured capacity.
 
-Existing v2 and v3 databases require explicit `upgrade_v2` or `upgrade_v3`
+Existing v2, v3 and v4 databases require explicit `upgrade_v2`, `upgrade_v3` or `upgrade_v4`
 with the matching acquired account guard, saved journal identity and revision
 anchor. Each transaction validates the old schema and record relationships,
 rejects extra triggers, retains command/release/identity/settlement data, adds
-the v4 execution tables and advances the revision once.
+the missing execution/consumer tables and advances the revision once.
 Failure rolls back; it never replaces the old database with an empty one.
 Older objects cannot write after the schema upgrade. Schema upgrade checks do
 not establish the authority of a restored backup or fence external writers.
@@ -375,7 +375,7 @@ Neither value establishes an account baseline, cost, fees or closeable capacity.
 match on reopen. New unique facts at capacity are rejected; existing duplicates
 remain readable. Pending reconciliation scans bounded pages fairly. Event reads
 are trusted local reads with a global sequence filtered by strategy, not an
-authenticated RPC or an ACK protocol. Native polling, complete recovery queries,
+authenticated RPC. Native polling, complete recovery queries,
 external baselines, state reduction and network consumption still require SDK
 composition and validation. Local synthetic tests are not account acceptance.
 
@@ -400,3 +400,26 @@ An exit error after commit is an uncertain response, not proof of rejection.
 This hook does not itself supply a startup/recovery admission policy.
 `GatewayDirectExecutionLedger.account_scope` is a read-only, owner-checked
 view of the account bound to its journal and guard.
+
+## Same-database strategy consumer progress
+
+Schema v5 adds bounded progress for each account/principal/consumer/strategy in
+the command database. `read_for_consumer` requires an explicit `result_fits`
+callback before committing offered progress. A network adapter must measure
+its complete response envelope; an explicitly unbounded local caller may pass
+an always-true callback. Pages shrink to fit, and an oversized first event
+creates or advances no consumer. Empty pages create no consumer and need no ACK.
+
+The epoch derives from journal identity, account and strategy, independently of
+native session generation. Sequence gaps between a strategy's events are valid.
+Positive resume and ACK must refer to that strategy's previously offered range;
+ACK is monotonic and records the consumer's durable-processing assertion only.
+Lost responses can be replayed. Progress updates do not change command/fact
+revision, remove audit history, or supply a recovery snapshot. Consumers are
+limited to 8192 per account; reopening verifies their fields and event references.
+
+These methods permit same-process cross-thread access through SQLite and do not
+authenticate callers or reassert native/guard health. Remote ACL, the client's
+atomic projection/cursor transaction and network ACK composition remain separate
+work. Explicit v4 migration preserves facts, commands and events atomically;
+normal opening never silently migrates a database.
