@@ -269,7 +269,10 @@ class GatewayDirectCancelJournal:
         *,
         target_identity,
         symbol,
+        before_commit=None,
     ):
+        if before_commit is not None and not callable(before_commit):
+            raise DirectCommandJournalError("INVALID_INPUT")
         strategy, operation_id, principal, request_key, reservation_id, digest, symbol = map(
             _text, (strategy, operation_id, principal, request_key, reservation_id, digest, symbol)
         )
@@ -290,6 +293,8 @@ class GatewayDirectCancelJournal:
                     old["symbol"],
                 ) != (principal, principal, request_key, reservation_id, digest, identity, symbol):
                     raise DirectCommandJournalError("REQUEST_CONFLICT")
+                if before_commit is not None:
+                    before_commit()
                 return _record(old)
             command = _target(
                 db,
@@ -334,7 +339,10 @@ class GatewayDirectCancelJournal:
                 ),
             )
             self.journal._bump(db)
-            return _record(self._require(db, strategy, operation_id, principal))
+            result = _record(self._require(db, strategy, operation_id, principal))
+            if before_commit is not None:
+                before_commit()
+            return result
 
     def get(self, strategy, operation_id, principal):
         strategy, operation_id, principal = map(_text, (strategy, operation_id, principal))

@@ -448,3 +448,8 @@ The current direct journal schema is v6. `GatewayDirectCommandJournal.upgrade_v5
 `GatewayDirectCancelJournal` binds each idempotent operation to one original command and persists its prepared native identity before dispatch. `GatewayDirectCancelDispatcher` reuses the exact original dispatcher/guard/journal. ORDER keys and CANCEL attempt keys are separate typed namespaces; keys remain unique within each namespace. Repeat DISPATCHING or completed attempts are observed without sending again. SENT means the cancel request was handed to native, not that the original order was cancelled. NOT_SENT/UNKNOWN affect only that attempt; original order and position facts remain unchanged. The current local path requires the original command principal; delegated cancellation is not implemented by this API.
 
 These classes are trusted local composition surfaces. They do not provide a cancel RPC, authenticate labels, handle native cancel callbacks, prove a recovered account, or establish real-account acceptance. `direct.release` still only releases an undispatched reservation.
+
+
+### Iteration 63 R16: authorized cancellation creation
+
+`GatewayDirectCancelJournal.request(..., before_commit=...)` invokes the trusted recheck after obtaining the SQLite write lock for both new and idempotent requests. Exceptions before commit roll back; a completed final recheck is the admission point for that local commit. A later local permit close does not undo a commit already admitted, and the owner must recheck again before dispatch. Remote operations and authentication are composed by the SDK; cancellation attempts do not alter the original order or positions.

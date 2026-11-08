@@ -368,3 +368,34 @@ def test_cancel_capacity_is_separate_and_bounded(tmp_path):
         assert journal.get("s", "order", "p") == order
     finally:
         guard.release()
+
+
+def test_request_before_commit_checks_new_and_duplicate_under_sqlite_lock(setup):
+    journal, cancel, guard, path = setup
+    order, identity = make_order(journal)
+    observed = []
+
+    def deny():
+        with sqlite3.connect(path, timeout=0) as db:
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                db.execute("BEGIN IMMEDIATE")
+        observed.append("checked")
+        raise RuntimeError("revoked")
+
+    args = ("s", "cancel", "p", order.request_key, order.reservation_id, order.digest)
+    with pytest.raises(RuntimeError, match="revoked"):
+        cancel.request(*args, target_identity=identity, symbol="X", before_commit=deny)
+    with pytest.raises(DirectCommandJournalError, match="NOT_FOUND"):
+        cancel.get("s", "cancel", "p")
+    row = cancel.request(
+        *args,
+        target_identity=identity,
+        symbol="X",
+        before_commit=lambda: observed.append("allowed"),
+    )
+    with pytest.raises(RuntimeError, match="revoked"):
+        cancel.request(*args, target_identity=identity, symbol="X", before_commit=deny)
+    assert cancel.get("s", "cancel", "p") == row
+    assert observed == ["checked", "allowed", "checked"]
+    with pytest.raises(DirectCommandJournalError, match="INVALID_INPUT"):
+        cancel.request(*args, target_identity=identity, symbol="X", before_commit=1)
