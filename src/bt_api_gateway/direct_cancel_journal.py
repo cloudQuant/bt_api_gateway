@@ -349,6 +349,12 @@ class GatewayDirectCancelJournal:
         with self.journal._transaction() as db:
             return _record(self._require(db, strategy, operation_id, principal))
 
+    def find_by_request_key(self, cancel_key: str) -> CancelRecord | None:
+        """Read the cancel-key namespace only; no authority or freshness implied."""
+        cancel_key = _text(cancel_key)
+        with self.journal._transaction() as db:
+            return _find_cancel_by_request_key(db, self.journal.account_scope, cancel_key)
+
     def begin_dispatch(
         self,
         strategy,
@@ -462,3 +468,85 @@ class GatewayDirectCancelJournal:
             )
             self.journal._bump(db)
             return _record(self._require(db, strategy, operation_id, principal))
+
+
+def _find_cancel_by_request_key(db, account, cancel_key):
+    """Validate a cancel-key association inside the caller's transaction."""
+    from .direct_command_journal import payload_digest
+
+    key_row = db.execute(
+        "SELECT attempt_id FROM direct_cancel_keys WHERE account=? AND strong_key=?",
+        (account, cancel_key),
+    ).fetchone()
+    if key_row is None:
+        return None
+    rows = db.execute(
+        "SELECT * FROM direct_cancel_attempts WHERE account=? AND attempt_id=?",
+        (account, key_row["attempt_id"]),
+    ).fetchall()
+    try:
+        if len(rows) != 1:
+            raise ValueError("cancel key orphan")
+        raw = rows[0]
+        attempt = _record(raw)
+        for value in (
+            attempt.strategy_scope,
+            attempt.operation_id,
+            attempt.principal,
+            attempt.target_principal,
+            attempt.request_key,
+            attempt.target_reservation_id,
+            attempt.target_digest,
+            attempt.symbol,
+            attempt.generation,
+        ):
+            _text(value)
+        _error(attempt.error_code)
+        parsed = uuid.UUID(attempt.attempt_id)
+        if (
+            str(parsed) != attempt.attempt_id
+            or parsed.version != 4
+            or attempt.account_scope != account
+            or attempt.principal != attempt.target_principal
+            or type(attempt.target_version) is not int
+            or attempt.target_version < 2
+            or (attempt.status == "DISPATCHING" and attempt.error_code is not None)
+            or attempt.status not in {"DISPATCHING", "SENT", "UNKNOWN", "NOT_SENT"}
+            or attempt.version != (2 if attempt.status == "DISPATCHING" else 3)
+            or attempt.marker_id != attempt.attempt_id
+            or attempt.prepared_cancel is None
+            or attempt.prepared_cancel.digest() != attempt.prepared_digest
+            or _json(attempt.prepared_cancel.to_mapping()) != raw["prepared_json"]
+            or cancel_key not in attempt.prepared_cancel.request_keys
+            or _target_json(attempt.prepared_cancel.target_identity) != raw["target_identity_json"]
+            or attempt.prepared_cancel.symbol != attempt.symbol
+        ):
+            raise ValueError("cancel attempt")
+        command = _target(
+            db,
+            account,
+            attempt.strategy_scope,
+            attempt.request_key,
+            attempt.target_reservation_id,
+            attempt.target_digest,
+            attempt.target_principal,
+        )
+        if (
+            command["native_identity_json"] != raw["target_identity_json"]
+            or command["version"] < attempt.target_version
+            or _request(command["payload_json"])["symbol"] != attempt.symbol
+            or payload_digest(json.loads(command["payload_json"])) != attempt.target_digest
+        ):
+            raise ValueError("cancel command")
+        stored = {
+            r[0]
+            for r in db.execute(
+                "SELECT strong_key FROM direct_cancel_keys WHERE account=? AND attempt_id=? LIMIT 17",
+                (account, attempt.attempt_id),
+            )
+        }
+        if stored != set(attempt.prepared_cancel.request_keys):
+            raise ValueError("cancel keys")
+        return attempt
+    except Exception as exc:
+        raise DirectCommandJournalError("INVALID_DATABASE") from exc

@@ -453,3 +453,8 @@ These classes are trusted local composition surfaces. They do not provide a canc
 ### Iteration 63 R16: authorized cancellation creation
 
 `GatewayDirectCancelJournal.request(..., before_commit=...)` invokes the trusted recheck after obtaining the SQLite write lock for both new and idempotent requests. Exceptions before commit roll back; a completed final recheck is the admission point for that local commit. A later local permit close does not undo a commit already admitted, and the owner must recheck again before dispatch. Remote operations and authentication are composed by the SDK; cancellation attempts do not alter the original order or positions.
+
+
+### Iteration 63 R17: atomic cancellation error attribution
+
+Direct journal schema v7 adds cancellation-error association in the existing database. An explicit validated v6 upgrade preserves old preparations and fact digests without inventing source evidence. The cancel-key namespace resolves one durable attempt; ingest_cancel_error verifies the prepared digest, source labels and original-order association and commits the fact, attempt association and existing strategy event together. A trusted pre-commit callback rechecks the provider source. Event reads and strict reopen validate the association again. Cancellation errors never change the original order, applied trade quantities or cancellation send state; NOT_SENT contradictions remain evidence. These local contracts require trusted provider/SDK composition and do not establish venue cancellation by themselves.

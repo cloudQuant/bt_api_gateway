@@ -11,13 +11,14 @@ import json
 import os
 import sqlite3
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal, localcontext
 
 from bt_api_base.direct_write_protocol import DirectExecutionEventKind
 from bt_api_base.gateway_execution_protocol import GatewayReturnFact
+from bt_api_base.gateway_execution_stream_protocol import GatewayCancelErrorAttribution
 from bt_api_base.market_protocol import MarketInstrumentKey
 
 from .direct_command_journal import (
@@ -42,6 +43,13 @@ _EXECUTION_DDL = {
     "direct_execution_facts_pending": "CREATE INDEX direct_execution_facts_pending ON direct_execution_facts(account, disposition)",
     "direct_execution_events_strategy": "CREATE INDEX direct_execution_events_strategy ON direct_execution_events(account, strategy, sequence)",
 }
+
+
+_CANCEL_ERROR_DDL = "CREATE TABLE direct_cancel_error_attribution (account TEXT NOT NULL, fact_digest TEXT NOT NULL, attempt_id TEXT NOT NULL, prepared_digest TEXT NOT NULL, cancel_key TEXT NOT NULL, source_binding_json TEXT NOT NULL, PRIMARY KEY(account, fact_digest))"
+
+
+def _create_cancel_error_table(db: sqlite3.Connection) -> None:
+    db.execute(_CANCEL_ERROR_DDL)
 
 
 _CONSUMER_DDL = "CREATE TABLE direct_execution_consumers (account TEXT NOT NULL, principal TEXT NOT NULL, consumer TEXT NOT NULL, strategy TEXT NOT NULL, offered_sequence INTEGER NOT NULL, acknowledged_sequence INTEGER NOT NULL, PRIMARY KEY(account, principal, consumer, strategy))"
@@ -119,6 +127,7 @@ class ExecutionEvent:
     reservation_id: str
     command_digest: str
     command_principal: str
+    cancel_attribution: GatewayCancelErrorAttribution | None = None
 
 
 @dataclass(frozen=True)
@@ -187,10 +196,11 @@ class GatewayDirectExecutionLedger:
         self._owned()
         with journal._transaction() as db:
             self._owned()
-            journal._verify_v2_upgrade_integrity(db, schema_version=6)
+            journal._verify_v2_upgrade_integrity(db, schema_version=7)
             journal._verify_v4_identity_integrity(db)
             _verify_execution_integrity(db, journal.account_scope, journal._execution_max_facts)
             _verify_consumer_integrity(db, journal.account_scope)
+            _verify_cancel_error_integrity(db, journal.account_scope, journal._execution_max_facts)
             self._owned()
 
     def _owned(self) -> None:
@@ -214,6 +224,12 @@ class GatewayDirectExecutionLedger:
         """Check exact same-process journal identity without asserting guard freshness."""
         self._check_pid()
         return self._journal is journal
+
+    @property
+    def journal(self) -> GatewayDirectCommandJournal:
+        """Return the exact same-process journal; this is not a guard assertion."""
+        self._check_pid()
+        return self._journal
 
     @property
     def account_scope(self) -> str:
@@ -245,6 +261,8 @@ class GatewayDirectExecutionLedger:
             raise DirectCommandJournalError("INVALID_FACT") from exc
         if fact.account_scope != self._journal.account_scope:
             raise DirectCommandJournalError("ACCOUNT_MISMATCH")
+        if fact.schema_version != 1:
+            raise DirectCommandJournalError("INVALID_FACT")
         digest = fact.fact_digest()
         with self._write() as db:
             row = db.execute(
@@ -290,6 +308,131 @@ class GatewayDirectExecutionLedger:
             ).fetchone()
             return self._result(db, row, applied=bool(row["applied"]))
 
+    def ingest_cancel_error(
+        self,
+        fact: GatewayReturnFact,
+        *,
+        cancel_key: str,
+        prepared_digest: str,
+        source_binding: Mapping[str, object],
+        before_commit: Callable[[], None] | None = None,
+    ) -> ExecutionIngestResult:
+        """Atomically append a source-validated cancel error and its attempt association."""
+        self._owned()
+        if type(fact) is not GatewayReturnFact or (
+            before_commit is not None and not callable(before_commit)
+        ):
+            raise DirectCommandJournalError("INVALID_INPUT")
+        try:
+            fact = GatewayReturnFact.from_mapping(fact.to_mapping())
+            cancel_key = _text(cancel_key)
+            prepared_digest = _text(prepared_digest)
+            if not isinstance(source_binding, Mapping) or not source_binding:
+                raise ValueError("source")
+            source_json = _json(dict(source_binding))
+            if (
+                fact.schema_version != 2
+                or fact.kind is not DirectExecutionEventKind.CANCEL_ERROR
+                or fact.cancel_request_key != cancel_key
+                or not fact.error_code
+            ):
+                raise ValueError("cancel fact")
+        except Exception as exc:
+            raise DirectCommandJournalError("INVALID_INPUT") from exc
+        if fact.account_scope != self._journal.account_scope:
+            raise DirectCommandJournalError("ACCOUNT_MISMATCH")
+        digest = fact.fact_digest()
+        account = self._journal.account_scope
+        with self._write() as db:
+            attempt = _validate_cancel_error_link(
+                db, account, fact, cancel_key, prepared_digest, source_json
+            )
+            row = db.execute(
+                "SELECT * FROM direct_execution_facts WHERE account=? AND fact_digest=?",
+                (account, digest),
+            ).fetchone()
+            side = db.execute(
+                "SELECT * FROM direct_cancel_error_attribution WHERE account=? AND fact_digest=?",
+                (account, digest),
+            ).fetchone()
+            if row is not None:
+                if (
+                    side is None
+                    or side["attempt_id"] != attempt.attempt_id
+                    or side["prepared_digest"] != prepared_digest
+                    or side["cancel_key"] != cancel_key
+                    or side["source_binding_json"] != source_json
+                    or row["disposition"] != "ATTRIBUTED"
+                    or row["reservation_id"] != attempt.target_reservation_id
+                    or row["event_sequence"] is None
+                ):
+                    raise DirectCommandJournalError("CANCEL_ATTRIBUTION_CONFLICT")
+                stored_fact = GatewayReturnFact.from_mapping(json.loads(row["fact_json"]))
+                stored_attribution = _event_cancel_attribution(
+                    db, account, stored_fact, digest, row["reservation_id"], attempt.strategy_scope
+                )
+                event = db.execute(
+                    "SELECT * FROM direct_execution_events WHERE account=? AND sequence=?",
+                    (account, row["event_sequence"]),
+                ).fetchone()
+                if (
+                    stored_fact.fact_digest() != digest
+                    or stored_attribution is None
+                    or stored_attribution.attempt_id != attempt.attempt_id
+                    or event is None
+                    or event["strategy"] != attempt.strategy_scope
+                    or event["fact_digest"] != digest
+                    or event["fact_json"] != row["fact_json"]
+                ):
+                    raise DirectCommandJournalError("INVALID_DATABASE")
+                result = self._result(db, row, applied=False)
+            else:
+                if side is not None:
+                    raise DirectCommandJournalError("INVALID_DATABASE")
+                count = db.execute(
+                    "SELECT fact_count FROM direct_execution_meta WHERE account=?", (account,)
+                ).fetchone()[0]
+                if count >= self._journal._execution_max_facts:
+                    raise DirectCommandJournalError("EXECUTION_CAPACITY_EXCEEDED")
+                db.execute(
+                    "INSERT INTO direct_execution_facts VALUES (?, ?, ?, 'UNATTRIBUTED', 'UNMATCHED', NULL, NULL, 0)",
+                    (account, digest, _json(fact.to_mapping())),
+                )
+                db.execute(
+                    "UPDATE direct_execution_meta SET fact_count=fact_count+1 WHERE account=?",
+                    (account,),
+                )
+                self._process(db, digest, fact)
+                row = db.execute(
+                    "SELECT * FROM direct_execution_facts WHERE account=? AND fact_digest=?",
+                    (account, digest),
+                ).fetchone()
+                if (
+                    row["disposition"] != "ATTRIBUTED"
+                    or row["reservation_id"] != attempt.target_reservation_id
+                    or row["event_sequence"] is None
+                    or row["applied"]
+                ):
+                    raise DirectCommandJournalError("CANCEL_ATTRIBUTION_CONFLICT")
+                if attempt.status == "NOT_SENT":
+                    db.execute(
+                        "UPDATE direct_execution_facts SET reason='CANCEL_NOT_SENT_CONTRADICTION' WHERE account=? AND fact_digest=?",
+                        (account, digest),
+                    )
+                db.execute(
+                    "INSERT INTO direct_cancel_error_attribution VALUES (?, ?, ?, ?, ?, ?)",
+                    (account, digest, attempt.attempt_id, prepared_digest, cancel_key, source_json),
+                )
+                self._journal._bump(db)
+                row = db.execute(
+                    "SELECT * FROM direct_execution_facts WHERE account=? AND fact_digest=?",
+                    (account, digest),
+                ).fetchone()
+                result = self._result(db, row, applied=False)
+            if before_commit is not None:
+                before_commit()
+            return result
+
     def reconcile_pending(self, *, limit: int = 256) -> tuple[ExecutionIngestResult, ...]:
         self._owned()
         _limit(limit)
@@ -314,6 +457,8 @@ class GatewayDirectExecutionLedger:
                     row["applied"],
                 )
                 fact = GatewayReturnFact.from_mapping(json.loads(row["fact_json"]))
+                if fact.schema_version != 1:
+                    raise DirectCommandJournalError("INVALID_DATABASE")
                 self._process(db, row["fact_digest"], fact)
                 current = db.execute(
                     "SELECT * FROM direct_execution_facts WHERE account=? AND fact_digest=?",
@@ -388,7 +533,7 @@ class GatewayDirectExecutionLedger:
         except sqlite3.DatabaseError as exc:
             raise DirectCommandJournalError("INVALID_DATABASE") from exc
 
-    def _event_from_row(self, row):
+    def _event_from_row(self, db, row):
         try:
             fact = GatewayReturnFact.from_mapping(json.loads(row["fact_json"]))
             payload = json.loads(row["command_payload_json"])
@@ -420,6 +565,9 @@ class GatewayDirectExecutionLedger:
                 or payload.get("symbol") != fact.instrument.native_symbol
             ):
                 raise ValueError("event command association")
+            attribution = _event_cancel_attribution(
+                db, row["account"], fact, row["fact_digest"], reservation, row["strategy"]
+            )
             return ExecutionEvent(
                 row["sequence"],
                 row["strategy"],
@@ -429,6 +577,7 @@ class GatewayDirectExecutionLedger:
                 reservation,
                 digest,
                 principal,
+                attribution,
             )
         except Exception as exc:
             raise DirectCommandJournalError("INVALID_DATABASE") from exc
@@ -442,7 +591,7 @@ class GatewayDirectExecutionLedger:
         _limit(limit)
         with self._read() as db:
             rows = self._event_rows(db, strategy, after_sequence, limit)
-            return tuple(self._event_from_row(row) for row in rows)
+            return tuple(self._event_from_row(db, row) for row in rows)
 
     def _consumer_identity(self, strategy_scope: str, principal_id: str, consumer_ref: str):
         strategy, principal, consumer = map(_text, (strategy_scope, principal_id, consumer_ref))
@@ -524,7 +673,7 @@ class GatewayDirectExecutionLedger:
                     raise DirectCommandJournalError("INVALID_SEQUENCE")
                 self._require_event(db, account, strategy, after_sequence)
             rows = self._event_rows(db, strategy, after_sequence, limit + 1)
-            events = tuple(self._event_from_row(row) for row in rows[:limit])
+            events = tuple(self._event_from_row(db, row) for row in rows[:limit])
             count = len(events)
             while True:
                 selected = events[:count]
@@ -897,6 +1046,7 @@ _VALID_REASONS = {
     "ATTRIBUTED": {
         "MATCHED",
         "NOT_SENT_CONTRADICTION",
+        "CANCEL_NOT_SENT_CONTRADICTION",
         "TRADE_DUPLICATE",
         "OVERFILL",
         "NOT_SENT_OVERFILL",
@@ -915,7 +1065,9 @@ _VALID_REASONS = {
 }
 
 
-def _verify_execution_integrity(db: sqlite3.Connection, account: str, capacity: int) -> None:
+def _verify_execution_integrity(
+    db: sqlite3.Connection, account: str, capacity: int, *, allow_v2: bool = True
+) -> None:
     """Reconstruct persisted execution projections on open, without provider I/O."""
     try:
         count = db.execute("SELECT count(*) FROM direct_execution_facts").fetchone()[0]
@@ -943,6 +1095,12 @@ def _verify_execution_integrity(db: sqlite3.Connection, account: str, capacity: 
                 raise ValueError("fact status")
             raw = json.loads(row["fact_json"])
             fact = GatewayReturnFact.from_mapping(raw)
+            if not allow_v2 and fact.schema_version != 1:
+                raise ValueError("legacy fact version")
+            if row["reason"] == "CANCEL_NOT_SENT_CONTRADICTION" and (
+                fact.schema_version != 2 or fact.kind is not DirectExecutionEventKind.CANCEL_ERROR
+            ):
+                raise ValueError("cancel contradiction fact")
             if (
                 fact.account_scope != account
                 or fact.fact_digest() != row["fact_digest"]
@@ -1179,5 +1337,157 @@ def _verify_execution_integrity(db: sqlite3.Connection, account: str, capacity: 
         for alias in db.execute("SELECT * FROM direct_execution_aliases"):
             if (alias["reservation_id"], alias["strong_key"]) not in alias_support:
                 raise ValueError("unsupported alias")
+    except Exception as exc:
+        raise DirectCommandJournalError("INVALID_DATABASE") from exc
+
+
+def _validate_cancel_error_link(db, account, fact, cancel_key, prepared_digest, source_json):
+    """Recheck one bounded cancel key, sealed source and original command."""
+    from .direct_cancel_journal import _find_cancel_by_request_key
+
+    if (
+        type(fact) is not GatewayReturnFact
+        or fact.schema_version != 2
+        or fact.kind is not DirectExecutionEventKind.CANCEL_ERROR
+        or fact.cancel_request_key != cancel_key
+        or not fact.error_code
+        or fact.account_scope != account
+    ):
+        raise DirectCommandJournalError("INVALID_FACT")
+    attempt = _find_cancel_by_request_key(db, account, cancel_key)
+    if attempt is None:
+        raise DirectCommandJournalError("CANCEL_ATTEMPT_NOT_FOUND")
+    try:
+        prepared = attempt.prepared_cancel
+        source = json.loads(source_json)
+        if (
+            prepared is None
+            or prepared.source_binding is None
+            or type(source) is not dict
+            or not source
+            or _json(source) != source_json
+            or _json(dict(prepared.source_binding)) != source_json
+            or prepared.digest() != prepared_digest
+            or attempt.prepared_digest != prepared_digest
+            or fact.identity is None
+            or _json(fact.identity.to_dict()) != _json(prepared.target_identity.to_dict())
+            or fact.route != prepared.target_identity.exchange_name
+            or fact.trading_day != prepared.trading_day
+            or type(fact.session_generation) is not int
+            or fact.session_generation != prepared.session_generation
+            or fact.instrument.native_symbol != prepared.symbol
+            or attempt.symbol != prepared.symbol
+        ):
+            raise ValueError("cancel source association")
+    except Exception as exc:
+        raise DirectCommandJournalError("CANCEL_ATTRIBUTION_CONFLICT") from exc
+    return attempt
+
+
+def _event_cancel_attribution(db, account, fact, fact_digest, reservation_id, strategy):
+    side = db.execute(
+        "SELECT * FROM direct_cancel_error_attribution WHERE account=? AND fact_digest=?",
+        (account, fact_digest),
+    ).fetchone()
+    if fact.schema_version == 1:
+        if side is not None:
+            raise DirectCommandJournalError("INVALID_DATABASE")
+        return None
+    if side is None:
+        raise DirectCommandJournalError("INVALID_DATABASE")
+    try:
+        attempt = _validate_cancel_error_link(
+            db,
+            account,
+            fact,
+            side["cancel_key"],
+            side["prepared_digest"],
+            side["source_binding_json"],
+        )
+        if (
+            side["attempt_id"] != attempt.attempt_id
+            or attempt.target_reservation_id != reservation_id
+            or attempt.strategy_scope != strategy
+        ):
+            raise ValueError("attempt mismatch")
+        return GatewayCancelErrorAttribution(
+            attempt.operation_id, attempt.attempt_id, attempt.prepared_digest
+        )
+    except Exception as exc:
+        raise DirectCommandJournalError("INVALID_DATABASE") from exc
+
+
+def _verify_cancel_error_integrity(db, account, capacity):
+    """Verify every v2 fact has one exact cancel association and event, and vice versa."""
+    try:
+        sides = db.execute(
+            "SELECT * FROM direct_cancel_error_attribution LIMIT ?", (capacity + 1,)
+        ).fetchall()
+        if len(sides) > capacity:
+            raise ValueError("cancel association capacity")
+        expected = set()
+        for side in sides:
+            if side["account"] != account:
+                raise ValueError("cancel association account")
+            row = db.execute(
+                "SELECT * FROM direct_execution_facts WHERE account=? AND fact_digest=?",
+                (account, side["fact_digest"]),
+            ).fetchone()
+            if (
+                row is None
+                or row["disposition"] != "ATTRIBUTED"
+                or row["event_sequence"] is None
+                or row["applied"]
+            ):
+                raise ValueError("cancel fact")
+            fact = GatewayReturnFact.from_mapping(json.loads(row["fact_json"]))
+            if fact.fact_digest() != side["fact_digest"]:
+                raise ValueError("cancel fact digest")
+            attempt = _validate_cancel_error_link(
+                db,
+                account,
+                fact,
+                side["cancel_key"],
+                side["prepared_digest"],
+                side["source_binding_json"],
+            )
+            attribution = _event_cancel_attribution(
+                db,
+                account,
+                fact,
+                side["fact_digest"],
+                row["reservation_id"],
+                attempt.strategy_scope,
+            )
+            if attribution is None:
+                raise ValueError("cancel association")
+            if row["reservation_id"] != attempt.target_reservation_id:
+                raise ValueError("cancel reservation")
+            if row["reason"] == "CANCEL_NOT_SENT_CONTRADICTION" and attempt.status != "NOT_SENT":
+                raise ValueError("cancel contradiction")
+            event = db.execute(
+                "SELECT * FROM direct_execution_events WHERE account=? AND sequence=?",
+                (account, row["event_sequence"]),
+            ).fetchone()
+            if (
+                event is None
+                or event["strategy"] != attempt.strategy_scope
+                or event["fact_digest"] != side["fact_digest"]
+                or event["fact_json"] != row["fact_json"]
+            ):
+                raise ValueError("cancel event")
+            expected.add(side["fact_digest"])
+        facts = db.execute(
+            "SELECT fact_digest,fact_json FROM direct_execution_facts LIMIT ?", (capacity + 1,)
+        ).fetchall()
+        if len(facts) > capacity:
+            raise ValueError("fact capacity")
+        actual = {
+            row["fact_digest"]
+            for row in facts
+            if json.loads(row["fact_json"]).get("schema_version") == 2
+        }
+        if actual != expected:
+            raise ValueError("missing cancel association")
     except Exception as exc:
         raise DirectCommandJournalError("INVALID_DATABASE") from exc
