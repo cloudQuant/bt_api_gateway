@@ -306,3 +306,26 @@ The guard remains held on native/cleanup uncertainty. These are local,
 cooperating-owner guarantees, not an external venue fencing mechanism.
 `observe()` is read-only and reports the local remaining reservation TTL and
 generation match; zero remaining TTL is not durable expiry or NOT_SENT.
+
+### Iteration 63 daily settlement journal
+
+Journal schema v3 adds settlement records to the same anchored SQLite database.
+The account/route/trading-day key retains its initial observation, native and
+owner generations, and optional attempt marker. ATTEMPTING is durable before
+confirmation; UNKNOWN retains the attempt; CONFIRMED requires a trusted
+provider observation supplied by the SDK owner. An existing daily record never
+grants another send marker. A fresh confirmed read may create a record without
+a send attempt. Commands and settlement records share the configured capacity.
+
+Existing v2 databases require explicit `upgrade_v2` with the matching acquired
+account guard, saved journal identity and revision anchor. The transaction
+validates the old schema and record relationships, rejects extra triggers,
+retains command/release/identity data, adds the table and advances the revision.
+Failure rolls back; it never replaces the old database with an empty one.
+Older objects cannot write after the schema upgrade. Schema upgrade checks do
+not establish the authority of a restored backup or fence external writers.
+
+Settlement insertion checks the caller's owner/observation/admission fence after
+SQLite acquires its write lock and again before commit. Storage does not validate
+provider provenance itself. The SDK controller supplies that validation and
+readback policy; this package still owns no native client or ZMQ socket.

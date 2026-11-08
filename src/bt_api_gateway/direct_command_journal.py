@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from bt_api_base.direct_write_protocol import SettlementObservation, SettlementStatus
 from bt_api_base.gateway_direct_protocol import canonical_gateway_payload
 
 from .database_identity import SQLiteFileIdentity
@@ -67,6 +68,27 @@ class DispatchStart:
 
 
 @dataclass(frozen=True)
+class SettlementRecord:
+    account_scope: str
+    exchange_name: str
+    trading_day: str
+    account_binding: str
+    owner_generation: str
+    initial_session_generation: int
+    initial_observation_id: str
+    marker_id: str | None
+    status: str
+    version: int
+    confirmation_observation_id: str | None
+
+
+@dataclass(frozen=True)
+class SettlementStart:
+    record: SettlementRecord
+    newly_started: bool
+
+
+@dataclass(frozen=True)
 class RecoveryCursor:
     journal_id: str
     revision: int
@@ -94,8 +116,7 @@ def _json(value: object, *, scalar_map: bool = False) -> str:
             type(value) is not dict
             or not value
             or any(
-                item is not None and type(item) not in (bool, int, str)
-                for item in value.values()
+                item is not None and type(item) not in (bool, int, str) for item in value.values()
             )
         ):
             raise ValueError("invalid scalar map")
@@ -201,8 +222,9 @@ class GatewayDirectCommandJournal:
                 db.execute(
                     "CREATE UNIQUE INDEX direct_journal_native_identity ON direct_journal_commands(account, native_identity_json) WHERE native_identity_json IS NOT NULL"
                 )
+                cls._create_settlement_table(db)
                 db.execute(
-                    "INSERT INTO direct_journal_meta VALUES (?, 2, ?, ?, 0)",
+                    "INSERT INTO direct_journal_meta VALUES (?, 3, ?, ?, 0)",
                     (self._account, max_records, self._journal_id),
                 )
         return self
@@ -228,6 +250,7 @@ class GatewayDirectCommandJournal:
         ):
             raise DirectCommandJournalError("INVALID_INPUT")
         self._max_records = max_records
+        self._schema_version = 3
         self._clock = clock
         self._timeout = timeout_seconds
         self._identity = SQLiteFileIdentity(Path(database_path))
@@ -244,7 +267,178 @@ class GatewayDirectCommandJournal:
     def generation(self) -> str:
         return self._generation
 
-    def _verify_schema(self, db: sqlite3.Connection) -> None:
+    @staticmethod
+    def _create_settlement_table(db: sqlite3.Connection) -> None:
+        db.execute(
+            "CREATE TABLE direct_journal_settlement (account TEXT NOT NULL, exchange_name TEXT NOT NULL, trading_day TEXT NOT NULL, account_binding TEXT NOT NULL, owner_generation TEXT NOT NULL, initial_session_generation INTEGER NOT NULL, initial_observation_id TEXT NOT NULL, marker_id TEXT, status TEXT NOT NULL, version INTEGER NOT NULL, confirmation_observation_id TEXT, PRIMARY KEY(account, exchange_name, trading_day))"
+        )
+
+    @classmethod
+    def upgrade_v2(
+        cls,
+        database_path: str | Path,
+        account_scope: str,
+        *,
+        generation: str,
+        guard: object,
+        expected_journal_id: str,
+        minimum_revision: int,
+        max_records: int = 100000,
+        clock: Callable[[], float] = time.monotonic,
+        timeout_seconds: float = 5.0,
+    ) -> GatewayDirectCommandJournal:
+        """Explicitly upgrade an anchored v2 journal under the existing account guard."""
+        from .session_guard import LocalAccountSessionGuard
+
+        if type(guard) is not LocalAccountSessionGuard:
+            raise DirectCommandJournalError("INVALID_GUARD")
+        self = cls.__new__(cls)
+        self._configure(
+            database_path, account_scope, generation, max_records, clock, timeout_seconds
+        )
+        self._journal_id = _text(expected_journal_id)
+        if type(minimum_revision) is not int or minimum_revision < 0:
+            raise DirectCommandJournalError("INVALID_REVISION")
+        self._minimum_revision = minimum_revision
+
+        def owned():
+            guard.assert_owned()
+            if (
+                guard.account_key_digest
+                != hashlib.sha256(self._account.encode("utf-8")).hexdigest()
+                or guard.acquire() != self._generation
+            ):
+                raise DirectCommandJournalError("GUARD_BINDING_MISMATCH")
+
+        owned()
+        try:
+            with self._connection() as db, self._transaction_on(db):
+                self._verify_schema(db, schema_version=2)
+                self._assert_anchor(db, schema_version=2)
+                self._verify_v2_upgrade_integrity(db)
+                owned()
+                self._create_settlement_table(db)
+                db.execute(
+                    "UPDATE direct_journal_meta SET schema_version=3, revision=revision+1 WHERE account=?",
+                    (self._account,),
+                )
+                owned()
+        except sqlite3.DatabaseError as exc:
+            raise DirectCommandJournalError("INVALID_DATABASE") from exc
+        return self
+
+    def _verify_v2_upgrade_integrity(self, db: sqlite3.Connection) -> None:
+        """Reject altered v2 DDL and inconsistent records before migration."""
+        expected = {
+            "direct_journal_meta": "CREATE TABLE direct_journal_meta (account TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, max_records INTEGER NOT NULL, journal_id TEXT NOT NULL, revision INTEGER NOT NULL)",
+            "direct_journal_commands": "CREATE TABLE direct_journal_commands (account TEXT NOT NULL, strategy TEXT NOT NULL, request_key TEXT NOT NULL, reservation_id TEXT NOT NULL UNIQUE, principal TEXT NOT NULL, digest TEXT NOT NULL, payload_json TEXT NOT NULL, generation TEXT NOT NULL, expires_at REAL NOT NULL, status TEXT NOT NULL, version INTEGER NOT NULL, native_identity_json TEXT, strong_keys_json TEXT, PRIMARY KEY(account, strategy, request_key))",
+            "direct_journal_releases": "CREATE TABLE direct_journal_releases (account TEXT NOT NULL, operation_id TEXT NOT NULL, strategy TEXT NOT NULL, request_key TEXT NOT NULL, reservation_id TEXT NOT NULL, digest TEXT NOT NULL, principal TEXT NOT NULL, expected_version INTEGER NOT NULL, PRIMARY KEY(account, operation_id))",
+            "direct_journal_strong_keys": "CREATE TABLE direct_journal_strong_keys (account TEXT NOT NULL, strong_key TEXT NOT NULL, reservation_id TEXT NOT NULL, PRIMARY KEY(account, strong_key))",
+            "direct_journal_release_command": "CREATE UNIQUE INDEX direct_journal_release_command ON direct_journal_releases(account, strategy, request_key)",
+            "direct_journal_native_identity": "CREATE UNIQUE INDEX direct_journal_native_identity ON direct_journal_commands(account, native_identity_json) WHERE native_identity_json IS NOT NULL",
+        }
+        automatic = {
+            "sqlite_autoindex_direct_journal_meta_1",
+            "sqlite_autoindex_direct_journal_commands_1",
+            "sqlite_autoindex_direct_journal_commands_2",
+            "sqlite_autoindex_direct_journal_releases_1",
+            "sqlite_autoindex_direct_journal_strong_keys_1",
+        }
+        actual = {row[0] for row in db.execute("SELECT name FROM sqlite_master")}
+        if actual != set(expected) | automatic:
+            raise DirectCommandJournalError("INVALID_DATABASE")
+        for name, sql in expected.items():
+            row = db.execute("SELECT sql FROM sqlite_master WHERE name=?", (name,)).fetchone()
+            if (
+                row is None
+                or not isinstance(row[0], str)
+                or "".join(row[0].split()).lower() != "".join(sql.split()).lower()
+            ):
+                raise DirectCommandJournalError("INVALID_DATABASE")
+        if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise DirectCommandJournalError("INVALID_DATABASE")
+        rows = db.execute("SELECT * FROM direct_journal_commands").fetchall()
+        if len(rows) > self._max_records:
+            raise DirectCommandJournalError("INVALID_DATABASE")
+        expected_keys, expected_releases = set(), {}
+        try:
+            for row in rows:
+                if row["account"] != self._account:
+                    raise ValueError
+                for key in ("strategy", "request_key", "reservation_id", "principal", "generation"):
+                    _text(row[key])
+                payload = json.loads(row["payload_json"])
+                if (
+                    _json(payload) != row["payload_json"]
+                    or payload_digest(payload) != row["digest"]
+                ):
+                    raise ValueError
+                if (
+                    type(row["expires_at"]) not in (int, float)
+                    or not math.isfinite(row["expires_at"])
+                    or row["expires_at"] < 0
+                ):
+                    raise ValueError
+                state = row["status"]
+                version = {
+                    "RESERVED": 1,
+                    "DISPATCHING": 2,
+                    "RELEASED": 2,
+                    "EXPIRED": 2,
+                    "SENT": 3,
+                    "NOT_SENT": 3,
+                    "UNKNOWN": 3,
+                }.get(state)
+                if version is None or row["version"] != version:
+                    raise ValueError
+                if state in {"DISPATCHING", "SENT", "NOT_SENT", "UNKNOWN"}:
+                    identity = json.loads(row["native_identity_json"])
+                    if _json(identity, scalar_map=True) != row["native_identity_json"]:
+                        raise ValueError
+                    keys = tuple(json.loads(row["strong_keys_json"]))
+                    if _strong_keys(keys) != keys:
+                        raise ValueError
+                    expected_keys.update(
+                        (self._account, key, row["reservation_id"]) for key in keys
+                    )
+                elif row["native_identity_json"] is not None or row["strong_keys_json"] is not None:
+                    raise ValueError
+                if state in {"RELEASED", "EXPIRED"}:
+                    expected_releases[(row["strategy"], row["request_key"])] = row
+            actual_keys = {
+                tuple(row)
+                for row in db.execute(
+                    "SELECT account, strong_key, reservation_id FROM direct_journal_strong_keys"
+                )
+            }
+            if actual_keys != expected_keys:
+                raise ValueError
+            seen = set()
+            for release in db.execute("SELECT * FROM direct_journal_releases"):
+                _text(release["operation_id"])
+                key = (release["strategy"], release["request_key"])
+                row = expected_releases.get(key)
+                if (
+                    row is None
+                    or release["account"] != self._account
+                    or any(
+                        release[name] != row[name]
+                        for name in ("reservation_id", "digest", "principal")
+                    )
+                    or release["expected_version"]
+                    not in ((1, 2) if row["status"] == "EXPIRED" else (1,))
+                ):
+                    raise ValueError
+                seen.add(key)
+            if any(
+                row["status"] == "RELEASED" and key not in seen
+                for key, row in expected_releases.items()
+            ):
+                raise ValueError
+        except (TypeError, ValueError, KeyError, DirectCommandJournalError) as exc:
+            raise DirectCommandJournalError("INVALID_DATABASE") from exc
+
+    def _verify_schema(self, db: sqlite3.Connection, *, schema_version: int = 3) -> None:
         objects = {
             row[0]
             for row in db.execute("SELECT name FROM sqlite_master WHERE type IN ('table','index')")
@@ -257,6 +451,8 @@ class GatewayDirectCommandJournal:
             "direct_journal_release_command",
             "direct_journal_native_identity",
         }
+        if schema_version == 3:
+            expected.add("direct_journal_settlement")
         if not expected.issubset(objects):
             raise DirectCommandJournalError("INVALID_DATABASE")
         columns = {
@@ -294,6 +490,20 @@ class GatewayDirectCommandJournal:
             ),
             "direct_journal_strong_keys": ("account", "strong_key", "reservation_id"),
         }
+        if schema_version == 3:
+            columns["direct_journal_settlement"] = (
+                "account",
+                "exchange_name",
+                "trading_day",
+                "account_binding",
+                "owner_generation",
+                "initial_session_generation",
+                "initial_observation_id",
+                "marker_id",
+                "status",
+                "version",
+                "confirmation_observation_id",
+            )
         for table, names in columns.items():
             info = db.execute(f"PRAGMA table_info({table})").fetchall()
             actual = tuple(row[1] for row in info)
@@ -305,6 +515,7 @@ class GatewayDirectCommandJournal:
                 "direct_journal_commands": ("account", "strategy", "request_key"),
                 "direct_journal_releases": ("account", "operation_id"),
                 "direct_journal_strong_keys": ("account", "strong_key"),
+                "direct_journal_settlement": ("account", "exchange_name", "trading_day"),
             }
             if pk != expected_pk[table]:
                 raise DirectCommandJournalError("INVALID_DATABASE")
@@ -327,7 +538,7 @@ class GatewayDirectCommandJournal:
             if tuple(row[2] for row in db.execute(f"PRAGMA index_info({index})")) != index_columns:
                 raise DirectCommandJournalError("INVALID_DATABASE")
 
-    def _assert_anchor(self, db: sqlite3.Connection) -> int:
+    def _assert_anchor(self, db: sqlite3.Connection, *, schema_version: int | None = None) -> int:
         rows = db.execute(
             "SELECT account, schema_version, max_records, journal_id, revision FROM direct_journal_meta"
         ).fetchall()
@@ -336,7 +547,10 @@ class GatewayDirectCommandJournal:
         account, schema, capacity, journal_id, revision = tuple(rows[0])
         if account != self._account:
             raise DirectCommandJournalError("ACCOUNT_MISMATCH")
-        if schema != 2 or capacity != self._max_records:
+        if (
+            schema != (self._schema_version if schema_version is None else schema_version)
+            or capacity != self._max_records
+        ):
             raise DirectCommandJournalError("SCHEMA_OR_CAPACITY_MISMATCH")
         if journal_id != self._journal_id:
             raise DirectCommandJournalError("JOURNAL_ID_MISMATCH")
@@ -348,6 +562,203 @@ class GatewayDirectCommandJournal:
         db.execute(
             "UPDATE direct_journal_meta SET revision=revision+1 WHERE account=?", (self._account,)
         )
+
+    @staticmethod
+    def _settlement_row(row: sqlite3.Row) -> SettlementRecord:
+        return SettlementRecord(
+            row["account"],
+            row["exchange_name"],
+            row["trading_day"],
+            row["account_binding"],
+            row["owner_generation"],
+            row["initial_session_generation"],
+            row["initial_observation_id"],
+            row["marker_id"],
+            row["status"],
+            row["version"],
+            row["confirmation_observation_id"],
+        )
+
+    @staticmethod
+    def _settlement_input(observation: SettlementObservation, status: SettlementStatus) -> None:
+        if type(observation) is not SettlementObservation or observation.status is not status:
+            raise DirectCommandJournalError("INVALID_SETTLEMENT_OBSERVATION")
+        try:
+            checked = SettlementObservation(
+                observation.exchange_name,
+                observation.account_binding,
+                observation.trading_day,
+                observation.session_generation,
+                observation.status,
+                observation.observation_id,
+            )
+        except (TypeError, ValueError) as exc:
+            raise DirectCommandJournalError("INVALID_SETTLEMENT_OBSERVATION") from exc
+        if checked != observation:
+            raise DirectCommandJournalError("INVALID_SETTLEMENT_OBSERVATION")
+
+    def _settlement_existing(self, db, exchange_name, trading_day, account_binding=None):
+        if account_binding is not None:
+            mismatch = db.execute(
+                "SELECT 1 FROM direct_journal_settlement WHERE account=? AND exchange_name=? AND account_binding<>? LIMIT 1",
+                (self._account, exchange_name, account_binding),
+            ).fetchone()
+            if mismatch is not None:
+                raise DirectCommandJournalError("SETTLEMENT_ACCOUNT_MISMATCH")
+        return db.execute(
+            "SELECT * FROM direct_journal_settlement WHERE account=? AND exchange_name=? AND trading_day=?",
+            (self._account, exchange_name, trading_day),
+        ).fetchone()
+
+    def _settlement_capacity(self, db):
+        count = db.execute(
+            "SELECT (SELECT count(*) FROM direct_journal_commands WHERE account=?) + "
+            "(SELECT count(*) FROM direct_journal_settlement WHERE account=?)",
+            (self._account, self._account),
+        ).fetchone()[0]
+        if count >= self._max_records:
+            raise DirectCommandJournalError("CAPACITY_EXCEEDED")
+
+    def settlement_get(self, exchange_name: str, trading_day: str) -> SettlementRecord | None:
+        exchange_name, trading_day = _text(exchange_name), _text(trading_day)
+        with self._transaction() as db:
+            row = self._settlement_existing(db, exchange_name, trading_day)
+            return None if row is None else self._settlement_row(row)
+
+    def settlement_begin(
+        self,
+        observation: SettlementObservation,
+        marker_id: str,
+        *,
+        before_begin: Callable[[], None],
+        before_commit: Callable[[], None],
+    ) -> SettlementStart:
+        """Durably claim one daily attempt; an existing claim never grants another marker."""
+        self._settlement_input(observation, SettlementStatus.UNCONFIRMED)
+        marker_id = _text(marker_id)
+        if not callable(before_begin) or not callable(before_commit):
+            raise DirectCommandJournalError("INVALID_SETTLEMENT_FENCE")
+        with self._transaction() as db:
+            before_begin()
+            row = self._settlement_existing(
+                db, observation.exchange_name, observation.trading_day, observation.account_binding
+            )
+            if row is not None:
+                before_commit()
+                return SettlementStart(self._settlement_row(row), False)
+            self._settlement_capacity(db)
+            db.execute(
+                "INSERT INTO direct_journal_settlement VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ATTEMPTING', 1, NULL)",
+                (
+                    self._account,
+                    observation.exchange_name,
+                    observation.trading_day,
+                    observation.account_binding,
+                    self._generation,
+                    observation.session_generation,
+                    observation.observation_id,
+                    marker_id,
+                ),
+            )
+            self._bump(db)
+            before_commit()
+            row = self._settlement_existing(
+                db, observation.exchange_name, observation.trading_day, observation.account_binding
+            )
+            return SettlementStart(self._settlement_row(row), True)
+
+    def settlement_mark_unknown(
+        self,
+        observation: SettlementObservation,
+        marker_id: str,
+        *,
+        before_commit: Callable[[], None] | None = None,
+    ) -> SettlementRecord:
+        self._settlement_input(observation, SettlementStatus.UNCONFIRMED)
+        marker_id = _text(marker_id)
+        if before_commit is not None and not callable(before_commit):
+            raise DirectCommandJournalError("INVALID_SETTLEMENT_FENCE")
+        with self._transaction() as db:
+            row = self._settlement_existing(
+                db, observation.exchange_name, observation.trading_day, observation.account_binding
+            )
+            if (
+                row is None
+                or row["marker_id"] != marker_id
+                or row["initial_observation_id"] != observation.observation_id
+                or row["initial_session_generation"] != observation.session_generation
+            ):
+                raise DirectCommandJournalError("SETTLEMENT_ATTEMPT_MISMATCH")
+            if row["status"] == "ATTEMPTING":
+                db.execute(
+                    "UPDATE direct_journal_settlement SET status='UNKNOWN', version=version+1 WHERE account=? AND exchange_name=? AND trading_day=?",
+                    (self._account, observation.exchange_name, observation.trading_day),
+                )
+                self._bump(db)
+                row = self._settlement_existing(
+                    db,
+                    observation.exchange_name,
+                    observation.trading_day,
+                    observation.account_binding,
+                )
+            if before_commit is not None:
+                before_commit()
+            return self._settlement_row(row)
+
+    def settlement_confirm(
+        self,
+        observation: SettlementObservation,
+        *,
+        before_begin: Callable[[], None] | None = None,
+        before_commit: Callable[[], None] | None = None,
+    ) -> SettlementRecord:
+        """Record a caller-verified observation; this storage does not attest it."""
+        self._settlement_input(observation, SettlementStatus.CONFIRMED)
+        if before_begin is not None and not callable(before_begin):
+            raise DirectCommandJournalError("INVALID_SETTLEMENT_FENCE")
+        if before_commit is not None and not callable(before_commit):
+            raise DirectCommandJournalError("INVALID_SETTLEMENT_FENCE")
+        with self._transaction() as db:
+            if before_begin is not None:
+                before_begin()
+            row = self._settlement_existing(
+                db, observation.exchange_name, observation.trading_day, observation.account_binding
+            )
+            if row is None:
+                self._settlement_capacity(db)
+                db.execute(
+                    "INSERT INTO direct_journal_settlement VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'CONFIRMED', 1, ?)",
+                    (
+                        self._account,
+                        observation.exchange_name,
+                        observation.trading_day,
+                        observation.account_binding,
+                        self._generation,
+                        observation.session_generation,
+                        observation.observation_id,
+                        observation.observation_id,
+                    ),
+                )
+                self._bump(db)
+            elif row["status"] != "CONFIRMED":
+                if observation.observation_id == row["initial_observation_id"]:
+                    raise DirectCommandJournalError("SETTLEMENT_OBSERVATION_REUSED")
+                db.execute(
+                    "UPDATE direct_journal_settlement SET status='CONFIRMED', version=version+1, confirmation_observation_id=? WHERE account=? AND exchange_name=? AND trading_day=?",
+                    (
+                        observation.observation_id,
+                        self._account,
+                        observation.exchange_name,
+                        observation.trading_day,
+                    ),
+                )
+                self._bump(db)
+            row = self._settlement_existing(
+                db, observation.exchange_name, observation.trading_day, observation.account_binding
+            )
+            if before_commit is not None:
+                before_commit()
+            return self._settlement_row(row)
 
     def _now(self) -> float:
         now = self._clock()
@@ -396,6 +807,10 @@ class GatewayDirectCommandJournal:
             if (
                 db.execute(
                     "SELECT count(*) FROM direct_journal_commands WHERE account=?", (self._account,)
+                ).fetchone()[0]
+                + db.execute(
+                    "SELECT count(*) FROM direct_journal_settlement WHERE account=?",
+                    (self._account,),
                 ).fetchone()[0]
                 >= self._max_records
             ):
