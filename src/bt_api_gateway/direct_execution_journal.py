@@ -187,7 +187,7 @@ class GatewayDirectExecutionLedger:
         self._owned()
         with journal._transaction() as db:
             self._owned()
-            journal._verify_v2_upgrade_integrity(db, schema_version=5)
+            journal._verify_v2_upgrade_integrity(db, schema_version=6)
             journal._verify_v4_identity_integrity(db)
             _verify_execution_integrity(db, journal.account_scope, journal._execution_max_facts)
             _verify_consumer_integrity(db, journal.account_scope)

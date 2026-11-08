@@ -378,6 +378,8 @@ def test_readonly_wrong_account_and_capacity(tmp_path):
 def _downgrade_v3(path):
     with sqlite3.connect(path) as db:
         for name in (
+            "direct_cancel_keys",
+            "direct_cancel_attempts",
             "direct_execution_consumers",
             "direct_execution_meta",
             "direct_execution_facts",
@@ -1187,6 +1189,8 @@ def test_v4_migration_preserves_execution_and_rolls_back_on_failure(setup, monke
     ledger.ingest(fact(kind=DirectExecutionEventKind.ORDER, status=DirectOrderStatus.ACCEPTED))
     before = revision(journal)
     with sqlite3.connect(path) as db:
+        db.execute("DROP TABLE direct_cancel_keys")
+        db.execute("DROP TABLE direct_cancel_attempts")
         db.execute("DROP TABLE direct_execution_consumers")
         db.execute("UPDATE direct_journal_meta SET schema_version=4")
     args = {
@@ -1255,6 +1259,8 @@ def test_v4_upgrade_rejects_corrupt_execution_without_schema_change(setup):
     ledger.ingest(fact(kind=DirectExecutionEventKind.ORDER, status=DirectOrderStatus.ACCEPTED))
     before = revision(journal)
     with sqlite3.connect(path) as db:
+        db.execute("DROP TABLE direct_cancel_keys")
+        db.execute("DROP TABLE direct_cancel_attempts")
         db.execute("DROP TABLE direct_execution_consumers")
         db.execute("UPDATE direct_journal_meta SET schema_version=4")
         db.execute("UPDATE direct_execution_events SET strategy='foreign'")

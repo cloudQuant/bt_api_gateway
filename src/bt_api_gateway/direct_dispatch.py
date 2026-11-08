@@ -164,6 +164,11 @@ class GatewayDirectDispatcher:
         """Return the exact journal object bound to this dispatcher."""
         return self._journal
 
+    def is_bound_to(self, journal: object, guard: object, exchange_name: object) -> bool:
+        """Check exact owner-thread composition without exposing mutable resources."""
+        self._owned()
+        return self._journal is journal and self._guard is guard and self._exchange == exchange_name
+
     def assert_owned(self) -> None:
         """Verify the creating process and thread still hold the same guard generation."""
         self._owned()
