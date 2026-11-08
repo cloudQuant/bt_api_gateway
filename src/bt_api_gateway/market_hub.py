@@ -284,6 +284,7 @@ class GatewayMarketHub:
         history_key_universe: Collection[MarketSubscriptionKey] | None = None,
         principal_allowed_history_keys: Mapping[str, Collection[MarketSubscriptionKey]]
         | None = None,
+        provider_cleanup_confirmed: Callable[[], bool] | None = None,
     ) -> None:
         if not callable(getattr(provider, "subscribe", None)) or not callable(
             getattr(provider, "unsubscribe", None)
@@ -304,6 +305,8 @@ class GatewayMarketHub:
             raise GatewayMarketHubError("INVALID_PUBLISHER")
         if epoch_factory is not None and not callable(epoch_factory):
             raise GatewayMarketHubError("INVALID_EPOCH_FACTORY")
+        if provider_cleanup_confirmed is not None and not callable(provider_cleanup_confirmed):
+            raise GatewayMarketHubError("INVALID_PROVIDER_CLEANUP_CONFIRMATION")
         normalized_history_timeout = _validate_history_configuration(
             history_provider, history_timeout_seconds
         )
@@ -327,6 +330,7 @@ class GatewayMarketHub:
         _validate_service_wire_scope(service_identity, service_scope)
 
         self._provider = provider
+        self._provider_cleanup_confirmed = provider_cleanup_confirmed
         provider_poll = getattr(provider, "poll", None)
         self._provider_poller = provider_poll if callable(provider_poll) else None
         reset_required = getattr(provider, "source_epoch_reset_required", None)
@@ -1290,10 +1294,31 @@ class GatewayMarketHub:
         return new_epoch
 
     def close(self) -> None:
-        """Release all actual handles, retaining failures for an explicit retry."""
+        """Release handles or accept trusted confirmation of whole-provider cleanup.
+
+        The optional callback is supplied by the owning composition, not a
+        client. Only exact True confirms that the borrowed provider is closed.
+        """
         self._check_owner()
         if any(stream.starting for stream in self._streams.values()):
             raise GatewayMarketHubError("PROVIDER_START_IN_PROGRESS", retryable=True)
+        confirmed = False
+        if self._provider_cleanup_confirmed is not None:
+            try:
+                confirmed = self._provider_cleanup_confirmed() is True
+            except Exception:
+                confirmed = False
+        if confirmed:
+            self._closing = True
+            for stream in self._streams.values():
+                stream.handle = None
+                stream.generation = None
+                stream.start_uncertain = False
+                stream.pending_release = False
+                stream.registrations.clear()
+            self._registration_ref_count = 0
+            self._registration_principals.clear()
+            return
         if any(stream.start_uncertain for stream in self._streams.values()):
             raise GatewayMarketHubError("PROVIDER_SUBSCRIBE_OUTCOME_UNKNOWN", retryable=True)
         self._closing = True

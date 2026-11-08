@@ -70,6 +70,15 @@ generation that the hub checks before retaining or publishing; the generation
 is not part of the public `sdk.market.event` payload. Providers must not call
 `publish` from a callback thread.
 
+An owner composition borrowing a provider may supply
+`provider_cleanup_confirmed` to `GatewayMarketHub`. Only an exact `True` returned
+during `close()` confirms that the whole provider has already stopped, allowing
+retained handles and uncertain acquisitions to be cleared without another native
+unsubscribe. The default remains conservative; false, non-boolean or failed
+confirmation does not release custody. This callback is trusted installed code,
+not a client setting, and cannot clear running trading UNKNOWN state or authorize
+an operation.
+
 ## Durable consumer progress
 
 `GatewayEventJournal.read_for_consumer` returns a bounded snapshot/replay page
