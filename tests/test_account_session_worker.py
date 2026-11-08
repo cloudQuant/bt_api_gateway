@@ -458,7 +458,7 @@ def test_legacy_observation_roundtrips_as_schema_v1_after_restart(tmp_path) -> N
     assert old_snapshot.payload["schema_version"] == 1
     first.close()
 
-    second, _ = _worker(tmp_path, FakeProvider([sample]), clocks)
+    second, _ = _worker(tmp_path, FakeProvider([replace(sample, observation_id="legacy-v1-new-read")]), clocks)
     second.start()
     new_snapshot = second.latest_snapshot
     assert new_snapshot is not None

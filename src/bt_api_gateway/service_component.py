@@ -21,6 +21,7 @@ from bt_api_base.account_protocol import AccountObservation
 from bt_api_base.service_protocol import MAX_REFERENCE_BYTES, WireIdentity, WireScope
 
 from .account_session_worker import GatewayAccountSessionWorker
+from .account_read_model import GatewayAccountReadModel
 from .account_view_projection import validate_policy_set
 from .event_journal import (
     GatewayAccountEvent,
@@ -284,7 +285,7 @@ class GatewayReadService:
         *,
         accounts: Mapping[str, GatewayServiceAccountScope],
         principals: Mapping[str, GatewayPrincipal],
-        state_worker: GatewayAccountSessionWorker | None = None,
+        state_worker: GatewayAccountSessionWorker | GatewayAccountReadModel | None = None,
         reconciliation: object | None = None,
     ) -> None:
         if not isinstance(journal, GatewayEventJournal):
@@ -295,6 +296,7 @@ class GatewayReadService:
             if (
                 type(reconciliation) is not GatewayReconciliationInspector
                 or state_worker is None
+                or type(state_worker) is GatewayAccountReadModel
                 or reconciliation._worker is not state_worker
             ):
                 raise GatewayServiceError("INVALID_RECONCILIATION_INSPECTOR")
@@ -303,7 +305,7 @@ class GatewayReadService:
         self._accounts = MappingProxyType(_copy_accounts(accounts))
         self._principals = MappingProxyType(_copy_principals(principals))
         if state_worker is not None:
-            if type(state_worker) is not GatewayAccountSessionWorker:
+            if type(state_worker) not in (GatewayAccountSessionWorker, GatewayAccountReadModel):
                 raise GatewayServiceError("INVALID_STATE_WORKER")
             if state_worker.journal is not journal:
                 raise GatewayServiceError("STATE_WORKER_JOURNAL_MISMATCH")
@@ -340,6 +342,16 @@ class GatewayReadService:
             self._view_policies = MappingProxyType({})
         self._state_worker = state_worker
 
+    @property
+    def state_source(self) -> GatewayAccountSessionWorker | GatewayAccountReadModel | None:
+        """Exact borrowed state source; this does not provide session authority."""
+        return self._state_worker
+
+    @property
+    def accounts(self) -> Mapping[str, GatewayServiceAccountScope]:
+        """The immutable trusted wire-account to journal routing table."""
+        return self._accounts
+
     #: Runtime authorization generation (iteration 60, G2): increases on revocation.
     authorization_generation = 1
 
@@ -368,11 +380,16 @@ class GatewayReadService:
     def supported_operations(self) -> frozenset[str]:
         """Advertise metadata only when the trusted provider owns its source."""
         operations = SUPPORTED_OPERATIONS
+        if type(self._state_worker) is GatewayAccountReadModel:
+            return frozenset({"account.snapshot", "account.snapshot.typed", "account.head",
+                              "account.read_after", "account.ack", "account.progress"})
         if self._reconciliation is not None:
             operations = operations | {RECONCILIATION_CUT_OPERATION}
         if self._state_worker is None:
             operations = operations - {"account.snapshot.typed"}
-        if self._state_worker is None or not self._state_worker.instrument_metadata_available:
+        if type(self._state_worker) is GatewayAccountReadModel:
+            operations = operations - {"account.configuration", "account.server_time_probe", "account.instrument_metadata"}
+        elif self._state_worker is None or not self._state_worker.instrument_metadata_available:
             operations = operations - {"account.instrument_metadata"}
         return operations
 
@@ -408,6 +425,8 @@ class GatewayReadService:
             and "stream" in arguments
             and operation in _EXECUTION_STREAM_OPERATIONS
         ):
+            if type(self._state_worker) is GatewayAccountReadModel:
+                raise GatewayServiceError("UNSUPPORTED_OPERATION")
             if any(type(key) is not str for key in arguments):
                 raise GatewayServiceError("INVALID_ARGUMENTS")
             return self._handle_execution_stream(
@@ -1182,7 +1201,7 @@ def _state_result_matches_worker(
     *,
     operation: str,
     strategy_scope: str,
-    worker: GatewayAccountSessionWorker,
+    worker: GatewayAccountSessionWorker | GatewayAccountReadModel,
     generation: object,
 ) -> bool:
     latest = worker.latest_snapshot

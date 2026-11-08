@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 from types import MappingProxyType
 
 import pytest
@@ -1035,7 +1036,7 @@ def test_state_worker_rejects_schema_version_inconsistent_with_observation(tmp_p
             payload=wrong_payload,
             captured_at=latest.captured_at,
         )
-        worker._latest_snapshot = wrong_snapshot
+        worker.read_model._view = replace(worker.read_model._view, snapshot=wrong_snapshot)
 
         assert (
             _state_result_matches_worker(

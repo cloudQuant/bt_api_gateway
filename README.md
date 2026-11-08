@@ -329,3 +329,28 @@ Settlement insertion checks the caller's owner/observation/admission fence after
 SQLite acquires its write lock and again before commit. Storage does not validate
 provider provenance itself. The SDK controller supplies that validation and
 readback policy; this package still owns no native client or ZMQ socket.
+
+### Iteration 63 owner-published account read model
+
+`GatewayAccountReadModel` extracts the existing account worker's observation,
+coverage, clock and journal checks. A single owner thread starts a generation
+and uses `begin_refresh` / `finish_refresh` / `fail_refresh`; an injected
+generation callback checks that owner's lifecycle. Beginning a read invalidates
+freshness before provider I/O. Cross-thread snapshot/status reads use an
+immutable cached view and trusted clocks, without entering a provider or guard.
+The original `GatewayAccountSessionWorker` composes this same model and retains
+its own provider, guard and cleanup responsibilities.
+
+Reopened journal snapshots are diagnostic only: the same observation ID cannot
+establish a new generation's baseline. A successfully published observation may
+be repeated within its generation without extending freshness. An ambiguous
+journal commit or failed final owner check revokes baseline reuse. Freshness
+cannot be restored by replaying that observation; a new validated read is needed.
+
+`GatewayReadService(state_worker=model)` exposes exactly six account operations:
+snapshot, typed snapshot, head, read_after, ack and progress. It rejects the
+execution stream and does not advertise provider metadata, configuration,
+server-time or reconciliation capabilities. Its read-only `accounts` mapping
+lets the SDK verify public account routing against the command binding. This
+read model owns no native lifecycle and grants no trading authority; local tests
+are not deployment or account acceptance.
