@@ -51,6 +51,15 @@ class DirectCommandRecord:
 
 
 @dataclass(frozen=True)
+class DirectCommandObservation:
+    """Read-only TTL observation, not evidence that a command was not sent."""
+
+    record: DirectCommandRecord
+    generation_current: bool
+    remaining_ttl_seconds: float | None
+
+
+@dataclass(frozen=True)
 class DispatchStart:
     record: DirectCommandRecord
     newly_started: bool
@@ -247,6 +256,14 @@ class GatewayDirectCommandJournal:
     def journal_id(self) -> str:
         return self._journal_id
 
+    @property
+    def account_scope(self) -> str:
+        return self._account
+
+    @property
+    def generation(self) -> str:
+        return self._generation
+
     def _verify_schema(self, db: sqlite3.Connection) -> None:
         objects = {
             row[0]
@@ -372,6 +389,10 @@ class GatewayDirectCommandJournal:
         *,
         ttl_seconds: float = 10.0,
     ) -> DirectCommandRecord:
+        """Create a reservation; repeated keys never renew its original TTL.
+
+        TTL is a first-creation lifecycle option, not part of the payload digest.
+        """
         strategy, request_key, principal = map(_text, (strategy, request_key, principal))
         if (
             isinstance(ttl_seconds, bool)
@@ -422,6 +443,21 @@ class GatewayDirectCommandJournal:
         with self._transaction() as db:
             row = self._require(db, strategy, request_key, principal)
             return self._record(row)
+
+    def observe(self, strategy: str, request_key: str, principal: str) -> DirectCommandObservation:
+        """Observe the same row and local monotonic clock in one transaction.
+
+        Zero TTL is pending expiry, not a persisted EXPIRED or NOT_SENT result.
+        """
+        strategy, request_key, principal = map(_text, (strategy, request_key, principal))
+        with self._transaction() as db:
+            record = self._record(self._require(db, strategy, request_key, principal))
+            now = self._now()
+            current = record.generation == self._generation
+            remaining = None
+            if record.status == "RESERVED":
+                remaining = max(0.0, record.expires_at - now) if current else 0.0
+            return DirectCommandObservation(record, current, remaining)
 
     def recovery_page(self, *, limit: int, cursor: RecoveryCursor | None = None) -> RecoveryPage:
         """Read every account row for trusted owner recovery at one revision.

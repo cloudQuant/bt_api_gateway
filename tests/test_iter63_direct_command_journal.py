@@ -539,3 +539,59 @@ def test_reopen_rejects_damaged_identity_constraint(tmp_path):
             path, "account", generation="g", expected_journal_id=j.journal_id, minimum_revision=0
         ),
     )
+
+
+def test_observation_tracks_remaining_ttl_without_mutation_or_renewal(tmp_path):
+    now = [100.0]
+    j = journal(tmp_path / "db", clock=lambda: now[0])
+    row = j.reserve("s", "k", "owner", {"qty": "1"}, ttl_seconds=10)
+    revision = j.recovery_page(limit=1).revision
+    observation = j.observe("s", "k", "owner")
+    assert observation.record == row and observation.generation_current
+    assert observation.remaining_ttl_seconds == 10.0
+    with pytest.raises(FrozenInstanceError):
+        observation.remaining_ttl_seconds = 100
+    now[0] = 103.0
+    repeated = j.reserve("s", "k", "owner", {"qty": "1"}, ttl_seconds=30)
+    assert repeated == row
+    assert j.observe("s", "k", "owner").remaining_ttl_seconds == 7.0
+    now[0] = 110.0
+    at_boundary = j.observe("s", "k", "owner")
+    assert at_boundary.remaining_ttl_seconds == 0.0 and at_boundary.record.status == "RESERVED"
+    now[0] = 111.0
+    after = j.observe("s", "k", "owner")
+    assert after.remaining_ttl_seconds == 0.0 and after.record.status == "RESERVED"
+    assert j.recovery_page(limit=1).revision == revision
+    assert j.get("s", "k", "owner") == row
+    expired = j.expire("s", "k", "owner")
+    assert expired.status == "EXPIRED"
+    terminal = j.observe("s", "k", "owner")
+    assert terminal.generation_current and terminal.remaining_ttl_seconds is None
+
+
+def test_observation_of_old_generation_is_zero_and_read_only(tmp_path):
+    path = tmp_path / "db"
+    old = journal(path, clock=lambda: 100.0)
+    row = reserve(old)
+    current = journal(path, generation="process-2", clock=lambda: 1.0)
+    revision = current.recovery_page(limit=1).revision
+    observed = current.observe("s", "k", "owner")
+    assert not observed.generation_current and observed.remaining_ttl_seconds == 0.0
+    assert observed.record == row and observed.record.status == "RESERVED"
+    assert current.recovery_page(limit=1).revision == revision
+    released = current.release(*args(row), "op", row.version)
+    assert released.status == "EXPIRED"
+    observed = current.observe("s", "k", "owner")
+    assert not observed.generation_current and observed.remaining_ttl_seconds is None
+
+
+@pytest.mark.parametrize("bad_clock", [float("nan"), float("inf"), -1, True, "1"])
+def test_observation_rejects_invalid_clock_without_writing(tmp_path, bad_clock):
+    now = [100.0]
+    j = journal(tmp_path / "db", clock=lambda: now[0])
+    row = reserve(j)
+    revision = j.recovery_page(limit=1).revision
+    now[0] = bad_clock
+    error("CLOCK_INVALID", lambda: j.observe("s", "k", "owner"))
+    assert j.get("s", "k", "owner") == row
+    assert j.recovery_page(limit=1).revision == revision

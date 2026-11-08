@@ -278,3 +278,19 @@ identity keys must be complete, sorted and unique. Recovery exposes all records
 to the trusted owner, not to unauthenticated remote clients. No provider sends,
 strategy ledger integration, automatic takeover or production route is enabled
 by this module. Version `0.2.0.dev63` is a development build, not release acceptance.
+
+### Iteration 63 trusted local dispatch bridge
+
+`GatewayDirectDispatcher` binds a command journal to an acquired
+`LocalAccountSessionGuard` for the same account and generation. It calls a
+trusted native port only at dispatch, and the SDK pre-dispatch commit port
+records the native identity and strong keys before it returns a send marker.
+A repeated dispatch reads the original state instead of allocating or sending
+again; an incomplete final write stays DISPATCHING for recovery.
+
+The SDK supplies the canonical OrderRequest adapter. Comparing request_summary
+alone does not prove the actual native request matches it. This internal bridge
+is not authentication, account readiness, a strategy ledger, or a remote client.
+Its admission callback and native port remain trusted composition inputs.
+`observe()` is read-only and reports the local remaining reservation TTL and
+generation match; zero remaining TTL is not durable expiry or NOT_SENT.
