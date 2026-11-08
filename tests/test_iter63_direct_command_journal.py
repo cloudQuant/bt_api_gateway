@@ -595,3 +595,49 @@ def test_observation_rejects_invalid_clock_without_writing(tmp_path, bad_clock):
     error("CLOCK_INVALID", lambda: j.observe("s", "k", "owner"))
     assert j.get("s", "k", "owner") == row
     assert j.recovery_page(limit=1).revision == revision
+
+
+def test_before_dispatch_failure_rolls_back_and_retry_cannot_double_start(tmp_path):
+    j = journal(tmp_path / "db")
+    row = reserve(j)
+    revision = j.recovery_page(limit=1).revision
+    seen = []
+
+    def deny():
+        seen.append("locked")
+        raise PermissionError("revoked")
+
+    with pytest.raises(PermissionError):
+        j.begin_dispatch(*args(row), row.version, {"ref": "r"}, ("key",), before_dispatch=deny)
+    assert seen == ["locked"] and j.get("s", "k", "owner") == row
+    assert j.recovery_page(limit=1).revision == revision
+    started = j.begin_dispatch(
+        *args(row),
+        row.version,
+        {"ref": "r"},
+        ("key",),
+        before_dispatch=lambda: seen.append("allowed"),
+    )
+    assert started.newly_started
+    repeated = j.begin_dispatch(
+        *args(row),
+        row.version,
+        {"ref": "r"},
+        ("key",),
+        before_dispatch=lambda: pytest.fail("retry rechecked"),
+    )
+    assert not repeated.newly_started and seen == ["locked", "allowed"]
+
+
+def test_reservation_expiry_during_before_dispatch_never_starts(tmp_path):
+    now = [100.0]
+    j = journal(tmp_path / "db", clock=lambda: now[0])
+    row = reserve(j)
+
+    def advance():
+        now[0] = 110.0
+
+    result = j.begin_dispatch(
+        *args(row), row.version, {"ref": "r"}, ("key",), before_dispatch=advance
+    )
+    assert not result.newly_started and result.record.status == "EXPIRED"

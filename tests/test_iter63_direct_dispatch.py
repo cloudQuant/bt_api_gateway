@@ -33,7 +33,7 @@ def reserve(journal, key="one", strategy="s", payload=None):
     )
 
 
-def invoke(dispatcher, row):
+def invoke(dispatcher, row, **kwargs):
     return dispatcher.dispatch(
         row.strategy_scope,
         row.request_key,
@@ -41,6 +41,7 @@ def invoke(dispatcher, row):
         row.reservation_id,
         row.digest,
         row.version,
+        **kwargs,
     )
 
 
@@ -70,7 +71,7 @@ def marker_record(payload, scope, value=None, **changes):
     return PreDispatchRecord(**values)
 
 
-def build(journal, guard, native, gate=lambda row: None):
+def build(journal, guard, native, gate=lambda row: True):
     return GatewayDirectDispatcher(journal, "TEST", guard, native, keys, gate)
 
 
@@ -205,6 +206,7 @@ def test_both_admission_checks_fail_closed(setup):
         calls.append("gate")
         if len(calls) == 2:
             raise ValueError("blocked")
+        return True
 
     def native(payload, port, scope):
         port.commit(marker_record(payload, scope))
@@ -361,9 +363,14 @@ def test_wrong_thread_and_deferred_port_refused(setup):
         return NativeDispatchOutcome(False, None, None)
 
     dispatcher = build(journal, guard, native)
+    dispatcher.assert_owned()
     errors = []
 
     def run():
+        try:
+            dispatcher.assert_owned()
+        except LocalAccountSessionGuardError as exc:
+            errors.append(exc.code)
         try:
             invoke(dispatcher, row)
         except LocalAccountSessionGuardError as exc:
@@ -372,7 +379,7 @@ def test_wrong_thread_and_deferred_port_refused(setup):
     thread = threading.Thread(target=run)
     thread.start()
     thread.join()
-    assert errors == ["SESSION_WRONG_OWNER"]
+    assert errors == ["SESSION_WRONG_OWNER", "SESSION_WRONG_OWNER"]
     with pytest.raises(DirectDispatchError, match="PRE_DISPATCH_FAILED"):
         invoke(dispatcher, row)
     with pytest.raises(DirectDispatchError, match="COMMIT_CLOSED"):
@@ -471,8 +478,8 @@ def test_mutated_payload_is_not_accepted_as_summary(setup):
     assert journal.get("s", "one", "principal").payload_json == row.payload_json
 
 
-@pytest.mark.parametrize("result", [False, 0, "", "yes", [], object()])
-def test_admission_requires_none_or_exact_true(setup, result):
+@pytest.mark.parametrize("result", [None, False, 0, "", "yes", [], object()])
+def test_admission_requires_exact_true(setup, result):
     journal, guard = setup
     row = reserve(journal)
     dispatcher = build(
@@ -545,3 +552,266 @@ def test_expiry_inside_commit_cannot_get_marker(setup):
         invoke(dispatcher, row)
     assert invoke(dispatcher, row).status == "EXPIRED"
     assert sent == []
+
+
+def test_request_fence_covers_admission_and_commit_but_not_native(setup, monkeypatch):
+    from contextlib import contextmanager
+
+    journal, guard = setup
+    first = reserve(journal, "one")
+    second = reserve(journal, "two", payload={"symbol": "X", "qty": "2"})
+    events = []
+    inside = []
+    original_begin = journal.begin_dispatch
+
+    def begin(*args, **kwargs):
+        assert inside == [args[1]]
+        events.append(("begin", args[1]))
+        return original_begin(*args, **kwargs)
+
+    monkeypatch.setattr(journal, "begin_dispatch", begin)
+
+    def fence_for(expected):
+        @contextmanager
+        def fence(row):
+            assert row.request_key == expected and not inside
+            inside.append(expected)
+            events.append(("enter", expected))
+            try:
+                yield
+            finally:
+                events.append(("exit", expected))
+                inside.pop()
+
+        return fence
+
+    def gate(row):
+        assert inside == [row.request_key]
+        events.append(("admit", row.request_key))
+        return True
+
+    def native(payload, port, scope):
+        assert not inside
+        key = "one" if payload["qty"] == "1" else "two"
+        events.append(("native", key))
+        value = identity("ref-" + payload["qty"])
+        marker = port.commit(marker_record(payload, scope, value))
+        assert not inside and marker
+        events.append(("send", key))
+        return NativeDispatchOutcome(True, value, marker)
+
+    dispatcher = build(journal, guard, native, gate)
+    assert dispatcher.journal is journal
+    with pytest.raises(AttributeError):
+        dispatcher.journal = object()
+    for row in (first, second):
+        assert invoke(dispatcher, row, request_fence=fence_for(row.request_key)).status == "SENT"
+        assert (
+            invoke(dispatcher, row, request_fence=lambda _: pytest.fail("replay fenced")).status
+            == "SENT"
+        )
+    for key in ("one", "two"):
+        matching = [event for event in events if event[1] == key]
+        assert [event[0] for event in matching] == [
+            "enter",
+            "admit",
+            "exit",
+            "native",
+            "enter",
+            "admit",
+            "begin",
+            "admit",
+            "exit",
+            "send",
+        ]
+
+
+def test_request_fence_revocation_between_initial_check_and_commit(setup):
+    from contextlib import contextmanager
+
+    journal, guard = setup
+    row = reserve(journal)
+    attempts, sends = [], []
+    allowed = [True]
+
+    @contextmanager
+    def fence(record):
+        attempts.append(record.reservation_id)
+        if not allowed[0]:
+            raise PermissionError("revoked")
+        yield
+
+    def native(payload, port, scope):
+        allowed[0] = False
+        marker = port.commit(marker_record(payload, scope))
+        if marker:
+            sends.append(marker)
+        return NativeDispatchOutcome(False, identity(), marker)
+
+    dispatcher = build(journal, guard, native)
+    with pytest.raises(DirectDispatchError, match="PRE_DISPATCH_FAILED"):
+        invoke(dispatcher, row, request_fence=fence)
+    assert attempts == [row.reservation_id, row.reservation_id]
+    assert sends == [] and journal.get("s", "one", "principal").status == "RESERVED"
+
+
+def test_fence_cannot_suppress_admission_denial(setup):
+    from contextlib import contextmanager, suppress
+
+    journal, guard = setup
+    row = reserve(journal)
+
+    @contextmanager
+    def suppressing(_):
+        with suppress(Exception):
+            yield
+
+    dispatcher = build(journal, guard, lambda *args: pytest.fail("native reached"), lambda _: None)
+    with pytest.raises(DirectDispatchError, match="ADMISSION_DENIED"):
+        invoke(dispatcher, row, request_fence=suppressing)
+    assert journal.get("s", "one", "principal").status == "RESERVED"
+
+
+def test_fence_exit_failure_after_commit_marks_unknown_and_replay_does_not_send(setup):
+    from contextlib import contextmanager
+
+    journal, guard = setup
+    row = reserve(journal)
+    entries, sends = [], []
+
+    @contextmanager
+    def fence(_):
+        entries.append(1)
+        yield
+        if len(entries) == 2:
+            raise OSError("lost commit scope")
+
+    def native(payload, port, scope):
+        try:
+            marker = port.commit(marker_record(payload, scope))
+        except OSError:
+            marker = None
+        if marker:
+            sends.append(marker)
+        return NativeDispatchOutcome(False, identity(), marker)
+
+    dispatcher = build(journal, guard, native)
+    assert invoke(dispatcher, row, request_fence=fence).status == "UNKNOWN"
+    assert invoke(dispatcher, row, request_fence=fence).status == "UNKNOWN"
+    assert len(entries) == 2 and sends == []
+
+
+def test_admission_exception_always_reports_denied(setup):
+    journal, guard = setup
+    row = reserve(journal)
+
+    def gate(_):
+        raise DirectDispatchError("other-error")
+
+    dispatcher = build(journal, guard, lambda *args: pytest.fail("native reached"), gate)
+    with pytest.raises(DirectDispatchError, match="ADMISSION_DENIED"):
+        invoke(dispatcher, row)
+    assert journal.get("s", "one", "principal").status == "RESERVED"
+
+
+def test_fence_exit_failure_after_duplicate_never_finishes_other_attempt(setup, monkeypatch):
+    from contextlib import contextmanager
+
+    from bt_api_gateway.direct_command_journal import DispatchStart
+
+    journal, guard = setup
+    row = reserve(journal)
+    original = journal.begin_dispatch
+    entries = []
+
+    def duplicate(*args, **kwargs):
+        started_by_other = original(*args, **kwargs)
+        return DispatchStart(started_by_other.record, False)
+
+    monkeypatch.setattr(journal, "begin_dispatch", duplicate)
+
+    @contextmanager
+    def fence(_):
+        entries.append(1)
+        yield
+        if len(entries) == 2:
+            raise OSError("lost exit")
+
+    def native(payload, port, scope):
+        marker = port.commit(marker_record(payload, scope))
+        return NativeDispatchOutcome(True, identity(), marker)
+
+    dispatcher = build(journal, guard, native)
+    with pytest.raises(DirectDispatchError, match="PRE_DISPATCH_FAILED"):
+        invoke(dispatcher, row, request_fence=fence)
+    assert journal.get("s", "one", "principal").status == "DISPATCHING"
+    assert invoke(dispatcher, row, request_fence=fence).status == "DISPATCHING"
+    assert len(entries) == 2
+
+
+def test_lease_recheck_after_waiting_for_sqlite_lock_blocks_marker(setup, monkeypatch):
+    import sqlite3
+    from contextlib import contextmanager
+
+    journal, guard = setup
+    row = reserve(journal)
+    auth_now = [0]
+    entered_commit = threading.Event()
+    waiting_for_lock = threading.Event()
+    checks = []
+    sent = []
+    original_transaction = journal._transaction
+
+    @contextmanager
+    def traced_transaction():
+        if entered_commit.is_set():
+            waiting_for_lock.set()
+        with original_transaction() as db:
+            yield db
+
+    monkeypatch.setattr(journal, "_transaction", traced_transaction)
+    scopes = []
+
+    @contextmanager
+    def fence(_):
+        assert auth_now[0] < 1
+        scopes.append(1)
+        if len(scopes) == 2:
+            entered_commit.set()
+
+        def recheck():
+            checks.append(auth_now[0])
+            if auth_now[0] >= 1:
+                raise PermissionError("lease expired")
+
+        yield recheck
+
+    def native(payload, port, scope):
+        lock = sqlite3.connect(
+            journal._identity.path, isolation_level=None, check_same_thread=False
+        )
+        lock.execute("BEGIN IMMEDIATE")
+
+        def expire_and_unlock():
+            assert waiting_for_lock.wait(2)
+            threading.Event().wait(0.05)
+            auth_now[0] = 1
+            lock.execute("COMMIT")
+
+        thread = threading.Thread(target=expire_and_unlock)
+        thread.start()
+        try:
+            marker = port.commit(marker_record(payload, scope))
+            if marker:
+                sent.append(marker)
+            return NativeDispatchOutcome(False, identity(), marker)
+        finally:
+            thread.join(2)
+            assert not thread.is_alive()
+            lock.close()
+
+    dispatcher = build(journal, guard, native)
+    with pytest.raises(DirectDispatchError, match="PRE_DISPATCH_FAILED"):
+        invoke(dispatcher, row, request_fence=fence)
+    assert scopes == [1, 1] and checks == [1]
+    assert sent == [] and journal.get("s", "one", "principal").status == "RESERVED"

@@ -295,5 +295,14 @@ The SDK supplies the canonical OrderRequest adapter. Comparing request_summary
 alone does not prove the actual native request matches it. This internal bridge
 is not authentication, account readiness, a strategy ledger, or a remote client.
 Its admission callback and native port remain trusted composition inputs.
+Admission must return the literal `True`; missing returns and other values deny
+dispatch. An optional per-request `request_fence` scopes the initial check and
+the local durable commit separately, without holding that fence during native
+I/O. Its yielded recheck runs after SQLite acquires the journal write lock and
+before DISPATCHING is written, so waiting for that lock cannot bypass a lease
+deadline. The SDK supplies Registry authorization and the separate owner-thread
+queue; this package does not interpret wire principals or own ZMQ sockets.
+The guard remains held on native/cleanup uncertainty. These are local,
+cooperating-owner guarantees, not an external venue fencing mechanism.
 `observe()` is read-only and reports the local remaining reservation TTL and
 generation match; zero remaining TTL is not durable expiry or NOT_SENT.

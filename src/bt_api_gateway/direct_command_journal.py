@@ -569,7 +569,16 @@ class GatewayDirectCommandJournal:
         expected_version: int,
         native_identity: object,
         strong_identity_keys: tuple[str, ...],
+        *,
+        before_dispatch: Callable[[], None] | None = None,
     ) -> DispatchStart:
+        """Begin dispatch under the write transaction and an optional local recheck.
+
+        The trusted recheck runs with SQLite's write lock held; it must not do
+        provider I/O, enter another journal transaction, or reenter its fence.
+        """
+        if before_dispatch is not None and not callable(before_dispatch):
+            raise DirectCommandJournalError("INVALID_INPUT")
         strategy, request_key, reservation_id, digest, principal = map(
             _text, (strategy, request_key, reservation_id, digest, principal)
         )
@@ -614,6 +623,17 @@ class GatewayDirectCommandJournal:
                     is not None
                 ):
                     raise DirectCommandJournalError("IDENTITY_CONFLICT")
+            if before_dispatch is not None:
+                before_dispatch()
+            if self._now() >= row["expires_at"]:
+                db.execute(
+                    "UPDATE direct_journal_commands SET status='EXPIRED', version=version+1 WHERE account=? AND strategy=? AND request_key=?",
+                    (self._account, strategy, request_key),
+                )
+                self._bump(db)
+                return DispatchStart(
+                    self._record(self._require(db, strategy, request_key, principal)), False
+                )
             db.execute(
                 "UPDATE direct_journal_commands SET status='DISPATCHING', version=version+1, native_identity_json=?, strong_keys_json=? WHERE account=? AND strategy=? AND request_key=?",
                 (identity, keys_json, self._account, strategy, request_key),

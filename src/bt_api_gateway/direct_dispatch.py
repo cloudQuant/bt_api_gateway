@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -25,6 +26,28 @@ class DirectDispatchError(RuntimeError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+ScopeRecheck = Callable[[], None]
+RequestFence = Callable[[DirectCommandRecord], AbstractContextManager[ScopeRecheck | None]]
+
+
+@contextmanager
+def _request_scope(
+    fence: RequestFence | None, row: DirectCommandRecord
+) -> Iterator[ScopeRecheck | None]:
+    """Never allow an injected context manager to suppress a denied operation."""
+    scope = nullcontext() if fence is None else fence(row)
+    recheck = scope.__enter__()
+    try:
+        if recheck is not None and not callable(recheck):
+            raise DirectDispatchError("INVALID_REQUEST_FENCE")
+        yield recheck
+    except BaseException as exc:
+        scope.__exit__(type(exc), exc, exc.__traceback__)
+        raise
+    else:
+        scope.__exit__(None, None, None)
 
 
 @dataclass(frozen=True)
@@ -130,6 +153,15 @@ class GatewayDirectDispatcher:
         self._active = False
         guard.bind_consumer(self)
 
+    @property
+    def journal(self) -> GatewayDirectCommandJournal:
+        """Return the exact journal object bound to this dispatcher."""
+        return self._journal
+
+    def assert_owned(self) -> None:
+        """Verify the creating process and thread still hold the same guard generation."""
+        self._owned()
+
     def _owned(self) -> None:
         self._guard.assert_owned()
         if self._guard.acquire() != self._guard_generation:
@@ -138,12 +170,10 @@ class GatewayDirectDispatcher:
     def _admitted(self, row: DirectCommandRecord) -> None:
         try:
             admitted = self._admission(row)
-            if admitted is not None and admitted is not True:
-                raise DirectDispatchError("ADMISSION_DENIED")
-        except DirectDispatchError:
-            raise
         except Exception:
             raise DirectDispatchError("ADMISSION_DENIED") from None
+        if admitted is not True:
+            raise DirectDispatchError("ADMISSION_DENIED")
 
     def dispatch(
         self,
@@ -153,7 +183,11 @@ class GatewayDirectDispatcher:
         reservation_id: str,
         digest: str,
         expected_version: int,
+        *,
+        request_fence: RequestFence | None = None,
     ) -> DirectCommandRecord:
+        if request_fence is not None and not callable(request_fence):
+            raise DirectDispatchError("INVALID_REQUEST_FENCE")
         self._owned()
         if self._active:
             raise DirectDispatchError("DISPATCH_REENTRANT")
@@ -170,9 +204,11 @@ class GatewayDirectDispatcher:
         payload = _request(row.payload_json)
         self._active = True
         try:
-            self._admitted(row)
-            self._owned()
-            port = _CommitPort(self, row)
+            with _request_scope(request_fence, row):
+                self._owned()
+                self._admitted(row)
+                self._owned()
+            port = _CommitPort(self, row, request_fence)
             try:
                 outcome = self._native_place(payload, port, self._journal.account_scope)
             except Exception:
@@ -220,9 +256,15 @@ class GatewayDirectDispatcher:
 class _CommitPort:
     """One-use commit port; only a newly committed row yields a marker."""
 
-    def __init__(self, owner: GatewayDirectDispatcher, record: DirectCommandRecord) -> None:
+    def __init__(
+        self,
+        owner: GatewayDirectDispatcher,
+        record: DirectCommandRecord,
+        request_fence: RequestFence | None,
+    ) -> None:
         self._owner = owner
         self._record = record
+        self._request_fence = request_fence
         self.identity: dict[str, object] | None = None
         self.keys: tuple[str, ...] = ()
         self._attempted = False
@@ -239,51 +281,63 @@ class _CommitPort:
         if self._attempted:
             raise DirectDispatchError("COMMIT_REUSED")
         self._attempted = True
-        if (
-            type(record) is not PreDispatchRecord
-            or record.operation is not WriteOperation.PLACE
-            or record.exchange_name != self._owner._exchange
-            or record.host_scope != self._owner._journal.account_scope
-            or record.identity is None
-            or record.target_identity is not None
-        ):
+        if type(record) is not PreDispatchRecord or record.identity is None:
             raise DirectDispatchError("COMMIT_RECORD_INVALID")
-        if record.session_generation != record.identity.session_generation:
-            raise DirectDispatchError("COMMIT_RECORD_INVALID")
-        if record.symbol != _request(self._record.payload_json)["symbol"]:
-            raise DirectDispatchError("COMMIT_RECORD_INVALID")
-        try:
-            summary = _json(dict(record.request_summary))
-        except Exception:
-            raise DirectDispatchError("COMMIT_RECORD_INVALID") from None
-        if summary != self._record.payload_json:
-            raise DirectDispatchError("REQUEST_CONFLICT")
-        identity = _identity(record.identity, self._owner._exchange)
+        # This injected projection must be pure; do it before the short fence.
         try:
             keys = self._owner._identity_keys(record.identity)
         except Exception:
             raise DirectDispatchError("IDENTITY_INVALID") from None
-        self._owner._owned()
-        current = self._owner._journal.get(
-            self._record.strategy_scope, self._record.request_key, self._record.principal
-        )
-        if current != self._record:
-            raise DirectDispatchError("REQUEST_CONFLICT")
-        self._owner._admitted(current)
-        self._owner._owned()
-        self.identity, self.keys = identity, keys
-        result = self._owner._journal.begin_dispatch(
-            current.strategy_scope,
-            current.request_key,
-            current.reservation_id,
-            current.digest,
-            current.principal,
-            current.version,
-            identity,
-            keys,
-        )
-        if not result.newly_started:
-            self._known_not_new = True
+        with _request_scope(self._request_fence, self._record) as recheck:
+            self._owner._owned()
+            if (
+                record.operation is not WriteOperation.PLACE
+                or record.exchange_name != self._owner._exchange
+                or record.host_scope != self._owner._journal.account_scope
+                or record.target_identity is not None
+                or record.session_generation != record.identity.session_generation
+                or record.symbol != _request(self._record.payload_json)["symbol"]
+            ):
+                raise DirectDispatchError("COMMIT_RECORD_INVALID")
+            try:
+                summary = _json(dict(record.request_summary))
+            except Exception:
+                raise DirectDispatchError("COMMIT_RECORD_INVALID") from None
+            if summary != self._record.payload_json:
+                raise DirectDispatchError("REQUEST_CONFLICT")
+            identity = _identity(record.identity, self._owner._exchange)
+            current = self._owner._journal.get(
+                self._record.strategy_scope, self._record.request_key, self._record.principal
+            )
+            if current != self._record:
+                raise DirectDispatchError("REQUEST_CONFLICT")
+            self._owner._admitted(current)
+            self._owner._owned()
+            self.identity, self.keys = identity, keys
+
+            def before_dispatch() -> None:
+                # Lock order: request fence (registry) -> journal SQLite.
+                # This recheck performs no provider I/O and does not reenter the fence.
+                self._owner._owned()
+                self._owner._admitted(current)
+                self._owner._owned()
+                if recheck is not None:
+                    recheck()
+
+            result = self._owner._journal.begin_dispatch(
+                current.strategy_scope,
+                current.request_key,
+                current.reservation_id,
+                current.digest,
+                current.principal,
+                current.version,
+                identity,
+                keys,
+                before_dispatch=before_dispatch,
+            )
+            if not result.newly_started:
+                self._known_not_new = True
+        if self._known_not_new:
             return None
         return current.reservation_id
 
