@@ -133,6 +133,11 @@ def test_dispatch_finish_recovery_and_identity(tmp_path):
     error("STATE_CONFLICT", lambda: j.release(*args(a), "op", a.version))
     reopened = journal(path, generation="process-2")
     assert reopened.get("s", "k", "owner").status == "DISPATCHING"
+    # Other commands proceed before the system UNKNOWN exists; afterwards the
+    # unknown-order scope fence refuses them without a binding resolver.
+    b = reserve(reopened, key="b")
+    s = dispatch(reopened, *args(b), b.version, {"ref": "b"})
+    sent = finish(reopened, *args(b), s.record.version, {"ref": "b"}, "SENT")
     unknown = finish(
         reopened, *args(a), started.record.version, {"ref": "one", "front": 1}, "UNKNOWN"
     )
@@ -146,9 +151,6 @@ def test_dispatch_finish_recovery_and_identity(tmp_path):
     )
     assert not dispatch(reopened, *args(a), a.version, {"ref": "one", "front": 1}).newly_started
     error("STATE_CONFLICT", lambda: reopened.release(*args(a), "op", a.version))
-    b = reserve(reopened, key="b")
-    s = dispatch(reopened, *args(b), b.version, {"ref": "b"})
-    sent = finish(reopened, *args(b), s.record.version, {"ref": "b"}, "SENT")
     assert sent.status == "SENT"
     error(
         "STATE_CONFLICT",
@@ -246,6 +248,10 @@ def test_each_mutation_commit_failure(tmp_path, monkeypatch, operation, after_co
     original = j._commit
 
     def fail(db):
+        if db.total_changes == 0:
+            # Read-only preflight transactions (begin_dispatch) commit normally;
+            # inject only into the mutating transaction under test.
+            return original(db)
         if after_commit:
             original(db)
         raise OSError("injected commit failure")

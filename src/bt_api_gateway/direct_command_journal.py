@@ -1382,6 +1382,55 @@ class GatewayDirectCommandJournal:
                 before_commit()
             return self._settlement_row(row)
 
+    def settlement_abandon_unsent(
+        self, observation: SettlementObservation, marker_id: str,
+    ) -> None:
+        """Remove one ATTEMPTING marker whose confirmation was never sent.
+
+        Only for the owner that wrote the marker and then failed its final
+        claim on the same thread before any provider call: the attempt is
+        definitely not in flight, so a later tick may make a new attempt. An
+        UNKNOWN or CONFIRMED row, or any identity mismatch, is never removed.
+        """
+        self._settlement_input(observation, SettlementStatus.UNCONFIRMED)
+        marker_id = _text(marker_id)
+        with self._transaction() as db:
+            row = self._settlement_existing(
+                db, observation.exchange_name, observation.trading_day, observation.account_binding
+            )
+            if (
+                row is None
+                or row["status"] != "ATTEMPTING"
+                or row["marker_id"] != marker_id
+                or row["initial_observation_id"] != observation.observation_id
+                or row["initial_session_generation"] != observation.session_generation
+                or row["owner_generation"] != self._generation
+            ):
+                raise DirectCommandJournalError("SETTLEMENT_ATTEMPT_MISMATCH")
+            db.execute(
+                "DELETE FROM direct_journal_settlement WHERE account=? AND exchange_name=? "
+                "AND trading_day=? AND status='ATTEMPTING' AND marker_id=?",
+                (self._account, observation.exchange_name, observation.trading_day, marker_id),
+            )
+            self._bump(db)
+
+    def settlement_account_frozen(self) -> bool:
+        """Read-only: whether an active account-scope FREEZE control exists."""
+        if self._schema_version < 10:
+            return False
+        with self._connection() as db:
+            db.execute("BEGIN")
+            try:
+                row = db.execute(
+                    "SELECT 1 FROM direct_control_causes WHERE account=? AND active=1 "
+                    "AND scope_kind='account' AND mode='FREEZE' LIMIT 1",
+                    (self._account,),
+                ).fetchone()
+                return row is not None
+            finally:
+                if db.in_transaction:
+                    db.execute("ROLLBACK")
+
     def settlement_confirm(
         self,
         observation: SettlementObservation,
@@ -2823,6 +2872,50 @@ class GatewayDirectCommandJournal:
             return DispatchStart(
                 self._record(self._require(db, strategy, request_key, principal)), True
             )
+
+    def recheck_dispatch_controls(
+        self, strategy: str, request_key: str, principal: str, reservation_id: str, digest: str,
+    ) -> None:
+        """Read-only control and monitor recheck for a DISPATCHING command.
+
+        Used for the decision-B final validation after the durable marker and
+        before the native claim: an emergency control or required-monitor loss
+        committed before this read refuses the native call. Capacity was
+        reserved by the marker transaction itself. No row is written.
+        """
+        strategy, request_key, principal, reservation_id, digest = map(
+            _text, (strategy, request_key, principal, reservation_id, digest))
+        with self._connection() as db:
+            db.execute("BEGIN")
+            try:
+                self._assert_anchor(db)
+                row = self._bound(db, strategy, request_key, reservation_id, digest, principal)
+                if row["status"] != "DISPATCHING":
+                    raise DirectCommandJournalError("NOT_DISPATCHING")
+                payload = json.loads(row["payload_json"])
+                if self._schema_version >= 10:
+                    from .direct_control import check_controls
+                    blocked = db.execute(
+                        "SELECT cause.mode FROM direct_control_blocked blocked "
+                        "JOIN direct_control_causes cause ON cause.account=blocked.account "
+                        "AND cause.cause_id=blocked.cause_id "
+                        "WHERE blocked.account=? AND blocked.reservation_id=?",
+                        (self._account, reservation_id),
+                    ).fetchall()
+                    if blocked and (any(item[0] != "STOP_NEW" for item in blocked)
+                                    or not self._allow_verified_close(
+                                        db, strategy, payload,
+                                        exclude_reservation_id=reservation_id)):
+                        raise DirectCommandJournalError("CONTROL_PREVIOUSLY_BLOCKED")
+                    check_controls(db, self._account, strategy, payload,
+                                   allow_verified_close=lambda: self._allow_verified_close(
+                                       db, strategy, payload,
+                                       exclude_reservation_id=reservation_id))
+                self._assert_monitor_gate(db, strategy, payload,
+                                          exclude_reservation_id=reservation_id)
+            finally:
+                if db.in_transaction:
+                    db.execute("ROLLBACK")
 
     def get_prepared_place(self, reservation_id: str):
         """Read the prepared value bound to one exact original reservation."""

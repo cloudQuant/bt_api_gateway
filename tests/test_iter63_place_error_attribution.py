@@ -359,8 +359,11 @@ def test_commit_port_persists_preparation_before_native_and_legacy_unchanged(set
         calls.append("native")
         return NativeDispatchOutcome(True, identity, marker)
 
+    from iter63_claim_support import SyntheticClaimPort, claiming
+
     dispatcher = GatewayDirectDispatcher(
-        journal, "CTP", guard, native, lambda _: ("session-ref-a",), lambda _: True
+        journal, "CTP", guard, claiming(native), lambda _: ("session-ref-a",), lambda _: True,
+        claim_port=SyntheticClaimPort(),
     )
     result = dispatcher.dispatch("s1", "req1", "principal", order.reservation_id, order.digest, 1)
     assert result.status == "SENT" and calls == ["native"]
@@ -401,8 +404,11 @@ def test_commit_failure_leaves_no_preparation_and_no_native_send(setup, monkeypa
         calls.append("native")
         return NativeDispatchOutcome(True, identity, marker)
 
+    from iter63_claim_support import SyntheticClaimPort, claiming
+
     dispatcher = GatewayDirectDispatcher(
-        journal, "CTP", guard, native, lambda _: ("session-ref-a",), lambda _: True
+        journal, "CTP", guard, claiming(native), lambda _: ("session-ref-a",), lambda _: True,
+        claim_port=SyntheticClaimPort(),
     )
     original = journal._commit
 

@@ -72,7 +72,10 @@ def marker_record(payload, scope, value=None, **changes):
 
 
 def build(journal, guard, native, gate=lambda row: True):
-    return GatewayDirectDispatcher(journal, "TEST", guard, native, keys, gate)
+    from iter63_claim_support import SyntheticClaimPort, claiming
+
+    return GatewayDirectDispatcher(journal, "TEST", guard, claiming(native), keys, gate,
+                                   claim_port=SyntheticClaimPort())
 
 
 def test_commit_precedes_native_and_replay_never_reallocates(setup):
@@ -189,6 +192,13 @@ def test_invalid_commit_records_refuse_before_send(setup, kind):
 @pytest.mark.parametrize("payload", [{}, [1], {"x": [1]}, {"x": {"y": "1"}}])
 def test_nonscalar_payload_rejected_before_native(setup, payload):
     journal, guard = setup
+    if type(payload) is not dict:
+        # A non-mapping payload is now refused at reservation already.
+        from bt_api_gateway.direct_command_journal import DirectCommandJournalError
+
+        with pytest.raises(DirectCommandJournalError):
+            reserve(journal, payload=payload)
+        return
     row = reserve(journal, payload=payload)
     calls = []
     dispatcher = build(journal, guard, lambda *args: calls.append("native"))
@@ -242,6 +252,9 @@ def test_identity_collision_no_send_and_guard_is_bound(setup):
 def test_release_expiry_and_input_binding_never_invoke_native(setup):
     journal, guard = setup
     released, expired = reserve(journal, "release"), reserve(journal, "expire")
+    # Reserve before the system UNKNOWN exists: afterwards the unknown-order
+    # scope fence (no binding resolver here) refuses new reservations.
+    fresh = reserve(journal, "new")
     journal.release(
         released.strategy_scope,
         released.request_key,
@@ -276,7 +289,6 @@ def test_release_expiry_and_input_binding_never_invoke_native(setup):
     dispatcher = build(journal, guard, lambda *args: calls.append(1))
     assert invoke(dispatcher, released).status == "RELEASED"
     assert invoke(dispatcher, expired).status == "UNKNOWN"
-    fresh = reserve(journal, "new")
     with pytest.raises(DirectDispatchError, match="REQUEST_CONFLICT"):
         dispatcher.dispatch("s", "new", "principal", fresh.reservation_id, "wrong", fresh.version)
     with pytest.raises(DirectDispatchError, match="VERSION_CONFLICT"):
@@ -620,6 +632,12 @@ def test_request_fence_covers_admission_and_commit_but_not_native(setup, monkeyp
             "enter",
             "admit",
             "begin",
+            "admit",  # before_dispatch, under the journal write lock
+            "admit",  # before_commit, immediately before COMMIT
+            "exit",
+            # Decision B: final authority recheck for the claim, released
+            # before the (synthetic) native send.
+            "enter",
             "admit",
             "exit",
             "send",

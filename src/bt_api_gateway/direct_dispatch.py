@@ -3,6 +3,14 @@
 The guard is held by the caller and is never released here. The injected native
 port must honor the SDK durable pre-dispatch marker and may call the venue only
 after commit returns that marker. This module does not prove provider facts.
+
+Decision B (2026-11-09): after the durable dispatch marker, ``native_fence``
+revalidates authority and market evidence under the Registry and market locks,
+then obtains one in-memory claim from the injected claim port and releases all
+locks before the provider's native call. A claim that precedes a revocation is
+in flight (the request may reach the venue after the revocation completed); a
+revocation that precedes the claim makes it stale and nothing is sent. Without
+a claim port every new dispatch is refused.
 """
 
 from __future__ import annotations
@@ -20,7 +28,12 @@ from bt_api_base.gateway_direct_protocol import (
     validate_gateway_native_identity,
 )
 
-from .direct_command_journal import DirectCommandRecord, GatewayDirectCommandJournal, _json
+from .direct_command_journal import (
+    DirectCommandJournalError,
+    DirectCommandRecord,
+    GatewayDirectCommandJournal,
+    _json,
+)
 from .session_guard import LocalAccountSessionGuard
 
 
@@ -126,6 +139,8 @@ class GatewayDirectDispatcher:
         native_place: Callable[[dict[str, object], Any, str], NativeDispatchOutcome],
         identity_keys: Callable[[NativeOrderIdentity], tuple[str, ...]],
         assert_admitted: Callable[[DirectCommandRecord], object],
+        *,
+        claim_port: object | None = None,
     ) -> None:
         if (
             type(journal) is not GatewayDirectCommandJournal
@@ -140,6 +155,11 @@ class GatewayDirectDispatcher:
         ):
             raise DirectDispatchError("INVALID_COMPOSITION")
         if not all(callable(x) for x in (native_place, identity_keys, assert_admitted)):
+            raise DirectDispatchError("INVALID_COMPOSITION")
+        if claim_port is not None and not all(
+            callable(getattr(claim_port, name, None))
+            for name in ("claim_native", "native_check", "retire")
+        ):
             raise DirectDispatchError("INVALID_COMPOSITION")
         if (
             hashlib.sha256(journal.account_scope.encode("utf-8")).hexdigest()
@@ -156,8 +176,21 @@ class GatewayDirectDispatcher:
         self._native_place = native_place
         self._identity_keys = identity_keys
         self._admission = assert_admitted
+        self._claim_port = claim_port
+        self._faulted = False
         self._active = False
         guard.bind_consumer(self)
+
+    def claims_available(self) -> bool:
+        """Whether a sealed claim port is installed; not an authorization."""
+        port = self._claim_port
+        if port is None or self._faulted:
+            return False
+        ready = getattr(port, "ready", None)
+        try:
+            return callable(ready) and ready() is True
+        except Exception:
+            return False
 
     @property
     def journal(self) -> GatewayDirectCommandJournal:
@@ -256,12 +289,11 @@ class GatewayDirectDispatcher:
             return row
         if type(expected_version) is not int or row.version != expected_version:
             raise DirectDispatchError("VERSION_CONFLICT")
-        # A durable reservation is not yet a dispatch authorization.  Until
-        # every authority that can affect an order participates in the same
-        # single-use, nonblocking native claim, do not write a dispatch marker
-        # or enter any injected native provider.  In particular, forwarding the
-        # old native_fence would hold Registry and market locks over native I/O.
-        raise DirectDispatchError("DISPATCH_CLAIM_UNAVAILABLE")
+        # A durable reservation is not yet a dispatch authorization.  Without
+        # a claim port covering every relevant writer, do not write a dispatch
+        # marker or enter any injected native provider.
+        if self._claim_port is None or not self.claims_available():
+            raise DirectDispatchError("DISPATCH_CLAIM_UNAVAILABLE")
         payload = _request(row.payload_json)
         self._active = True
         try:
@@ -276,6 +308,16 @@ class GatewayDirectDispatcher:
                 outcome = None
             finally:
                 port.close()
+                # Safe once the marker left RESERVED: the journal refuses to
+                # prepare this command again, so the in-memory guard may go.
+                port.retire_claim()
+            if port.identity is not None and not port.claimed and not (
+                type(outcome) is NativeDispatchOutcome and outcome.sent is False
+            ):
+                # A provider reached (or may have reached) the venue without the
+                # decision-B claim: a composition fault. Record the attempt
+                # honestly below and refuse every later dispatch.
+                self._faulted = True
             self._owned()
             current = port.current_after_attempt()
             if current is None:
@@ -334,6 +376,9 @@ class _CommitPort:
         self.identity: dict[str, object] | None = None
         self.keys: tuple[str, ...] = ()
         self.prepared_digest: str | None = None
+        self._claim: object | None = None
+        self._claim_retired = False
+        self._claim_attempted = False
         self._attempted = False
         self._known_not_new = False
         self._closed = False
@@ -341,34 +386,90 @@ class _CommitPort:
     def close(self) -> None:
         self._closed = True
 
+    @property
+    def claimed(self) -> bool:
+        return self._claim is not None or self._claim_retired
+
+    def retire_claim(self) -> None:
+        claim, self._claim = self._claim, None
+        if claim is not None:
+            self._claim_retired = True
+            try:
+                self._owner._claim_port.retire(claim)
+            except Exception:
+                # The command already left RESERVED; a retained guard only
+                # costs capacity and is reported by the claim port.
+                pass
+
+    def _final_validation(self, horizon_ns: int = 0) -> None:
+        """Authority, market and control recheck for one claim attempt.
+
+        Lock order: Registry request fence -> market gate -> journal read, the
+        same order as ``commit``; no provider I/O. ``horizon_ns`` requires
+        time-limited market evidence to stay valid for the claim window. All
+        locks are released before the claim port returns and the native call.
+        """
+        if type(horizon_ns) is not int or horizon_ns < 0:
+            raise DirectDispatchError('INVALID_CLAIM_HORIZON')
+        # Entering the request fence performs its own authority check; a
+        # yielded recheck is invoked again around the remaining checks.
+        with _request_scope(self._request_fence, self._record) as recheck:
+            self._owner._owned()
+            self._owner._admitted(self._record)
+            if recheck is not None:
+                recheck()
+            if self._delegation_permit is not None:
+                if (self._market_gate is not None and self._market_gate.matches_delegation(
+                        self._market_permit, self._delegation_permit) is not True):
+                    raise DirectDispatchError('INVALID_DELEGATION')
+                if self._delegation_permit.command.parent_ref is not None:
+                    raise DirectDispatchError('PARENT_NATIVE_FENCE_UNAVAILABLE')
+                # Non-parent grants do not require a journal-backed authority
+                # check. Registry is held by the request scope.
+                self._delegation_permit.recheck(None)
+            if self._market_gate is not None:
+                self._market_gate.native_recheck(self._market_permit, self._record,
+                                                 horizon_ns=horizon_ns)
+            row = self._record
+            try:
+                self._owner._journal.recheck_dispatch_controls(
+                    row.strategy_scope, row.request_key, row.principal,
+                    row.reservation_id, row.digest)
+            except DirectCommandJournalError as error:
+                raise DirectDispatchError(error.code) from None
+            if recheck is not None:
+                recheck()
+
     @contextmanager
     def native_fence(self):
-        """Hold current trusted market evidence around the final native call."""
+        """Obtain the single decision-B claim, then yield a lock-free check.
+
+        The yielded callable is invoked by the provider immediately before the
+        native call; it verifies only that this claim is still fresh and never
+        acquires Registry, market or journal locks.
+        """
         if self._closed or not self._owner._active:
             raise DirectDispatchError('COMMIT_CLOSED')
-        if self._market_gate is None:
-            yield None
-            return
-        with _request_scope(self._request_fence, self._record) as recheck:
-            if recheck is None:
-                raise DirectDispatchError('INVALID_REQUEST_FENCE')
-            with self._market_gate.native_fence(self._market_permit, self._record):
-                def final_recheck():
-                    self._owner._owned()
-                    self._owner._admitted(self._record)
-                    recheck()
-                    if self._delegation_permit is not None:
-                        if self._market_gate.matches_delegation(self._market_permit, self._delegation_permit) is not True:
-                            raise DirectDispatchError('INVALID_DELEGATION')
-                        if self._delegation_permit.command.parent_ref is not None:
-                            raise DirectDispatchError('PARENT_NATIVE_FENCE_UNAVAILABLE')
-                        # Non-parent grants do not require a journal-backed
-                        # authority check. Registry is held by the outer scope.
-                        self._delegation_permit.recheck(None)
-                    recheck()
-                    self._market_gate.native_recheck(self._market_permit, self._record)
-                final_recheck()
-                yield final_recheck
+        port = self._owner._claim_port
+        if port is None or self._claim_attempted:
+            raise DirectDispatchError('DISPATCH_CLAIM_UNAVAILABLE')
+        self._claim_attempted = True
+        current = self.current_after_attempt()
+        if current is None:
+            raise DirectDispatchError('PRE_DISPATCH_FAILED')
+        try:
+            claim = port.claim_native(current, self.identity, self._final_validation)
+        except DirectDispatchError:
+            raise
+        except Exception:
+            raise DirectDispatchError('DISPATCH_CLAIM_UNAVAILABLE') from None
+        if claim is None:
+            raise DirectDispatchError('DISPATCH_CLAIM_UNAVAILABLE')
+        self._claim = claim
+        check = port.native_check(claim)
+        if not callable(check):
+            raise DirectDispatchError('DISPATCH_CLAIM_UNAVAILABLE')
+        yield check
 
     def commit(self, record: PreDispatchRecord) -> str | None:
         self._owner._owned()

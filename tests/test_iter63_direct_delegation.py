@@ -267,7 +267,9 @@ def test_dispatcher_commits_delegate_under_the_original_fence(owner):
         assert marker and not state['held']
         state['sent'] += 1
         return NativeDispatchOutcome(True, native, marker)
-    dispatcher = GatewayDirectDispatcher(journal, 'CTP', guard, place, lambda _: ('order-key',), lambda _: True)
+    from iter63_claim_support import SyntheticClaimPort, claiming
+    dispatcher = GatewayDirectDispatcher(journal, 'CTP', guard, claiming(place), lambda _: ('order-key',),
+                                         lambda _: True, claim_port=SyntheticClaimPort())
     result = dispatcher.dispatch('strategy', 'order-1', 'risk-principal', row.reservation_id,
         row.digest, row.version, request_fence=admission, delegation_permit=permit(operation='direct.dispatch'))
     assert result.status == 'SENT' and state['sent'] == 1 and state['rechecks'] >= 1
@@ -293,7 +295,9 @@ def test_delegate_revoked_at_native_commit_never_sends(owner):
             request_summary=payload, trading_day='20300101', session_generation=1, created_at_utc='synthetic'))
         sent.append(marker)
         return NativeDispatchOutcome(True, native, marker)
-    dispatcher = GatewayDirectDispatcher(journal, 'CTP', guard, place, lambda _: ('order-key',), lambda _: True)
+    from iter63_claim_support import SyntheticClaimPort, claiming
+    dispatcher = GatewayDirectDispatcher(journal, 'CTP', guard, claiming(place), lambda _: ('order-key',),
+                                         lambda _: True, claim_port=SyntheticClaimPort())
     with pytest.raises(DirectDispatchError, match='PRE_DISPATCH_FAILED'):
         dispatcher.dispatch('strategy', 'order-1', 'risk-principal', row.reservation_id,
             row.digest, row.version, request_fence=admission, delegation_permit=auth)

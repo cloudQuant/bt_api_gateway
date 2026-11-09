@@ -328,6 +328,8 @@ def test_upgrade_rejects_wrong_account_guard_and_generation(owned, tmp_path):
 def test_upgrade_preserves_unknown_identity_strong_keys_and_release(owned):
     journal, guard, path = owned
     first = journal.reserve("s", "unknown", "p", {"symbol": "rb"})
+    # Reserve before the system UNKNOWN exists (unknown-order scope fence).
+    second = journal.reserve("s", "released", "p", {"symbol": "rb"})
     native = {
         "exchange_name": "TEST",
         "client_order_id": "ref",
@@ -348,7 +350,6 @@ def test_upgrade_preserves_unknown_identity_strong_keys_and_release(owned):
         ("strong-1",),
         "UNKNOWN",
     )
-    second = journal.reserve("s", "released", "p", {"symbol": "rb"})
     released = journal.release(
         "s", "released", second.reservation_id, second.digest, "p", "release-op", 1
     )
