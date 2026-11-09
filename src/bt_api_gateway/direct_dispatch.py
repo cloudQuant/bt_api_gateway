@@ -4,13 +4,17 @@ The guard is held by the caller and is never released here. The injected native
 port must honor the SDK durable pre-dispatch marker and may call the venue only
 after commit returns that marker. This module does not prove provider facts.
 
-Decision B (2026-11-09): after the durable dispatch marker, ``native_fence``
-revalidates authority and market evidence under the Registry and market locks,
-then obtains one in-memory claim from the injected claim port and releases all
-locks before the provider's native call. A claim that precedes a revocation is
-in flight (the request may reach the venue after the revocation completed); a
-revocation that precedes the claim makes it stale and nothing is sent. Without
-a claim port every new dispatch is refused.
+Decision B (2026-11-09): before the durable dispatch marker, the dispatcher
+revalidates authority, market evidence and journal controls (taking the
+Registry, market and journal locks only briefly) and obtains one in-memory
+claim from the injected claim port; all locks are released before the provider
+call, whose final check is only the claim's age. A claim that precedes a
+revocation is in flight (the request may reach the venue after the revocation
+completed); a revocation that precedes the claim makes it stale and nothing is
+sent. If a covered writer is mid-change the claim is BUSY: no marker is written,
+the command stays RESERVED and the owner may retry after serving other work.
+The marker transaction still rechecks authority and may refuse. Without a
+claim port every new dispatch is refused.
 """
 
 from __future__ import annotations
@@ -302,6 +306,8 @@ class GatewayDirectDispatcher:
                 self._admitted(row)
                 self._owned()
             port = _CommitPort(self, row, request_fence, delegation_permit, market_gate, market_permit)
+            # The single claim precedes the marker; failure leaves RESERVED.
+            port.claim_before_marker()
             try:
                 outcome = self._native_place(payload, port, self._journal.account_scope)
             except Exception:
@@ -379,6 +385,7 @@ class _CommitPort:
         self._claim: object | None = None
         self._claim_retired = False
         self._claim_attempted = False
+        self._native_fence_used = False
         self._attempted = False
         self._known_not_new = False
         self._closed = False
@@ -388,7 +395,8 @@ class _CommitPort:
 
     @property
     def claimed(self) -> bool:
-        return self._claim is not None or self._claim_retired
+        # The provider path entered native_fence with a live claim.
+        return self._native_fence_used
 
     def retire_claim(self) -> None:
         claim, self._claim = self._claim, None
@@ -400,6 +408,24 @@ class _CommitPort:
                 # The command already left RESERVED; a retained guard only
                 # costs capacity and is reported by the claim port.
                 pass
+
+    def claim_before_marker(self) -> None:
+        port = self._owner._claim_port
+        if port is None or self._claim_attempted or self._closed or not self._owner._active:
+            raise DirectDispatchError('DISPATCH_CLAIM_UNAVAILABLE')
+        self._claim_attempted = True
+        try:
+            claim = port.claim_native(self._record, None, self._final_validation)
+        except DirectDispatchError:
+            raise
+        except Exception as error:
+            code = getattr(error, 'code', None)
+            if code == 'DISPATCH_CLAIM_BUSY':
+                raise DirectDispatchError('DISPATCH_CLAIM_BUSY') from None
+            raise DirectDispatchError('DISPATCH_CLAIM_UNAVAILABLE') from None
+        if claim is None:
+            raise DirectDispatchError('DISPATCH_CLAIM_UNAVAILABLE')
+        self._claim = claim
 
     def _final_validation(self, horizon_ns: int = 0) -> None:
         """Authority, market and control recheck for one claim attempt.
@@ -442,30 +468,21 @@ class _CommitPort:
 
     @contextmanager
     def native_fence(self):
-        """Obtain the single decision-B claim, then yield a lock-free check.
+        """Yield a lock-free check bound to the claim taken before the marker.
 
-        The yielded callable is invoked by the provider immediately before the
-        native call; it verifies only that this claim is still fresh and never
-        acquires Registry, market or journal locks.
+        The provider invokes it immediately before the native call; it only
+        verifies the claim is still fresh and never acquires Registry, market
+        or journal locks. Without that claim (or its marker) nothing is sent.
         """
         if self._closed or not self._owner._active:
             raise DirectDispatchError('COMMIT_CLOSED')
         port = self._owner._claim_port
-        if port is None or self._claim_attempted:
+        claim = self._claim
+        if port is None or claim is None or self._native_fence_used:
             raise DirectDispatchError('DISPATCH_CLAIM_UNAVAILABLE')
-        self._claim_attempted = True
-        current = self.current_after_attempt()
-        if current is None:
+        self._native_fence_used = True
+        if self.current_after_attempt() is None:
             raise DirectDispatchError('PRE_DISPATCH_FAILED')
-        try:
-            claim = port.claim_native(current, self.identity, self._final_validation)
-        except DirectDispatchError:
-            raise
-        except Exception:
-            raise DirectDispatchError('DISPATCH_CLAIM_UNAVAILABLE') from None
-        if claim is None:
-            raise DirectDispatchError('DISPATCH_CLAIM_UNAVAILABLE')
-        self._claim = claim
         check = port.native_check(claim)
         if not callable(check):
             raise DirectDispatchError('DISPATCH_CLAIM_UNAVAILABLE')

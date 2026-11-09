@@ -207,24 +207,37 @@ def test_nonscalar_payload_rejected_before_native(setup, payload):
     assert calls == [] and journal.get("s", "one", "principal").status == "RESERVED"
 
 
-def test_both_admission_checks_fail_closed(setup):
+@pytest.mark.parametrize(
+    ("blocked_at", "code"),
+    [
+        # Decision B: gate call 2 is the final validation before the claim,
+        # which now precedes the marker, so native_place is never entered.
+        (2, "ADMISSION_DENIED"),
+        # Gate call 3 is the marker transaction's own admission recheck.
+        (3, "PRE_DISPATCH_FAILED"),
+    ],
+)
+def test_both_admission_checks_fail_closed(setup, blocked_at, code):
     journal, guard = setup
     row = reserve(journal)
     calls = []
 
     def gate(_):
         calls.append("gate")
-        if len(calls) == 2:
+        if calls.count("gate") == blocked_at:
             raise ValueError("blocked")
         return True
 
     def native(payload, port, scope):
+        calls.append("native")
         port.commit(marker_record(payload, scope))
         calls.append("send")
 
-    with pytest.raises(DirectDispatchError, match="PRE_DISPATCH_FAILED"):
+    with pytest.raises(DirectDispatchError, match=code):
         invoke(build(journal, guard, native, gate), row)
-    assert calls == ["gate", "gate"]
+    assert "send" not in calls
+    assert calls.count("gate") == blocked_at
+    assert ("native" in calls) is (blocked_at == 3)
     assert journal.get("s", "one", "principal").status == "RESERVED"
 
 
@@ -625,6 +638,11 @@ def test_request_fence_covers_admission_and_commit_but_not_native(setup, monkeyp
     for key in ("one", "two"):
         matching = [event for event in events if event[1] == key]
         assert [event[0] for event in matching] == [
+            "enter",  # initial check
+            "admit",
+            "exit",
+            # Decision B: the claim (with its final authority validation)
+            # precedes the marker and is released before native_place.
             "enter",
             "admit",
             "exit",
@@ -634,11 +652,6 @@ def test_request_fence_covers_admission_and_commit_but_not_native(setup, monkeyp
             "begin",
             "admit",  # before_dispatch, under the journal write lock
             "admit",  # before_commit, immediately before COMMIT
-            "exit",
-            # Decision B: final authority recheck for the claim, released
-            # before the (synthetic) native send.
-            "enter",
-            "admit",
             "exit",
             "send",
         ]
@@ -669,7 +682,8 @@ def test_request_fence_revocation_between_initial_check_and_commit(setup):
     dispatcher = build(journal, guard, native)
     with pytest.raises(DirectDispatchError, match="PRE_DISPATCH_FAILED"):
         invoke(dispatcher, row, request_fence=fence)
-    assert attempts == [row.reservation_id, row.reservation_id]
+    # initial check, claim validation, then the refused marker commit
+    assert attempts == [row.reservation_id] * 3
     assert sends == [] and journal.get("s", "one", "principal").status == "RESERVED"
 
 
@@ -701,7 +715,7 @@ def test_fence_exit_failure_after_commit_marks_unknown_and_replay_does_not_send(
     def fence(_):
         entries.append(1)
         yield
-        if len(entries) == 2:
+        if len(entries) == 3:  # initial, claim validation, then the commit scope
             raise OSError("lost commit scope")
 
     def native(payload, port, scope):
@@ -716,7 +730,7 @@ def test_fence_exit_failure_after_commit_marks_unknown_and_replay_does_not_send(
     dispatcher = build(journal, guard, native)
     assert invoke(dispatcher, row, request_fence=fence).status == "UNKNOWN"
     assert invoke(dispatcher, row, request_fence=fence).status == "UNKNOWN"
-    assert len(entries) == 2 and sends == []
+    assert len(entries) == 3 and sends == []
 
 
 def test_admission_exception_always_reports_denied(setup):
@@ -752,7 +766,7 @@ def test_fence_exit_failure_after_duplicate_never_finishes_other_attempt(setup, 
     def fence(_):
         entries.append(1)
         yield
-        if len(entries) == 2:
+        if len(entries) == 3:  # initial, claim validation, then the commit scope
             raise OSError("lost exit")
 
     def native(payload, port, scope):
@@ -764,7 +778,7 @@ def test_fence_exit_failure_after_duplicate_never_finishes_other_attempt(setup, 
         invoke(dispatcher, row, request_fence=fence)
     assert journal.get("s", "one", "principal").status == "DISPATCHING"
     assert invoke(dispatcher, row, request_fence=fence).status == "DISPATCHING"
-    assert len(entries) == 2
+    assert len(entries) == 3
 
 
 def test_lease_recheck_after_waiting_for_sqlite_lock_blocks_marker(setup, monkeypatch):
@@ -794,7 +808,7 @@ def test_lease_recheck_after_waiting_for_sqlite_lock_blocks_marker(setup, monkey
     def fence(_):
         assert auth_now[0] < 1
         scopes.append(1)
-        if len(scopes) == 2:
+        if len(scopes) == 3:  # initial, claim validation, then the marker commit
             entered_commit.set()
 
         def recheck():
@@ -831,7 +845,9 @@ def test_lease_recheck_after_waiting_for_sqlite_lock_blocks_marker(setup, monkey
     dispatcher = build(journal, guard, native)
     with pytest.raises(DirectDispatchError, match="PRE_DISPATCH_FAILED"):
         invoke(dispatcher, row, request_fence=fence)
-    assert scopes == [1, 1] and checks == [1]
+    # Claim validation rechecks twice under a live lease; the marker's recheck
+    # after the SQLite lock wait sees the expired lease and blocks the marker.
+    assert scopes == [1, 1, 1] and checks == [0, 0, 1]
     assert sent == [] and journal.get("s", "one", "principal").status == "RESERVED"
 
 

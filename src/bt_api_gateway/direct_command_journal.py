@@ -2876,12 +2876,13 @@ class GatewayDirectCommandJournal:
     def recheck_dispatch_controls(
         self, strategy: str, request_key: str, principal: str, reservation_id: str, digest: str,
     ) -> None:
-        """Read-only control and monitor recheck for a DISPATCHING command.
+        """Read-only control and monitor recheck for a still RESERVED command.
 
-        Used for the decision-B final validation after the durable marker and
-        before the native claim: an emergency control or required-monitor loss
-        committed before this read refuses the native call. Capacity was
-        reserved by the marker transaction itself. No row is written.
+        Used for the decision-B final validation immediately before the claim
+        (which precedes the durable marker): an emergency control or a lost
+        required monitor committed before this read refuses the claim. The
+        marker transaction rechecks controls and capacity again. No row is
+        written.
         """
         strategy, request_key, principal, reservation_id, digest = map(
             _text, (strategy, request_key, principal, reservation_id, digest))
@@ -2890,8 +2891,8 @@ class GatewayDirectCommandJournal:
             try:
                 self._assert_anchor(db)
                 row = self._bound(db, strategy, request_key, reservation_id, digest, principal)
-                if row["status"] != "DISPATCHING":
-                    raise DirectCommandJournalError("NOT_DISPATCHING")
+                if row["status"] != "RESERVED":
+                    raise DirectCommandJournalError("NOT_RESERVED")
                 payload = json.loads(row["payload_json"])
                 if self._schema_version >= 10:
                     from .direct_control import check_controls
