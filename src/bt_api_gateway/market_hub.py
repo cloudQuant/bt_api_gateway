@@ -23,6 +23,7 @@ from collections import deque
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
+from functools import wraps
 from types import MappingProxyType
 from typing import Any, Protocol, cast
 
@@ -53,7 +54,37 @@ from bt_api_base.service_protocol import (
     envelope_to_wire_mapping,
 )
 
+def _market_dispatch_mutation(method):
+    """Bracket host-side market mutations without holding the gate lock.
+
+    The installed gate tracks changes and rejects concurrent dispatch. The
+    decorated operation may wait for the native owner, so the gate's mutex
+    must be released while the method executes. No gate means legacy market
+    behavior is unchanged.
+    """
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        hub = getattr(self, "_hub", self)
+        gate = getattr(hub, "_market_dispatch_gate", None)
+        if gate is None:
+            return method(self, *args, **kwargs)
+        # Only explicitly defined, side-effect-free preflight checks run
+        # before entering the change barrier.  In particular, an invalid RPC
+        # identity or operation must not permanently poison market evidence;
+        # any failure after the barrier remains conservatively poisoned.
+        preflight = getattr(self, "_market_dispatch_preflight_" + method.__name__, None)
+        if preflight is not None:
+            preflight(*args, **kwargs)
+        # Only operations that reduce authority or release resources may
+        # proceed after the shared claim domain has irreversibly closed.
+        cleanup = method.__name__ in {"close", "revoke_principal_keys"}
+        with gate.market_change(cleanup=cleanup):
+            return method(self, *args, **kwargs)
+    return guarded
+
+
 MARKET_READ_AFTER_BOUNDED_OPERATION = "market.read_after_bounded"
+MARKET_CLOCK_OPERATION = "market.clock_observation"
 MARKET_OPERATIONS = frozenset(
     {
         "market.bootstrap_many",
@@ -77,7 +108,7 @@ MARKET_OPERATIONS_WITH_BOUNDED_READ_AFTER = MARKET_OPERATIONS | frozenset(
 ALL_MARKET_OPERATIONS_WITH_BOUNDED_READ_AFTER = (
     ALL_MARKET_OPERATIONS
     | ASYNC_BOOTSTRAP_OPERATIONS
-    | frozenset({MARKET_READ_AFTER_BOUNDED_OPERATION})
+    | frozenset({MARKET_READ_AFTER_BOUNDED_OPERATION, MARKET_CLOCK_OPERATION})
 )
 SUPPORTED_OPERATIONS = MARKET_OPERATIONS
 DEFAULT_MARKET_READ_LIMIT = 100
@@ -427,6 +458,7 @@ class GatewayMarketHub:
         self._history_key_universe = frozenset(copied_history_keys)
         self._principal_allowed_history_keys = MappingProxyType(copied_history_acl)
         self._owner_thread_id = threading.get_ident()
+        self._market_dispatch_gate = None
         self._closing = False
         self._provider_poll_cursor = 0
         self._source_diagnostics = {
@@ -465,6 +497,19 @@ class GatewayMarketHub:
                 raise GatewayMarketHubError("STREAM_ID_COLLISION")
             self._stream_by_id[key.stream_id] = key
             self._streams[key] = _MarketStream(key=key, epoch=self._new_epoch())
+
+    def install_market_dispatch_gate(self, gate: object) -> None:
+        """Bind one trusted owner-local dispatch gate before it is used.
+
+        This is a trusted composition hook, never an RPC entry point. The SDK
+        is responsible for validating the exact gate and its account authority.
+        """
+        self._check_owner()
+        if (self._market_dispatch_gate is not None or getattr(gate, "_hub", None) is not self
+                or not callable(getattr(gate, "market_change", None))
+                or not callable(getattr(gate, "_published_after_success", None))):
+            raise GatewayMarketHubError("INVALID_DISPATCH_GATE")
+        self._market_dispatch_gate = gate
 
     @property
     def identity(self) -> WireIdentity:
@@ -515,6 +560,8 @@ class GatewayMarketHub:
         operations = (
             ALL_MARKET_OPERATIONS if self._history_provider is not None else MARKET_OPERATIONS
         )
+        if callable(getattr(self._provider, "read_market_login_clock", None)):
+            operations = operations | {MARKET_CLOCK_OPERATION}
         return operations | ASYNC_BOOTSTRAP_OPERATIONS if self._async_bootstrap else operations
 
     @property
@@ -605,12 +652,14 @@ class GatewayMarketHub:
             if allowed != self._key_universe and not partitioned:
                 raise GatewayMarketHubError("MARKET_AUDIENCE_INCOMPLETE")
 
+    @_market_dispatch_mutation
     def set_publisher(self, publisher: Callable[[WireEnvelope], object]) -> None:
         """Install the owner-thread PUB callback exactly once before use."""
         if self._requires_partitioned_audience:
             raise GatewayMarketHubError("PARTITIONED_PUBLISHER_REQUIRED")
         self._set_publisher(publisher)
 
+    @_market_dispatch_mutation
     def set_partitioned_publisher(
         self,
         publisher: Callable[[WireEnvelope], object],
@@ -673,6 +722,7 @@ class GatewayMarketHub:
         """``(epoch, sequence)`` below which ``principal_ref`` may not read ``key``."""
         return self._grant_floors.get((principal_ref, key))
 
+    @_market_dispatch_mutation
     def revoke_principal_keys(
         self,
         principal_ref: str,
@@ -744,6 +794,7 @@ class GatewayMarketHub:
             }
         )
 
+    @_market_dispatch_mutation
     def grant_principal_keys(
         self, principal_ref: str, keys: Collection[MarketSubscriptionKey]
     ) -> Mapping[str, object]:
@@ -787,6 +838,7 @@ class GatewayMarketHub:
             }
         )
 
+    @_market_dispatch_mutation
     def resume_delivery(self) -> bool:
         """Retry ``regrant`` after a failure; delivery resumes only on success."""
         self._check_owner()
@@ -822,6 +874,7 @@ class GatewayMarketHub:
             raise GatewayMarketHubError("PUBLISHER_CONFIGURED_AFTER_SUBSCRIBE")
         self._publisher = publisher
 
+    @_market_dispatch_mutation
     def subscribe(
         self,
         principal_ref: str,
@@ -926,6 +979,7 @@ class GatewayMarketHub:
             source_descriptor=descriptor,
         )
 
+    @_market_dispatch_mutation
     def unsubscribe(
         self,
         principal_ref: str,
@@ -968,6 +1022,88 @@ class GatewayMarketHub:
         _require_reference(registration_id, "INVALID_REGISTRATION")
         return registration_id in stream.registrations
 
+    @_market_dispatch_mutation
+    def clock_observation(self, principal_ref: str, key: MarketSubscriptionKey,
+                          registration_id: str) -> Mapping[str, object]:
+        """Observe a current source using only this hub's trusted stream state."""
+        self._check_owner()
+        self._ensure_open()
+        stream = self._authorize_key(principal_ref, key)
+        _require_reference(registration_id, "INVALID_REGISTRATION")
+        if (registration_id not in stream.registrations
+                or self._registration_principals.get((key, registration_id)) != principal_ref
+                or stream.handle is None or stream.generation is None
+                or stream.pending_release or stream.starting or stream.releasing
+                or stream.start_uncertain or stream.needs_new_epoch):
+            raise GatewayMarketHubError("MARKET_SOURCE_UNAVAILABLE")
+        method = getattr(self._provider, "read_market_login_clock", None)
+        if not callable(method):
+            raise GatewayMarketHubError("CAPABILITY_UNAVAILABLE")
+        handle, generation, epoch = stream.handle, stream.generation, stream.epoch
+        try:
+            value = method(handle, key=key, generation=generation,
+                           stream_id=key.stream_id, epoch=epoch)
+        except Exception:
+            raise GatewayMarketHubError("CLOCK_SOURCE_UNAVAILABLE") from None
+        if (not isinstance(value, Mapping) or self._authorize_key(principal_ref, key) is not stream
+                or stream.handle is not handle or stream.generation != generation
+                or stream.epoch != epoch or registration_id not in stream.registrations
+                or self._registration_principals.get((key, registration_id)) != principal_ref
+                or stream.pending_release or stream.starting or stream.releasing
+                or stream.start_uncertain or stream.needs_new_epoch):
+            raise GatewayMarketHubError("MARKET_SOURCE_UNAVAILABLE")
+        return value
+
+    @_market_dispatch_mutation
+    def dispatch_clock_observation(
+        self, principal_ref: str, key: MarketSubscriptionKey, registration_id: str,
+        *, epoch: str, sequence: int, message_id: str,
+    ) -> Mapping[str, object]:
+        """Get a same-owner source observation for the exact published tick.
+
+        The client cursor is only an index; native sequence values are taken
+        exclusively from the retained, successfully published server frame.
+        The source monotonic value never leaves this process.
+        """
+        self._check_owner()
+        self._ensure_open()
+        gate = self._market_dispatch_gate
+        if gate is None:
+            raise GatewayMarketHubError("CAPABILITY_UNAVAILABLE")
+        try:
+            provider_sequence, provider_subscription_epoch = gate._published_tick(
+                principal_ref, key, registration_id, epoch, sequence, message_id
+            )
+        except Exception:
+            raise GatewayMarketHubError("MARKET_EVIDENCE_UNAVAILABLE") from None
+        stream = self._authorize_key(principal_ref, key)
+        handle, generation = stream.handle, stream.generation
+        read = getattr(self._provider, "read_market_tick_clock", None)
+        if not callable(read):
+            raise GatewayMarketHubError("CAPABILITY_UNAVAILABLE")
+        try:
+            result = read(handle, key=key, generation=generation, stream_id=key.stream_id,
+                          epoch=epoch, provider_sequence=provider_sequence,
+                          provider_subscription_epoch=provider_subscription_epoch)
+        except Exception:
+            raise GatewayMarketHubError("CLOCK_SOURCE_UNAVAILABLE", retryable=True) from None
+        if (type(result) is not tuple or len(result) != 2 or type(result[0]) is not dict
+                or type(result[1]) is not int or self._authorize_key(principal_ref, key) is not stream
+                or stream.handle is not handle or stream.generation != generation
+                or stream.epoch != epoch or registration_id not in stream.registrations
+                or self._registration_principals.get((key, registration_id)) != principal_ref
+                or stream.pending_release or stream.starting or stream.releasing
+                or stream.start_uncertain or stream.needs_new_epoch):
+            raise GatewayMarketHubError("MARKET_SOURCE_UNAVAILABLE")
+        try:
+            gate._published_tick(principal_ref, key, registration_id, epoch, sequence, message_id)
+            gate._clock_after_source(registration_id, principal_ref, key, result[0],
+                                     observed_monotonic_ns=result[1])
+        except Exception:
+            raise GatewayMarketHubError("MARKET_EVIDENCE_UNAVAILABLE") from None
+        return result[0]
+
+    @_market_dispatch_mutation
     def maintain(self, active_registration_ids: Collection[str]) -> Mapping[str, int]:
         """Explicitly prune refs absent from the owner-supplied active registry.
 
@@ -1127,6 +1263,7 @@ class GatewayMarketHub:
             else:
                 self._source_diagnostics["provider_events_published"] += 1
 
+    @_market_dispatch_mutation
     def publish(
         self,
         key: MarketSubscriptionKey,
@@ -1204,6 +1341,8 @@ class GatewayMarketHub:
             raise GatewayMarketHubError("PUBLISHER_FAILED", retryable=True) from None
         if outcome is False or (outcome is not None and outcome is not True):
             raise GatewayMarketHubError("PUBLISHER_FAILED", retryable=True)
+        if self._market_dispatch_gate is not None:
+            self._market_dispatch_gate._published_after_success(key, envelope)
         return envelope
 
     def snapshot(
@@ -1370,6 +1509,7 @@ class GatewayMarketHub:
             raise GatewayMarketHubError("INVALID_HISTORY_PAGE") from None
         return MappingProxyType(result)
 
+    @_market_dispatch_mutation
     def reset_stream_epoch(self, key: MarketSubscriptionKey) -> str:
         """Rotate the public cursor after a provider-confirmed source reconnect.
 
@@ -1393,6 +1533,7 @@ class GatewayMarketHub:
         stream.needs_new_epoch = False
         return new_epoch
 
+    @_market_dispatch_mutation
     def close(self) -> None:
         """Release handles or accept trusted confirmation of whole-provider cleanup.
 
@@ -1899,6 +2040,7 @@ class GatewayMarketService:
             operations = operations | frozenset({MARKET_READ_AFTER_BOUNDED_OPERATION})
         return operations
 
+    @_market_dispatch_mutation
     def register_registration(
         self, registration_id: str, registration: GatewayMarketRegistration
     ) -> None:
@@ -1917,6 +2059,7 @@ class GatewayMarketService:
             raise GatewayMarketServiceError("REGISTRATION_LIMIT_EXCEEDED")
         self._registrations[registration_id] = registration
 
+    @_market_dispatch_mutation
     def maintain(self, active_registration_ids: Collection[str]) -> Mapping[str, int]:
         """Prune local contexts and their hub refs using an owner registry view."""
         self._hub._check_owner()
@@ -1929,6 +2072,121 @@ class GatewayMarketService:
                 del self._registrations[registration_id]
         return result
 
+    def _market_dispatch_preflight_handle(
+        self,
+        operation: str,
+        *,
+        principal_ref: str,
+        scope: WireScope,
+        arguments: Mapping[str, object],
+        registration_id: str,
+        result_fits: Callable[[Mapping[str, object]], bool] | None = None,
+    ) -> None:
+        """Reject invalid RPC identity/operation without mutating the Hub.
+
+        Only exact wire dictionaries are prevalidated here.  Arbitrary local
+        mappings and any provider or result callbacks remain inside the
+        change barrier, where uncertain or partial mutations fail closed.
+        """
+        self._hub._check_owner()
+        if type(operation) is not str or operation not in self.supported_operations:
+            raise GatewayMarketServiceError("UNSUPPORTED_OPERATION")
+        self._resolve_registration(principal_ref, scope, registration_id)
+        if type(arguments) is not dict:
+            return
+        if any(type(name) is not str for name in arguments):
+            raise GatewayMarketServiceError("INVALID_ARGUMENTS")
+        if self._hub._async_bootstrap and operation in {"market.subscribe", "market.bootstrap_many"}:
+            raise GatewayMarketServiceError("ASYNC_BOOTSTRAP_REQUIRED")
+        if operation in ASYNC_BOOTSTRAP_OPERATIONS:
+            if not _plain_wire_tree(arguments):
+                return
+            if operation == "market.bootstrap_begin":
+                if set(arguments) not in (
+                    {"operation_id", "subscriptions"},
+                    {"operation_id", "subscriptions", "refresh_existing"},
+                ):
+                    raise GatewayMarketServiceError("INVALID_ARGUMENTS")
+            else:
+                _require_exact_arguments(arguments, {"operation_id"})
+            operation_id = arguments["operation_id"]
+            if type(operation_id) is not str or re.fullmatch(r"[0-9a-f]{32}", operation_id) is None:
+                raise GatewayMarketServiceError("INVALID_OPERATION_ID")
+            if operation == "market.bootstrap_begin":
+                if type(arguments.get("refresh_existing", False)) is not bool:
+                    raise GatewayMarketServiceError("INVALID_ARGUMENTS")
+                items = arguments["subscriptions"]
+                if type(items) not in (list, tuple) or not 1 <= len(items) <= 20:
+                    raise GatewayMarketServiceError("INVALID_BOOTSTRAP_BATCH")
+                seen = set()
+                for item in items:
+                    if (type(item) is not dict or set(item) not in (
+                            {"key"}, {"key", "require_source_descriptor"})
+                            or type(item.get("require_source_descriptor", False)) is not bool):
+                        raise GatewayMarketServiceError("INVALID_BOOTSTRAP_BATCH")
+                    key = _parse_key(item["key"])
+                    if key in seen:
+                        raise GatewayMarketServiceError("DUPLICATE_MARKET_KEY")
+                    seen.add(key)
+            return
+        if operation == "market.bootstrap_many":
+            _require_exact_arguments(arguments, {"subscriptions"})
+            items = arguments["subscriptions"]
+            if type(items) not in (list, tuple) or not 1 <= len(items) <= 20:
+                raise GatewayMarketServiceError("INVALID_BOOTSTRAP_BATCH")
+            # Per-item rejections have an existing structured reply; their
+            # validation in _handle_bootstrap_many occurs before provider use.
+            return
+        simple_operations = {
+            "market.subscribe", "market.unsubscribe", "market.snapshot", "market.head",
+            "market.read_after", MARKET_READ_AFTER_BOUNDED_OPERATION, MARKET_CLOCK_OPERATION,
+            MARKET_HISTORY_OPERATION,
+        }
+        if operation not in simple_operations:
+            return
+        fields = set(arguments)
+        if operation == "market.subscribe":
+            if fields not in ({"key"}, {"key", "require_source_descriptor"}):
+                raise GatewayMarketServiceError("INVALID_ARGUMENTS")
+            if ("require_source_descriptor" in arguments
+                    and type(arguments["require_source_descriptor"]) is not bool):
+                raise GatewayMarketServiceError("INVALID_ARGUMENTS")
+        elif operation in {"market.read_after", MARKET_READ_AFTER_BOUNDED_OPERATION}:
+            _require_exact_arguments(arguments, {"key", "epoch", "after", "limit"})
+        elif operation == MARKET_HISTORY_OPERATION:
+            _require_exact_arguments(arguments, {"key", "start_time_utc", "end_time_utc", "limit"})
+        elif operation == MARKET_CLOCK_OPERATION and fields == {"key", "epoch", "sequence", "message_id"}:
+            pass
+        else:
+            _require_exact_arguments(arguments, {"key"})
+        # Decoded wire values are built-in JSON trees.  Never call a user
+        # supplied Mapping or value method before the change barrier.
+        if not _plain_wire_tree(arguments):
+            return
+        if operation == MARKET_HISTORY_OPERATION:
+            request = _parse_history_request(arguments)
+            self._hub._authorize_history_key(principal_ref, request.key)
+            return
+        key = _parse_key(arguments["key"])
+        self._hub._authorize_key(principal_ref, key)
+        if (operation not in {"market.subscribe", "market.unsubscribe"}
+                and not self._hub.registration_active(key, registration_id)):
+            raise GatewayMarketServiceError("MARKET_SUBSCRIPTION_REQUIRED")
+        if operation in {"market.read_after", MARKET_READ_AFTER_BOUNDED_OPERATION}:
+            if type(arguments["epoch"]) is not str:
+                raise GatewayMarketServiceError("INVALID_EPOCH")
+            try:
+                _validate_cursor(arguments["after"], arguments["limit"])
+            except GatewayMarketHubError as exc:
+                raise GatewayMarketServiceError(exc.code, retryable=exc.retryable) from None
+        elif operation == MARKET_CLOCK_OPERATION and fields == {"key", "epoch", "sequence", "message_id"}:
+            if (any(type(arguments[name]) is not str or not arguments[name]
+                    or arguments[name] != arguments[name].strip() or len(arguments[name]) > 256
+                    for name in ("epoch", "message_id"))
+                    or type(arguments["sequence"]) is not int or arguments["sequence"] <= 0):
+                raise GatewayMarketServiceError("MARKET_EVIDENCE_UNAVAILABLE")
+
+    @_market_dispatch_mutation
     def handle(
         self,
         operation: str,
@@ -1975,6 +2233,8 @@ class GatewayMarketService:
             expected = {"key", "start_time_utc", "end_time_utc", "limit"}
         elif operation in {"market.read_after", MARKET_READ_AFTER_BOUNDED_OPERATION}:
             expected = {"key", "epoch", "after", "limit"}
+        elif operation == MARKET_CLOCK_OPERATION and set(raw) == {"key", "epoch", "sequence", "message_id"}:
+            expected = {"key", "epoch", "sequence", "message_id"}
         else:
             expected = {"key"}
         if operation != "market.subscribe":
@@ -2003,6 +2263,16 @@ class GatewayMarketService:
             return self._hub.unsubscribe(principal_ref, key, registration_id)
         if not self._hub.registration_active(key, registration_id):
             raise GatewayMarketServiceError("MARKET_SUBSCRIPTION_REQUIRED")
+        if operation == MARKET_CLOCK_OPERATION:
+            try:
+                if set(raw) == {"key", "epoch", "sequence", "message_id"}:
+                    return self._hub.dispatch_clock_observation(
+                        principal_ref, key, registration_id, epoch=raw["epoch"],
+                        sequence=raw["sequence"], message_id=raw["message_id"]
+                    )
+                return self._hub.clock_observation(principal_ref, key, registration_id)
+            except GatewayMarketHubError as exc:
+                raise GatewayMarketServiceError(exc.code, retryable=exc.retryable) from None
         if operation == "market.head":
             return self._hub.head(key)
         if operation == "market.snapshot":
@@ -2706,6 +2976,26 @@ def _require_arguments(arguments: Mapping[str, object]) -> Mapping[str, object]:
     if not isinstance(arguments, Mapping) or any(type(key) is not str for key in arguments):
         raise GatewayMarketServiceError("INVALID_ARGUMENTS")
     return arguments
+
+
+def _plain_wire_tree(value: object) -> bool:
+    """Recognize bounded built-in JSON values without invoking user objects."""
+    stack = [(value, 0)]
+    remaining = 100_000
+    while stack:
+        item, depth = stack.pop()
+        remaining -= 1
+        if remaining < 0 or depth > 16:
+            return False
+        if item is None or type(item) in (str, int, float, bool):
+            continue
+        if type(item) in (list, tuple):
+            stack.extend((child, depth + 1) for child in item)
+        elif type(item) is dict and all(type(key) in (str, int, float, bool) or key is None for key in item):
+            stack.extend((child, depth + 1) for child in item.values())
+        else:
+            return False
+    return True
 
 
 def _require_exact_arguments(arguments: Mapping[str, object], expected: set[str]) -> None:

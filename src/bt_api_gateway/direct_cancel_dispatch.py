@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable
+from contextlib import nullcontext
 
 from bt_api_base.direct_write_protocol import PreDispatchRecord, WriteOperation
 
@@ -77,6 +78,9 @@ class GatewayDirectCancelDispatcher:
         *,
         expected_version: int,
         request_fence=None,
+        parent_command=None,
+        parent_cancel_recheck=None,
+        control_cancel_permit=None,
     ) -> CancelRecord:
         if request_fence is not None and not callable(request_fence):
             raise DirectDispatchError("INVALID_REQUEST_FENCE")
@@ -84,7 +88,15 @@ class GatewayDirectCancelDispatcher:
         if self._active:
             raise DirectDispatchError("DISPATCH_REENTRANT")
         row = self._journal.get(strategy, operation_id, principal)
+        delegated = row.principal != row.target_principal
+        if (delegated or control_cancel_permit is not None) and request_fence is None:
+            raise DirectDispatchError("INVALID_REQUEST_FENCE")
         if row.status != "REQUESTED":
+            if delegated:
+                with _request_scope(request_fence, row) as recheck:
+                    if recheck is None:
+                        raise DirectDispatchError("INVALID_REQUEST_FENCE")
+                    recheck()
             return row
         if row.generation != self._journal.journal.generation:
             raise DirectDispatchError("GENERATION_MISMATCH")
@@ -96,7 +108,7 @@ class GatewayDirectCancelDispatcher:
                 self._owned()
                 self._admitted(row)
                 self._owned()
-            port = _CancelCommitPort(self, row, request_fence)
+            port = _CancelCommitPort(self, row, request_fence, parent_command, parent_cancel_recheck, control_cancel_permit)
             try:
                 outcome = self._native_cancel(
                     row.target_identity, row.symbol, port, self._journal.journal.account_scope
@@ -149,8 +161,10 @@ class GatewayDirectCancelDispatcher:
 
 
 class _CancelCommitPort:
-    def __init__(self, owner, record, request_fence):
+    def __init__(self, owner, record, request_fence, parent_command, parent_cancel_recheck, control_cancel_permit):
         self._owner, self._record, self._request_fence = owner, record, request_fence
+        self._parent_command, self._parent_cancel_recheck = parent_command, parent_cancel_recheck
+        self._control_cancel_permit = control_cancel_permit
         self._attempted = False
         self._closed = False
         self._known_not_new = False
@@ -203,6 +217,10 @@ class _CancelCommitPort:
                 if recheck is not None:
                     recheck()
 
+            delegated = current.principal != current.target_principal
+            if (delegated or self._control_cancel_permit is not None) and recheck is None:
+                raise DirectDispatchError("INVALID_REQUEST_FENCE")
+
             result = self._owner._journal.begin_dispatch(
                 current.strategy_scope,
                 current.operation_id,
@@ -210,6 +228,12 @@ class _CancelCommitPort:
                 current.version,
                 prepared,
                 before_dispatch=before_dispatch,
+                # The enclosing Registry admission already holds this fence
+                # through the local commit; do not reenter it.
+                strategy_admission_fence=(lambda: nullcontext(recheck)) if (delegated or self._control_cancel_permit is not None) else None,
+                parent_command=self._parent_command,
+                parent_cancel_recheck=self._parent_cancel_recheck,
+                control_cancel_permit=self._control_cancel_permit,
             )
             if not result.newly_started:
                 self._known_not_new = True

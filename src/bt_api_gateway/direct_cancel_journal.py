@@ -6,6 +6,7 @@ import json
 import re
 import sqlite3
 import uuid
+from contextlib import ExitStack
 from dataclasses import dataclass
 
 from bt_api_base.direct_cancel_protocol import PreparedCancelRequest
@@ -143,6 +144,24 @@ def _target(db, account, strategy, request_key, reservation, digest, principal):
     return row
 
 
+def _delegated_cancel_target(db, account, strategy, request_key, reservation, target_principal):
+    """Check the historical actor without substituting the current requester."""
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='direct_delegated_commands'").fetchone() is None:
+        return False
+    return db.execute(
+        "SELECT 1 FROM direct_delegated_commands WHERE account=? AND strategy=? "
+        "AND request_key=? AND reservation_id=? AND actor_principal=?",
+        (account, strategy, request_key, reservation, target_principal),
+    ).fetchone() is not None
+
+
+def _control_cancel_target(db, account, attempt):
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='direct_control_cancel_proofs'").fetchone() is None:
+        return False
+    return db.execute('SELECT 1 FROM direct_control_cancel_proofs WHERE account=? AND strategy=? AND operation_id=? AND attempt_id=?',
+                      (account, attempt.strategy_scope, attempt.operation_id, attempt.attempt_id)).fetchone() is not None
+
+
 def _verify_cancel_integrity(db: sqlite3.Connection, account: str, capacity: int) -> None:
     try:
         rows = db.execute(
@@ -172,7 +191,9 @@ def _verify_cancel_integrity(db: sqlite3.Connection, account: str, capacity: int
                 str(parsed_attempt) != item.attempt_id
                 or parsed_attempt.version != 4
                 or item.account_scope != account
-                or item.principal != item.target_principal
+                or (item.principal != item.target_principal and not _control_cancel_target(db, account, item) and not _delegated_cancel_target(
+                    db, account, item.strategy_scope, item.request_key,
+                    item.target_reservation_id, item.target_principal))
                 or type(item.target_version) is not int
                 or item.target_version < 2
             ):
@@ -270,14 +291,70 @@ class GatewayDirectCancelJournal:
         target_identity,
         symbol,
         before_commit=None,
+        target_principal=None,
+        strategy_admission_fence=None,
+        parent_command=None,
+        parent_cancel_recheck=None,
+        control_cancel_permit=None,
     ):
         if before_commit is not None and not callable(before_commit):
             raise DirectCommandJournalError("INVALID_INPUT")
         strategy, operation_id, principal, request_key, reservation_id, digest, symbol = map(
             _text, (strategy, operation_id, principal, request_key, reservation_id, digest, symbol)
         )
+        target_principal = principal if target_principal is None else _text(target_principal)
+        delegated = principal != target_principal
+        control = control_cancel_permit is not None
+        if control:
+            from .direct_control_cancel import GatewayControlCancelPermit
+            if (self.journal._schema_version < 17 or type(control_cancel_permit) is not GatewayControlCancelPermit
+                    or not callable(strategy_admission_fence) or parent_command is not None or parent_cancel_recheck is not None):
+                raise DirectCommandJournalError('CONTROL_CANCEL_DENIED')
+        if delegated and (self.journal._schema_version < 12 or not callable(strategy_admission_fence)):
+            raise DirectCommandJournalError("DELEGATION_UNAVAILABLE")
+        if not delegated and not control and strategy_admission_fence is not None:
+            raise DirectCommandJournalError("INVALID_INPUT")
         identity = _target_json(target_identity)
-        with self.journal._transaction() as db:
+        with ExitStack() as stack:
+            check = None
+            if delegated or control:
+                manager = strategy_admission_fence()
+                check = type(manager).__enter__(manager)
+                exit_ = type(manager).__exit__
+                stack.push(lambda *exc: (exit_(manager, *exc), False)[1])
+                if not callable(check):
+                    raise DirectCommandJournalError("INVALID_ADMISSION")
+            db = stack.enter_context(self.journal._transaction())
+            if delegated or control:
+                check()
+                if delegated and not control and not _delegated_cancel_target(db, self.journal.account_scope, strategy,
+                                                request_key, reservation_id, target_principal):
+                    raise DirectCommandJournalError("DELEGATION_MISMATCH")
+            if control:
+                b = control_cancel_permit.binding
+                if (b['account'], b['strategy'], b['operation_id'], b['requester'], b['target_principal'],
+                    b['request_key'], b['reservation_id'], b['digest'], b['native_identity_json'], b['symbol']) != (
+                    self.journal.account_scope, strategy, operation_id, principal, target_principal,
+                    request_key, reservation_id, digest, identity, symbol):
+                    raise DirectCommandJournalError('CONTROL_CANCEL_DENIED')
+                control_cancel_permit.recheck(db)
+            if not control and self.journal._schema_version >= 12 and principal == target_principal:
+                from bt_api_base.gateway_delegation_protocol import GatewayDelegatedCommand
+                saved = db.execute('SELECT envelope_json FROM direct_delegated_commands WHERE account=? AND strategy=? AND request_key=?',
+                    (self.journal.account_scope, strategy, request_key)).fetchone()
+                cmd = None if saved is None else GatewayDelegatedCommand.from_mapping(json.loads(saved['envelope_json']))
+                if cmd is not None and cmd.parent_ref is not None:
+                    if type(parent_command) is not GatewayDelegatedCommand or parent_command != cmd or not callable(parent_cancel_recheck):
+                        raise DirectCommandJournalError('PARENT_CANCEL_DENIED')
+                elif parent_command is not None or parent_cancel_recheck is not None:
+                    raise DirectCommandJournalError('PARENT_CANCEL_DENIED')
+            else:
+                cmd = None
+            def check_parent():
+                if cmd is not None and cmd.parent_ref is not None and parent_cancel_recheck(
+                        db, cmd, operation_id, reservation_id, digest) is not True:
+                    raise DirectCommandJournalError('PARENT_CANCEL_DENIED')
+            check_parent()
             old = db.execute(
                 "SELECT * FROM direct_cancel_attempts WHERE account=? AND strategy=? AND operation_id=?",
                 (self.journal.account_scope, strategy, operation_id),
@@ -291,10 +368,19 @@ class GatewayDirectCancelJournal:
                     old["target_digest"],
                     old["target_identity_json"],
                     old["symbol"],
-                ) != (principal, principal, request_key, reservation_id, digest, identity, symbol):
+                ) != (principal, target_principal, request_key, reservation_id, digest, identity, symbol):
                     raise DirectCommandJournalError("REQUEST_CONFLICT")
                 if before_commit is not None:
                     before_commit()
+                if check is not None:
+                    check()
+                check_parent()
+                if control:
+                    proof = db.execute('SELECT attempt_id,proof_json FROM direct_control_cancel_proofs WHERE account=? AND strategy=? AND operation_id=?',
+                                       (self.journal.account_scope, strategy, operation_id)).fetchone()
+                    if proof is None or (proof['attempt_id'], proof['proof_json']) != (old['attempt_id'], control_cancel_permit.binding_json):
+                        raise DirectCommandJournalError('CONTROL_CANCEL_DENIED')
+                    control_cancel_permit.recheck(db)
                 return _record(old)
             command = _target(
                 db,
@@ -303,7 +389,7 @@ class GatewayDirectCancelJournal:
                 request_key,
                 reservation_id,
                 digest,
-                principal,
+                target_principal,
             )
             if (
                 command["status"] not in {"DISPATCHING", "SENT", "UNKNOWN"}
@@ -327,7 +413,7 @@ class GatewayDirectCancelJournal:
                     strategy,
                     operation_id,
                     principal,
-                    principal,
+                    target_principal,
                     request_key,
                     reservation_id,
                     digest,
@@ -338,10 +424,17 @@ class GatewayDirectCancelJournal:
                     attempt,
                 ),
             )
+            if control:
+                control_cancel_permit.append(db, attempt)
             self.journal._bump(db)
             result = _record(self._require(db, strategy, operation_id, principal))
             if before_commit is not None:
                 before_commit()
+            if check is not None:
+                check()
+            check_parent()
+            if control:
+                control_cancel_permit.recheck(db)
             return result
 
     def get(self, strategy, operation_id, principal):
@@ -364,6 +457,10 @@ class GatewayDirectCancelJournal:
         prepared_cancel,
         *,
         before_dispatch=None,
+        strategy_admission_fence=None,
+        parent_command=None,
+        parent_cancel_recheck=None,
+        control_cancel_permit=None,
     ):
         strategy, operation_id, principal = map(_text, (strategy, operation_id, principal))
         if (
@@ -378,11 +475,67 @@ class GatewayDirectCancelJournal:
             digest = prepared_cancel.digest()
         except Exception as exc:
             raise DirectCommandJournalError("INVALID_INPUT") from exc
-        with self.journal._transaction() as db:
+        with ExitStack() as stack:
+            check = None
+            if strategy_admission_fence is not None:
+                if not callable(strategy_admission_fence):
+                    raise DirectCommandJournalError("INVALID_ADMISSION")
+                manager = strategy_admission_fence()
+                check = type(manager).__enter__(manager)
+                exit_ = type(manager).__exit__
+                stack.push(lambda *exc: (exit_(manager, *exc), False)[1])
+                if not callable(check):
+                    raise DirectCommandJournalError("INVALID_ADMISSION")
+            db = stack.enter_context(self.journal._transaction())
             row = self._require(db, strategy, operation_id, principal)
+            control = control_cancel_permit is not None
+            if self.journal._schema_version >= 17 and not control and db.execute(
+                    'SELECT 1 FROM direct_control_cancel_proofs WHERE account=? AND strategy=? AND operation_id=?',
+                    (self.journal.account_scope, strategy, operation_id)).fetchone() is not None:
+                raise DirectCommandJournalError('CONTROL_CANCEL_DENIED')
+            if control:
+                from .direct_control_cancel import GatewayControlCancelPermit
+                if (self.journal._schema_version < 17 or type(control_cancel_permit) is not GatewayControlCancelPermit
+                        or check is None or parent_command is not None or parent_cancel_recheck is not None):
+                    raise DirectCommandJournalError('CONTROL_CANCEL_DENIED')
+                proof = db.execute('SELECT attempt_id,proof_json FROM direct_control_cancel_proofs WHERE account=? AND strategy=? AND operation_id=?',
+                                   (self.journal.account_scope, strategy, operation_id)).fetchone()
+                if proof is None or (proof['attempt_id'], proof['proof_json']) != (row['attempt_id'], control_cancel_permit.binding_json):
+                    raise DirectCommandJournalError('CONTROL_CANCEL_DENIED')
+                control_cancel_permit.recheck(db)
+            parent = None
+            if not control and self.journal._schema_version >= 12 and row['principal'] == row['target_principal']:
+                from bt_api_base.gateway_delegation_protocol import GatewayDelegatedCommand
+                saved = db.execute('SELECT envelope_json FROM direct_delegated_commands WHERE account=? AND strategy=? AND request_key=?',
+                    (self.journal.account_scope, strategy, row['request_key'])).fetchone()
+                parent = None if saved is None else GatewayDelegatedCommand.from_mapping(json.loads(saved['envelope_json']))
+                if parent is not None and parent.parent_ref is not None:
+                    if type(parent_command) is not GatewayDelegatedCommand or parent_command != parent or not callable(parent_cancel_recheck):
+                        raise DirectCommandJournalError('PARENT_CANCEL_DENIED')
+                elif parent_command is not None or parent_cancel_recheck is not None:
+                    raise DirectCommandJournalError('PARENT_CANCEL_DENIED')
+            def check_parent():
+                if parent is not None and parent.parent_ref is not None and parent_cancel_recheck(
+                        db, parent, operation_id, row['target_reservation_id'], row['target_digest']) is not True:
+                    raise DirectCommandJournalError('PARENT_CANCEL_DENIED')
+            check_parent()
+            if row["principal"] != row["target_principal"]:
+                if self.journal._schema_version < 12 or check is None:
+                    raise DirectCommandJournalError("DELEGATION_UNAVAILABLE")
+                check()
+                if not control and not _delegated_cancel_target(db, self.journal.account_scope, strategy,
+                        row["request_key"], row["target_reservation_id"], row["target_principal"]):
+                    raise DirectCommandJournalError("DELEGATION_MISMATCH")
+            elif strategy_admission_fence is not None and not control:
+                raise DirectCommandJournalError("INVALID_INPUT")
             if row["status"] != "REQUESTED":
                 if row["prepared_json"] != prepared_json or row["prepared_digest"] != digest:
                     raise DirectCommandJournalError("REQUEST_CONFLICT")
+                if check is not None:
+                    check()
+                check_parent()
+                if control:
+                    control_cancel_permit.recheck(db)
                 return CancelDispatchStart(_record(row), False)
             if row["version"] != expected_version:
                 raise DirectCommandJournalError("VERSION_CONFLICT")
@@ -395,7 +548,7 @@ class GatewayDirectCancelJournal:
                 row["request_key"],
                 row["target_reservation_id"],
                 row["target_digest"],
-                principal,
+                row["target_principal"],
             )
             if (
                 command["status"] not in {"DISPATCHING", "SENT", "UNKNOWN"}
@@ -419,6 +572,11 @@ class GatewayDirectCancelJournal:
                 (prepared_json, digest, self.journal.account_scope, strategy, operation_id),
             )
             self.journal._bump(db)
+            if check is not None:
+                check()
+            check_parent()
+            if control:
+                control_cancel_permit.recheck(db)
             return CancelDispatchStart(
                 _record(self._require(db, strategy, operation_id, principal)), True
             )
@@ -507,7 +665,9 @@ def _find_cancel_by_request_key(db, account, cancel_key):
             str(parsed) != attempt.attempt_id
             or parsed.version != 4
             or attempt.account_scope != account
-            or attempt.principal != attempt.target_principal
+            or (attempt.principal != attempt.target_principal and not _control_cancel_target(db, account, attempt) and not _delegated_cancel_target(
+                db, account, attempt.strategy_scope, attempt.request_key,
+                attempt.target_reservation_id, attempt.target_principal))
             or type(attempt.target_version) is not int
             or attempt.target_version < 2
             or (attempt.status == "DISPATCHING" and attempt.error_code is not None)

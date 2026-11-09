@@ -12,7 +12,7 @@ import os
 import sqlite3
 import threading
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from decimal import Decimal, localcontext
 
@@ -21,6 +21,7 @@ from bt_api_base.gateway_execution_protocol import GatewayReturnFact
 from bt_api_base.gateway_execution_stream_protocol import (
     GatewayCancelErrorAttribution,
     GatewayPlaceErrorAttribution,
+    GatewayTradeAttribution,
 )
 from bt_api_base.market_protocol import MarketInstrumentKey
 
@@ -53,6 +54,23 @@ _TRADE_DATE_DDL = "CREATE TABLE direct_execution_trade_dates (account TEXT NOT N
 
 def _create_trade_date_table(db: sqlite3.Connection) -> None:
     db.execute(_TRADE_DATE_DDL)
+
+
+def _known_trade_time(db, account, route, trade_key, *, before_sequence=None):
+    """Read only already emitted original/enrichment facts, never guessed times."""
+    known = None
+    rows = db.execute("SELECT sequence,fact_json FROM direct_execution_events WHERE account=? "
+        "AND json_extract(fact_json,'$.route')=? AND json_extract(fact_json,'$.trade_key')=? ORDER BY sequence",
+        (account, route, trade_key)).fetchall()
+    for sequence, raw in rows:
+        if before_sequence is not None and sequence >= before_sequence:
+            break
+        fact = GatewayReturnFact.from_mapping(json.loads(raw))
+        if fact.trade_time is not None:
+            if known is not None and known != fact.trade_time:
+                raise DirectCommandJournalError('INVALID_DATABASE')
+            known = fact.trade_time
+    return known
 
 
 _CANCEL_ERROR_DDL = "CREATE TABLE direct_cancel_error_attribution (account TEXT NOT NULL, fact_digest TEXT NOT NULL, attempt_id TEXT NOT NULL, prepared_digest TEXT NOT NULL, cancel_key TEXT NOT NULL, source_binding_json TEXT NOT NULL, PRIMARY KEY(account, fact_digest))"
@@ -140,6 +158,7 @@ class ExecutionEvent:
     cancel_attribution: GatewayCancelErrorAttribution | None = None
     place_attribution: GatewayPlaceErrorAttribution | None = None
     trade_metadata_only: bool = False
+    trade_attribution: GatewayTradeAttribution | None = None
 
 
 @dataclass(frozen=True)
@@ -166,6 +185,80 @@ class ExecutionPending:
     fact_digest: str
     reason: str
     fact: GatewayReturnFact
+
+
+def _trade_attribution(db, account, strategy, reservation, command_digest,
+                       original_keys, fact, fact_digest, before_sequence):
+    """Derive a venue-alias bridge solely from this journal's prior facts.
+
+    This is an association proof, not native source authentication.  Raw
+    provider trade fields and their digests are never rewritten or augmented.
+    """
+    if fact.kind is not DirectExecutionEventKind.TRADE:
+        return None
+    original = set(original_keys)
+    if set(fact.binding_keys) & original:
+        return None
+    venue = fact.venue_key
+    if venue is None:
+        raise ValueError("trade venue identity missing")
+    alias = db.execute(
+        "SELECT reservation_id FROM direct_execution_aliases WHERE account=? AND strong_key=?",
+        (account, venue),
+    ).fetchone()
+    if alias is None:
+        # A venue key that was itself an original key is not an alias bridge.
+        # Legacy events stay readable, but cannot manufacture a bridge proof.
+        if venue in original:
+            return None
+        raise ValueError("trade alias missing")
+    if alias[0] != reservation:
+        raise ValueError("trade alias reservation mismatch")
+    owned = db.execute(
+        "SELECT reservation_id FROM direct_journal_strong_keys WHERE account=? AND strong_key=?",
+        (account, venue),
+    ).fetchone()
+    if owned is None or owned[0] != reservation:
+        raise ValueError("trade alias owner mismatch")
+    rows = db.execute(
+        "SELECT f.fact_digest,f.fact_json,f.event_sequence,f.applied,e.strategy,e.fact_json AS event_json "
+        "FROM direct_execution_facts f JOIN direct_execution_events e "
+        "ON e.account=f.account AND e.sequence=f.event_sequence AND e.fact_digest=f.fact_digest "
+        "WHERE f.account=? AND f.reservation_id=? AND f.disposition='ATTRIBUTED' "
+        "AND f.event_sequence<? AND json_extract(f.fact_json,'$.kind')='order' "
+        "AND EXISTS (SELECT 1 FROM json_each(f.fact_json,'$.identity_keys') WHERE value=?) "
+        "ORDER BY f.event_sequence",
+        (account, reservation, before_sequence, venue),
+    )
+    for row in rows:
+        anchor = GatewayReturnFact.from_mapping(json.loads(row["fact_json"]))
+        if (row["applied"] != 0 or row["strategy"] != strategy
+                or row["event_json"] != row["fact_json"]
+                or anchor.fact_digest() != row["fact_digest"]
+                or _json(anchor.to_mapping()) != row["fact_json"]
+                or anchor.account_scope != account or anchor.route != fact.route
+                or anchor.instrument != fact.instrument or anchor.kind is not DirectExecutionEventKind.ORDER
+                or anchor.venue_key != venue or not set(anchor.binding_keys).issubset(original)):
+            raise ValueError("trade anchor association mismatch")
+        anchor_original = (set(anchor.identity_keys) & original) - {venue}
+        if not anchor_original:
+            continue
+        for key in anchor.identity_keys:
+            owner = db.execute(
+                "SELECT reservation_id FROM direct_journal_strong_keys WHERE account=? AND strong_key=?",
+                (account, key),
+            ).fetchone()
+            if owner is None or owner[0] != reservation:
+                raise ValueError("trade anchor original key mismatch")
+        return GatewayTradeAttribution(
+            account_scope=account, strategy_scope=strategy, fact_digest=fact_digest,
+            reservation_id=reservation, command_digest=command_digest,
+            anchor_fact_digest=row["fact_digest"], anchor_sequence=row["event_sequence"],
+            venue_key_digest=hashlib.sha256(venue.encode("utf-8")).hexdigest(),
+            original_binding_key_digests=tuple(sorted(hashlib.sha256(key.encode("utf-8")).hexdigest()
+                                                      for key in anchor_original)),
+        )
+    raise ValueError("trade anchor missing")
 
 
 def _canonical_quantity(value: Decimal, *, integer_limit: int = 36) -> str:
@@ -208,7 +301,7 @@ class GatewayDirectExecutionLedger:
         self._owned()
         with journal._transaction() as db:
             self._owned()
-            journal._verify_v2_upgrade_integrity(db, schema_version=9)
+            journal._verify_v2_upgrade_integrity(db, schema_version=journal._schema_version)
             journal._verify_v4_identity_integrity(db)
             _verify_execution_integrity(db, journal.account_scope, journal._execution_max_facts)
             _verify_consumer_integrity(db, journal.account_scope)
@@ -253,6 +346,16 @@ class GatewayDirectExecutionLedger:
         self._owned()
         return self._journal.account_scope
 
+    def record_verified_external_fact(
+        self, fact_digest: str, evidence: object, *, source_fence, verify_source_and_exclusion
+    ) -> bool:
+        """Delegate classification using this ledger's owner-bound account guard."""
+        self._owned()
+        return self._journal.record_verified_external_fact(
+            fact_digest, evidence, guard=self._guard, source_fence=source_fence,
+            verify_source_and_exclusion=verify_source_and_exclusion,
+        )
+
     @contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:
         self._owned()
@@ -286,6 +389,18 @@ class GatewayDirectExecutionLedger:
                 (self._journal.account_scope, digest),
             ).fetchone()
             if row is not None:
+                if (self._journal._schema_version >= 14 and row['reason'] == 'TRADE_DUPLICATE'
+                        and fact.kind is DirectExecutionEventKind.TRADE and fact.schema_version == 4
+                        and fact.trade_time is not None):
+                    self._process(db, digest, fact)
+                    self._append_account_fact(db, digest)
+                    updated = db.execute(
+                        "SELECT * FROM direct_execution_facts WHERE account=? AND fact_digest=?",
+                        (self._journal.account_scope, digest),
+                    ).fetchone()
+                    if updated['reason'] != row['reason'] or updated['event_sequence'] != row['event_sequence']:
+                        self._journal._bump(db)
+                        return self._result(db, updated, applied=False)
                 result = self._result(db, row, applied=False)
                 if fact.kind is DirectExecutionEventKind.TRADE and fact.trade_key is not None:
                     trade = db.execute(
@@ -326,6 +441,7 @@ class GatewayDirectExecutionLedger:
                 (self._journal.account_scope,),
             )
             self._process(db, digest, fact)
+            self._append_account_fact(db, digest)
             self._journal._bump(db)
             row = db.execute(
                 "SELECT * FROM direct_execution_facts WHERE account=? AND fact_digest=?",
@@ -428,6 +544,7 @@ class GatewayDirectExecutionLedger:
                     (account,),
                 )
                 self._process(db, digest, fact)
+                self._append_account_fact(db, digest)
                 row = db.execute(
                     "SELECT * FROM direct_execution_facts WHERE account=? AND fact_digest=?",
                     (account, digest),
@@ -559,6 +676,7 @@ class GatewayDirectExecutionLedger:
                     (account,),
                 )
                 self._process(db, digest, fact)
+                self._append_account_fact(db, digest)
                 row = db.execute(
                     "SELECT * FROM direct_execution_facts WHERE account=? AND fact_digest=?",
                     (account, digest),
@@ -618,6 +736,7 @@ class GatewayDirectExecutionLedger:
                 if fact.schema_version not in (1, 4):
                     raise DirectCommandJournalError("INVALID_DATABASE")
                 self._process(db, row["fact_digest"], fact)
+                self._append_account_fact(db, row["fact_digest"])
                 current = db.execute(
                     "SELECT * FROM direct_execution_facts WHERE account=? AND fact_digest=?",
                     (self._journal.account_scope, row["fact_digest"]),
@@ -684,9 +803,9 @@ class GatewayDirectExecutionLedger:
                      ON f.account=e.account AND f.fact_digest=e.fact_digest
                    LEFT JOIN direct_journal_commands AS c
                      ON c.account=f.account AND c.reservation_id=f.reservation_id
-                   WHERE e.account=? AND e.strategy=? AND e.sequence>?
+                   WHERE e.account=? AND (? IS NULL OR e.strategy=?) AND e.sequence>?
                    ORDER BY e.sequence LIMIT ?""",
-                (self._journal.account_scope, strategy, after_sequence, limit),
+                (self._journal.account_scope, strategy, strategy, after_sequence, limit),
             ).fetchall()
         except sqlite3.DatabaseError as exc:
             raise DirectCommandJournalError("INVALID_DATABASE") from exc
@@ -730,6 +849,7 @@ class GatewayDirectExecutionLedger:
                 db, self._journal, fact, row["fact_digest"], reservation, row["strategy"]
             )
             metadata_only = False
+            trade_attribution = None
             if fact.kind is DirectExecutionEventKind.TRADE:
                 if fact.trade_key is None or row["fact_applied"] not in (0, 1):
                     raise ValueError("invalid trade event")
@@ -749,6 +869,7 @@ class GatewayDirectExecutionLedger:
                 if row["fact_applied"] == 1:
                     if trade["fact_digest"] != row["fact_digest"] or row["fact_reason"] in {
                         "TRADE_DATE_ENRICHED",
+                        "TRADE_TIME_ENRICHED",
                         "TRADE_DUPLICATE",
                     }:
                         raise ValueError("invalid applied trade event")
@@ -757,20 +878,25 @@ class GatewayDirectExecutionLedger:
                         "SELECT * FROM direct_execution_trade_dates WHERE account=? AND route=? AND trade_key_json=?",
                         (row["account"], fact.route, trade_key),
                     ).fetchone()
+                    time_enrichment = row["fact_reason"] == "TRADE_TIME_ENRICHED"
                     if (
                         fact.schema_version != 4
-                        or fact.trade_date is None
-                        or row["fact_reason"] != "TRADE_DATE_ENRICHED"
-                        or side is None
-                        or side["fact_digest"] != row["fact_digest"]
-                        or side["original_fact_digest"] != trade["fact_digest"]
-                        or side["original_fact_digest"] == side["fact_digest"]
-                        or side["trade_date"] != fact.trade_date
+                        or row["fact_reason"] not in {"TRADE_DATE_ENRICHED", "TRADE_TIME_ENRICHED"}
+                        or (not time_enrichment and (fact.trade_date is None or side is None
+                            or side["fact_digest"] != row["fact_digest"]
+                            or side["original_fact_digest"] != trade["fact_digest"]
+                            or side["original_fact_digest"] == side["fact_digest"]
+                            or side["trade_date"] != fact.trade_date))
+                        or (time_enrichment and fact.trade_date is not None and
+                            (side is None or side["trade_date"] != fact.trade_date))
+                        or (time_enrichment and (fact.trade_time is None
+                            or _known_trade_time(db, row["account"], fact.route, trade_key,
+                                                 before_sequence=row["sequence"]) is not None))
                     ):
                         raise ValueError("invalid trade date event")
                     original = db.execute(
                         "SELECT * FROM direct_execution_facts WHERE account=? AND fact_digest=?",
-                        (row["account"], side["original_fact_digest"]),
+                        (row["account"], trade["fact_digest"]),
                     ).fetchone()
                     if original is None:
                         raise ValueError("missing original trade fact")
@@ -788,10 +914,10 @@ class GatewayDirectExecutionLedger:
                         or original_fact.fact_digest() != original["fact_digest"]
                         or _json(original_fact.to_mapping()) != original["fact_json"]
                         or original_fact.trade_content_digest() != trade["content_digest"]
-                        or (
+                        or (not time_enrichment and (
                             original_fact.schema_version == 4
                             and original_fact.trade_date is not None
-                        )
+                        ))
                         or original["event_sequence"] is None
                         or original["event_sequence"] >= row["sequence"]
                         or original_event is None
@@ -801,7 +927,12 @@ class GatewayDirectExecutionLedger:
                     ):
                         raise ValueError("invalid original trade event link")
                     metadata_only = True
-            elif row["fact_reason"] == "TRADE_DATE_ENRICHED":
+                anchor_cut = original["event_sequence"] if metadata_only else row["sequence"]
+                trade_attribution = _trade_attribution(
+                    db, row["account"], row["strategy"], reservation, digest,
+                    original_keys, fact, row["fact_digest"], anchor_cut,
+                )
+            elif row["fact_reason"] in {"TRADE_DATE_ENRICHED", "TRADE_TIME_ENRICHED"}:
                 raise ValueError("invalid trade date event kind")
             return ExecutionEvent(
                 row["sequence"],
@@ -815,6 +946,7 @@ class GatewayDirectExecutionLedger:
                 attribution,
                 place_attribution,
                 metadata_only,
+                trade_attribution,
             )
         except Exception as exc:
             raise DirectCommandJournalError("INVALID_DATABASE") from exc
@@ -985,6 +1117,253 @@ class GatewayDirectExecutionLedger:
                 )
             return progress
 
+    def _account_observer_identity(self, principal_id, consumer_ref):
+        if self._journal._schema_version < 12:
+            raise DirectCommandJournalError("ACCOUNT_OBSERVER_UNAVAILABLE")
+        principal, consumer = map(_text, (principal_id, consumer_ref))
+        epoch = hashlib.sha256(_json(["account-observer-v1", self._journal.journal_id,
+                                      self._journal.account_scope]).encode("ascii")).hexdigest()
+        return principal, consumer, epoch
+
+    @contextmanager
+    def _account_observer_transaction(self, admission_fence, *, with_check=False):
+        """Fence is installed by the authenticated account-read service, never by RPC."""
+        if not callable(admission_fence):
+            raise DirectCommandJournalError("INVALID_ADMISSION")
+        with ExitStack() as stack:
+            manager = admission_fence()
+            check = type(manager).__enter__(manager)
+            exit_ = type(manager).__exit__
+            stack.push(lambda *exc: (exit_(manager, *exc), False)[1])
+            if not callable(check):
+                raise DirectCommandJournalError("INVALID_ADMISSION")
+            with self._write() as db:
+                check()
+                yield (db, check) if with_check else db
+                check()
+
+    def account_observer_progress(self, *, principal_id, consumer_ref, admission_fence, consumer_owner=None):
+        from .account_observer import AccountObserverProgress
+        principal, consumer, epoch = self._account_observer_identity(principal_id, consumer_ref)
+        with self._account_observer_transaction(admission_fence) as db:
+            row = db.execute("SELECT offered_sequence,acknowledged_sequence FROM direct_account_observer_consumers "
+                "WHERE account=? AND principal=? AND consumer=?",
+                (self._journal.account_scope, principal, consumer)).fetchone()
+            values = tuple(row) if row else (0, 0)
+            if self._journal._schema_version >= 19:
+                from .account_event_consumer_ownership import account_event_visible_cursors
+                values = account_event_visible_cursors(db, self._journal.account_scope, principal, consumer, consumer_owner)
+            return AccountObserverProgress(principal, consumer, epoch, *values)
+
+    def account_fact_health(self):
+        """Owner-local aggregate only; no trading or reconciliation authority."""
+        if self._journal._schema_version < 12:
+            raise DirectCommandJournalError('ACCOUNT_FACT_STREAM_UNAVAILABLE')
+        self._owned()
+        with self._read() as db:
+            row = db.execute("SELECT "
+                "SUM(CASE WHEN f.disposition='UNATTRIBUTED' AND e.fact_digest IS NULL THEN 1 ELSE 0 END),"
+                "SUM(CASE WHEN f.disposition='CONFLICT' THEN 1 ELSE 0 END),"
+                "SUM(CASE WHEN e.fact_digest IS NOT NULL THEN 1 ELSE 0 END) "
+                "FROM direct_execution_facts f LEFT JOIN external_position_events e "
+                "ON e.account=f.account AND e.fact_digest=f.fact_digest WHERE f.account=?",
+                (self._journal.account_scope,)).fetchone()
+            self._owned()
+            return {'unattributed': row[0] or 0, 'conflict': row[1] or 0, 'verified_external': row[2] or 0}
+
+    def account_fact_progress(self, *, principal_id, consumer_ref, admission_fence, consumer_owner=None):
+        from .account_observation_journal import account_fact_progress
+        if self._journal._schema_version < 14:
+            raise DirectCommandJournalError('ACCOUNT_FACT_STREAM_UNAVAILABLE')
+        with self._account_observer_transaction(admission_fence) as db:
+            progress = account_fact_progress(db, self._journal.account_scope, principal_id, consumer_ref)
+            if self._journal._schema_version >= 18:
+                from dataclasses import replace
+                from .account_fact_consumer_ownership import account_fact_visible_cursors
+                offered, acknowledged = account_fact_visible_cursors(db, self._journal.account_scope,
+                    principal_id, consumer_ref, consumer_owner)
+                progress = replace(progress, offered_sequence=offered, acknowledged_sequence=acknowledged)
+            return progress
+
+    def read_account_facts(self, *, principal_id, consumer_ref, admission_fence, result_fits,
+                           after_sequence=0, expected_epoch=None, limit=256, consumer_owner=None):
+        from .account_observation_journal import read_account_facts
+        if self._journal._schema_version < 14:
+            raise DirectCommandJournalError('ACCOUNT_FACT_STREAM_UNAVAILABLE')
+        with self._account_observer_transaction(admission_fence) as db:
+            before = db.total_changes
+            if self._journal._schema_version >= 18:
+                from .account_fact_consumer_ownership import claim_account_fact_reader
+                claim_account_fact_reader(db, self._journal.account_scope, principal_id, consumer_ref,
+                                          consumer_owner, after_sequence=after_sequence)
+            page = read_account_facts(db, self._journal.account_scope, principal_id, consumer_ref,
+                after_sequence=after_sequence, expected_epoch=expected_epoch, limit=limit, result_fits=result_fits)
+            if db.total_changes != before:
+                self._journal._bump(db)
+            return page
+
+    def acknowledge_account_facts(self, *, principal_id, consumer_ref, admission_fence,
+                                  sequence, expected_epoch, result_fits=None, consumer_owner=None):
+        from .account_observation_journal import acknowledge_account_facts
+        if self._journal._schema_version < 14:
+            raise DirectCommandJournalError('ACCOUNT_FACT_STREAM_UNAVAILABLE')
+        with self._account_observer_transaction(admission_fence) as db:
+            before = db.total_changes
+            if self._journal._schema_version >= 18:
+                from .account_fact_consumer_ownership import require_account_fact_owner
+                require_account_fact_owner(db, self._journal.account_scope, principal_id, consumer_ref, consumer_owner)
+            progress = acknowledge_account_facts(db, self._journal.account_scope, principal_id, consumer_ref,
+                sequence=sequence, expected_epoch=expected_epoch, result_fits=result_fits)
+            if db.total_changes != before:
+                self._journal._bump(db)
+            return progress
+
+    def compact_account_facts(self):
+        """Compact only account observations under the existing local owner."""
+        from .account_fact_compaction import compact_account_facts
+        if self._journal._schema_version < 18:
+            raise DirectCommandJournalError('ACCOUNT_FACT_STREAM_UNAVAILABLE')
+        with self._write() as db:
+            before = db.total_changes
+            result = compact_account_facts(db, self._journal.account_scope, self._journal.journal_id)
+            if db.total_changes != before:
+                self._journal._bump(db)
+            return result
+
+    def account_fact_snapshot_info(self, *, principal_id, consumer_ref, admission_fence, consumer_owner):
+        from .account_fact_compaction import compaction_metadata
+        from .account_fact_consumer_ownership import account_fact_visible_cursors
+        if self._journal._schema_version < 18:
+            raise DirectCommandJournalError('ACCOUNT_FACT_STREAM_UNAVAILABLE')
+        with self._account_observer_transaction(admission_fence) as db:
+            account_fact_visible_cursors(db, self._journal.account_scope, principal_id, consumer_ref, consumer_owner)
+            return compaction_metadata(db, self._journal.account_scope)
+
+    def read_account_fact_snapshot(self, *, principal_id, consumer_ref, admission_fence, consumer_owner,
+                                   snapshot_id, after_ordinal=0, limit=256, result_fits):
+        from .account_fact_compaction import read_account_fact_snapshot
+        from .account_fact_consumer_ownership import account_fact_visible_cursors, claim_account_fact_reader
+        if self._journal._schema_version < 18:
+            raise DirectCommandJournalError('ACCOUNT_FACT_STREAM_UNAVAILABLE')
+        with self._account_observer_transaction(admission_fence, with_check=True) as (db, check):
+            before = db.total_changes
+            _, ack = account_fact_visible_cursors(db, self._journal.account_scope, principal_id, consumer_ref, consumer_owner)
+            claim_account_fact_reader(db, self._journal.account_scope, principal_id, consumer_ref, consumer_owner, after_sequence=ack)
+            def verify_consumer(_account, _principal, _consumer, _owner):
+                check()
+                return True
+            page = read_account_fact_snapshot(db, self._journal.account_scope, principal_id, consumer_ref,
+                owner=consumer_owner, snapshot_id=snapshot_id, after_ordinal=after_ordinal, limit=limit,
+                result_fits=result_fits, verify_consumer=verify_consumer)
+            if db.total_changes != before:
+                self._journal._bump(db)
+            return page
+
+    def confirm_account_fact_snapshot(self, *, principal_id, consumer_ref, admission_fence, consumer_owner,
+                                     snapshot_id, snapshot_digest):
+        from .account_fact_compaction import confirm_account_fact_snapshot
+        if self._journal._schema_version < 18:
+            raise DirectCommandJournalError('ACCOUNT_FACT_STREAM_UNAVAILABLE')
+        with self._account_observer_transaction(admission_fence, with_check=True) as (db, check):
+            before = db.total_changes
+            def verify_consumer(_account, _principal, _consumer, _owner):
+                check()
+                return True
+            result = confirm_account_fact_snapshot(db, self._journal.account_scope, principal_id, consumer_ref,
+                owner=consumer_owner, snapshot_id=snapshot_id, snapshot_digest=snapshot_digest,
+                verify_consumer=verify_consumer)
+            if db.total_changes != before:
+                self._journal._bump(db)
+            return result
+
+    def read_account_observer(self, *, principal_id, consumer_ref, admission_fence, result_fits,
+                              after_sequence=0, expected_epoch=None, limit=256, consumer_owner=None):
+        """Offer attributed account events on an independent durable observer cursor."""
+        from .account_observer import _MAX_ACCOUNT_OBSERVERS
+        principal, consumer, epoch = self._account_observer_identity(principal_id, consumer_ref)
+        self._sequence(after_sequence)
+        _limit(limit)
+        if expected_epoch is not None and expected_epoch != epoch:
+            raise DirectCommandJournalError("EPOCH_MISMATCH")
+        if not callable(result_fits):
+            raise DirectCommandJournalError("INVALID_INPUT")
+        account = self._journal.account_scope
+        with self._account_observer_transaction(admission_fence) as db:
+            before = db.total_changes
+            if self._journal._schema_version >= 19:
+                from .account_event_consumer_ownership import claim_account_event_reader
+                claim_account_event_reader(db, account, principal, consumer, consumer_owner, after_sequence=after_sequence)
+            row = db.execute("SELECT offered_sequence,acknowledged_sequence FROM direct_account_observer_consumers "
+                "WHERE account=? AND principal=? AND consumer=?", (account, principal, consumer)).fetchone()
+            offered, ack = tuple(row) if row else (0, 0)
+            if after_sequence and (row is None or expected_epoch != epoch or after_sequence > offered
+                    or db.execute("SELECT 1 FROM direct_execution_events WHERE account=? AND sequence=?",
+                                  (account, after_sequence)).fetchone() is None):
+                raise DirectCommandJournalError("INVALID_SEQUENCE")
+            rows = self._event_rows(db, None, after_sequence, limit + 1)
+            events = tuple(self._event_from_row(db, item) for item in rows[:limit])
+            count = len(events)
+            while True:
+                selected = events[:count]
+                new_offer = max(offered, selected[-1].sequence) if selected else offered
+                page = ExecutionEventPage(selected, epoch, new_offer, ack, len(rows) > count)
+                fits = result_fits(page)
+                if type(fits) is not bool:
+                    raise DirectCommandJournalError("INVALID_INPUT")
+                if fits:
+                    break
+                if count <= 1:
+                    raise DirectCommandJournalError("PAGE_TOO_LARGE")
+                count -= 1
+            if selected and (row is None or new_offer > offered):
+                if row is None:
+                    if db.execute("SELECT count(*) FROM direct_account_observer_consumers WHERE account=?",
+                                  (account,)).fetchone()[0] >= _MAX_ACCOUNT_OBSERVERS:
+                        raise DirectCommandJournalError("CONSUMER_CAPACITY_EXCEEDED")
+                    db.execute("INSERT INTO direct_account_observer_consumers VALUES (?,?,?,?,0)",
+                               (account, principal, consumer, new_offer))
+                else:
+                    db.execute("UPDATE direct_account_observer_consumers SET offered_sequence=? "
+                        "WHERE account=? AND principal=? AND consumer=?", (new_offer, account, principal, consumer))
+            if self._journal._schema_version >= 19 and db.total_changes != before:
+                self._journal._bump(db)
+            return page
+
+    def acknowledge_account_observer(self, *, principal_id, consumer_ref, sequence, expected_epoch,
+                                     admission_fence, result_fits=None, consumer_owner=None):
+        from .account_observer import AccountObserverProgress
+        principal, consumer, epoch = self._account_observer_identity(principal_id, consumer_ref)
+        self._sequence(sequence)
+        if expected_epoch != epoch:
+            raise DirectCommandJournalError("EPOCH_MISMATCH")
+        if result_fits is not None and not callable(result_fits):
+            raise DirectCommandJournalError("INVALID_INPUT")
+        account = self._journal.account_scope
+        with self._account_observer_transaction(admission_fence) as db:
+            if self._journal._schema_version >= 19:
+                from .account_event_consumer_ownership import require_account_event_owner
+                require_account_event_owner(db, account, principal, consumer, consumer_owner)
+            row = db.execute("SELECT offered_sequence,acknowledged_sequence FROM direct_account_observer_consumers "
+                "WHERE account=? AND principal=? AND consumer=?", (account, principal, consumer)).fetchone()
+            if (row is None or sequence > row[0] or (sequence and db.execute(
+                "SELECT 1 FROM direct_execution_events WHERE account=? AND sequence=?",
+                (account, sequence)).fetchone() is None)):
+                raise DirectCommandJournalError("INVALID_SEQUENCE")
+            ack = max(row[1], sequence)
+            progress = AccountObserverProgress(principal, consumer, epoch, row[0], ack)
+            if result_fits is not None:
+                fits = result_fits(progress)
+                if type(fits) is not bool:
+                    raise DirectCommandJournalError("INVALID_INPUT")
+                if not fits:
+                    raise DirectCommandJournalError("PAGE_TOO_LARGE")
+            if ack != row[1]:
+                db.execute("UPDATE direct_account_observer_consumers SET acknowledged_sequence=? "
+                    "WHERE account=? AND principal=? AND consumer=?", (ack, account, principal, consumer))
+                if self._journal._schema_version >= 19:
+                    self._journal._bump(db)
+            return progress
+
     def pending(self, *, limit: int = 256) -> tuple[ExecutionPending, ...]:
         _limit(limit)
         with self._read() as db:
@@ -1036,6 +1415,12 @@ class GatewayDirectExecutionLedger:
                 digest,
             ),
         )
+        self._append_account_fact(db, digest)
+
+    def _append_account_fact(self, db, digest):
+        if self._journal._schema_version >= 14:
+            from .account_observation_journal import append_account_fact
+            append_account_fact(db, self._journal.account_scope, digest)
 
     def _conflict_trade(self, db, fact, digest, trade_key, original, reason):
         db.execute(
@@ -1058,6 +1443,29 @@ class GatewayDirectExecutionLedger:
     def _process(self, db: sqlite3.Connection, digest: str, fact: GatewayReturnFact) -> None:
         account = self._journal.account_scope
         trade_key = _json(list(fact.trade_key)) if fact.trade_key is not None else None
+        if self._journal._schema_version >= 12:
+            external = db.execute(
+                "SELECT 1 FROM external_position_events WHERE account=? AND fact_digest=?",
+                (account, digest),
+            ).fetchone()
+            external_trade = None
+            if fact.kind is DirectExecutionEventKind.TRADE and trade_key is not None:
+                external_trade = db.execute(
+                    "SELECT content_digest FROM external_position_trades "
+                    "WHERE account=? AND route=? AND trade_key_json=?",
+                    (account, fact.route, trade_key),
+                ).fetchone()
+                if external_trade is not None and external_trade[0] != fact.trade_content_digest():
+                    raise DirectCommandJournalError("EXTERNAL_TRADE_CONFLICT")
+            if external is not None or external_trade is not None:
+                # External ownership is an explicitly verified side ledger. It
+                # cannot later be silently rematched into a strategy ledger.
+                if any(db.execute(
+                    "SELECT 1 FROM direct_journal_strong_keys WHERE account=? AND strong_key=?",
+                    (account, key),
+                ).fetchone() is not None for key in fact.identity_keys):
+                    raise DirectCommandJournalError("EXTERNAL_IDENTITY_CONFLICT")
+                return
         trade = None
         if fact.kind is DirectExecutionEventKind.TRADE and trade_key is not None:
             trade = db.execute(
@@ -1167,6 +1575,11 @@ class GatewayDirectExecutionLedger:
                 ):
                     self._fact_update(db, digest, "UNATTRIBUTED", "ORIGINAL_ANCHOR_REQUIRED")
                     return
+                if self._journal._schema_version >= 12:
+                    from .external_position_ledger import external_identity_collision
+                    if external_identity_collision(db, account, (fact.venue_key,)):
+                        self._fact_update(db, digest, "CONFLICT", "EXTERNAL_IDENTITY_CONFLICT")
+                        return
                 db.execute(
                     "INSERT INTO direct_journal_strong_keys VALUES (?, ?, ?)",
                     (account, fact.venue_key, reservation),
@@ -1217,12 +1630,21 @@ class GatewayDirectExecutionLedger:
                         db, fact, digest, trade_key, trade["content_digest"], "TRADE_DATE_CONFLICT"
                     )
                     return
+                known_time = (_known_trade_time(db, account, fact.route, trade_key)
+                              if self._journal._schema_version >= 14 else None)
+                if (self._journal._schema_version >= 14 and known_time is not None
+                        and fact.trade_time is not None and known_time != fact.trade_time):
+                    self._conflict_trade(db, fact, digest, trade_key, trade["content_digest"], "TRADE_TIME_CONFLICT")
+                    return
                 if date_row is None and trade_date is not None:
                     db.execute(
                         "INSERT INTO direct_execution_trade_dates VALUES (?, ?, ?, ?, ?, ?)",
                         (account, fact.route, trade_key, trade_date, digest, trade["fact_digest"]),
                     )
                     reason = "TRADE_DATE_ENRICHED"
+                elif (self._journal._schema_version >= 14 and fact.schema_version == 4
+                      and fact.trade_time is not None and known_time is None):
+                    reason = "TRADE_TIME_ENRICHED"
                 else:
                     self._fact_update(db, digest, "ATTRIBUTED", "TRADE_DUPLICATE", reservation)
                     return
@@ -1316,12 +1738,14 @@ _VALID_REASONS = {
         "CANCEL_NOT_SENT_CONTRADICTION",
         "TRADE_DUPLICATE",
         "TRADE_DATE_ENRICHED",
+        "TRADE_TIME_ENRICHED",
         "OVERFILL",
         "NOT_SENT_OVERFILL",
     },
     "CONFLICT": {
         "TRADE_CONTENT_CONFLICT",
         "TRADE_DATE_CONFLICT",
+        "TRADE_TIME_CONFLICT",
         "TRADE_CONFLICT_RETAINED",
         "IDENTITY_CONFLICT",
         "BINDING_CONFLICT",
@@ -1330,6 +1754,7 @@ _VALID_REASONS = {
         "COMMAND_STATE_CONFLICT",
         "TRADE_SIDE_OR_OFFSET_CONFLICT",
         "POSITION_RANGE_CONFLICT",
+        "EXTERNAL_IDENTITY_CONFLICT",
     },
 }
 
@@ -1473,11 +1898,12 @@ def _verify_execution_integrity(
             fact = GatewayReturnFact.from_mapping(raw)
             if fact.schema_version > max_fact_version:
                 raise ValueError("legacy fact version")
-            if row["reason"] in {"TRADE_DATE_ENRICHED", "TRADE_DATE_CONFLICT"} and (
+            if row["reason"] in {"TRADE_DATE_ENRICHED", "TRADE_DATE_CONFLICT", "TRADE_TIME_ENRICHED", "TRADE_TIME_CONFLICT"} and (
                 max_fact_version < 4
                 or fact.schema_version != 4
                 or fact.kind is not DirectExecutionEventKind.TRADE
-                or fact.trade_date is None
+                or (row["reason"] in {"TRADE_DATE_ENRICHED", "TRADE_DATE_CONFLICT"} and fact.trade_date is None)
+                or (row["reason"] in {"TRADE_TIME_ENRICHED", "TRADE_TIME_CONFLICT"} and fact.trade_time is None)
             ):
                 raise ValueError("trade date reason")
             if row["reason"] == "CANCEL_NOT_SENT_CONTRADICTION" and (
@@ -1708,6 +2134,21 @@ def _verify_execution_integrity(
                 raise ValueError("invalid duplicate trade")
         if max_fact_version >= 4:
             _verify_trade_dates(db, account, facts, trade_keys, conflicts)
+            for digest, (row, fact) in facts.items():
+                if row['reason'] not in {'TRADE_TIME_ENRICHED', 'TRADE_TIME_CONFLICT'}:
+                    continue
+                key = (fact.route, _json(list(fact.trade_key)))
+                trade = trade_keys.get(key)
+                if trade is None or not trade['applied'] or trade['content_digest'] != fact.trade_content_digest():
+                    raise ValueError('time enrichment trade link')
+                if row['reason'] == 'TRADE_TIME_ENRICHED':
+                    if (row['disposition'] != 'ATTRIBUTED' or row['event_sequence'] is None or row['applied']
+                            or row['reservation_id'] != trade['reservation_id']
+                            or _known_trade_time(db, account, fact.route, key[1], before_sequence=row['event_sequence']) is not None):
+                        raise ValueError('time enrichment link')
+                elif (row['disposition'] != 'CONFLICT' or digest not in conflict_fact_ids
+                        or _known_trade_time(db, account, fact.route, key[1]) in (None, fact.trade_time)):
+                    raise ValueError('time conflict link')
         positions = {}
         for row in db.execute("SELECT * FROM direct_execution_positions"):
             if row["account"] != account:
@@ -1728,6 +2169,32 @@ def _verify_execution_integrity(
         for alias in db.execute("SELECT * FROM direct_execution_aliases"):
             if (alias["reservation_id"], alias["strong_key"]) not in alias_support:
                 raise ValueError("unsupported alias")
+        # Reconstruct every venue-only trade bridge on reopen.  Merely retaining
+        # a mutable alias row is insufficient: its original ORDER anchor must
+        # precede the quantity-applying trade and remain linked to that command.
+        for fact_digest, (row, fact) in facts.items():
+            if (fact.kind is not DirectExecutionEventKind.TRADE
+                    or row["disposition"] != "ATTRIBUTED"
+                    or row["event_sequence"] is None or fact.binding_keys):
+                continue
+            command = db.execute(
+                "SELECT strategy,digest,strong_keys_json FROM direct_journal_commands "
+                "WHERE account=? AND reservation_id=?", (account, row["reservation_id"]),
+            ).fetchone()
+            if command is None:
+                raise ValueError("trade command missing")
+            before_sequence = row["event_sequence"]
+            if not row["applied"]:
+                trade = trade_keys.get((fact.route, _json(list(fact.trade_key))))
+                if trade is None or trade["fact_digest"] not in facts:
+                    raise ValueError("original trade missing")
+                original_row, _ = facts[trade["fact_digest"]]
+                before_sequence = original_row["event_sequence"]
+            if type(before_sequence) is not int:
+                raise ValueError("trade sequence missing")
+            _trade_attribution(db, account, command["strategy"], row["reservation_id"],
+                               command["digest"], json.loads(command["strong_keys_json"]),
+                               fact, fact_digest, before_sequence)
     except Exception as exc:
         raise DirectCommandJournalError("INVALID_DATABASE") from exc
 

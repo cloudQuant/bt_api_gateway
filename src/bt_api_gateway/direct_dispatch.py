@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -196,15 +196,59 @@ class GatewayDirectDispatcher:
         expected_version: int,
         *,
         request_fence: RequestFence | None = None,
+        delegation_permit: object | None = None,
+        market_gate: object | None = None,
+        market_permit: object | None = None,
     ) -> DirectCommandRecord:
         if request_fence is not None and not callable(request_fence):
             raise DirectDispatchError("INVALID_REQUEST_FENCE")
+        if ((market_gate is None) != (market_permit is None)
+                or (market_gate is not None and (request_fence is None
+                    or not all(callable(getattr(market_gate, name, None)) for name in
+                               ('dispatch_fence', 'native_fence', 'recheck', 'native_recheck', 'matches_delegation'))
+                    or market_gate.matches_delegation(market_permit, delegation_permit) is not True))):
+            raise DirectDispatchError('INVALID_MARKET_GATE')
+        if delegation_permit is not None:
+            from .direct_delegation import GatewayDelegationPermit
+            if (type(delegation_permit) is not GatewayDelegationPermit
+                    or delegation_permit.operation != "direct.dispatch" or request_fence is None):
+                raise DirectDispatchError("INVALID_DELEGATION")
+            cmd = delegation_permit.command
+            if (cmd.account_scope != self._journal.account_scope or cmd.strategy_scope != strategy
+                    or cmd.request_key != request_key or cmd.actor_principal != principal
+                    or cmd.payload_digest != digest):
+                raise DirectDispatchError("INVALID_DELEGATION")
+            # A parent recheck requires the journal.  The native provider can
+            # invoke its last recheck while holding its trading-session lock;
+            # acquiring the journal there would invert the journal -> session
+            # lock order used by admission.  Until there is a bounded owner
+            # fence spanning that boundary, do not write a dispatch marker.
+            if market_gate is not None and cmd.parent_ref is not None:
+                raise DirectDispatchError("PARENT_NATIVE_FENCE_UNAVAILABLE")
         self._owned()
         if self._active:
             raise DirectDispatchError("DISPATCH_REENTRANT")
         row = self._journal.get(strategy, request_key, principal)
         if row.reservation_id != reservation_id or row.digest != digest:
             raise DirectDispatchError("REQUEST_CONFLICT")
+        if delegation_permit is not None:
+            # Re-observation of an already dispatched/expired command still
+            # requires current authority and the original persisted envelope.
+            with _request_scope(request_fence, row) as recheck:
+                with self._journal._transaction() as db:
+                    saved = db.execute(
+                        "SELECT envelope_json,envelope_digest FROM direct_delegated_commands "
+                        "WHERE account=? AND strategy=? AND request_key=?",
+                        (self._journal.account_scope, strategy, request_key),
+                    ).fetchone()
+                    cmd = delegation_permit.command
+                    if (saved is None or saved["envelope_json"] != cmd.canonical_json
+                            or saved["envelope_digest"] != cmd.digest):
+                        raise DirectDispatchError("INVALID_DELEGATION")
+                    delegation_permit.recheck(db)
+                    if recheck is not None:
+                        recheck()
+                    delegation_permit.recheck(db)
         if row.status != "RESERVED":
             return row
         row = self._journal.expire(strategy, request_key, principal)
@@ -212,6 +256,12 @@ class GatewayDirectDispatcher:
             return row
         if type(expected_version) is not int or row.version != expected_version:
             raise DirectDispatchError("VERSION_CONFLICT")
+        # A durable reservation is not yet a dispatch authorization.  Until
+        # every authority that can affect an order participates in the same
+        # single-use, nonblocking native claim, do not write a dispatch marker
+        # or enter any injected native provider.  In particular, forwarding the
+        # old native_fence would hold Registry and market locks over native I/O.
+        raise DirectDispatchError("DISPATCH_CLAIM_UNAVAILABLE")
         payload = _request(row.payload_json)
         self._active = True
         try:
@@ -219,7 +269,7 @@ class GatewayDirectDispatcher:
                 self._owned()
                 self._admitted(row)
                 self._owned()
-            port = _CommitPort(self, row, request_fence)
+            port = _CommitPort(self, row, request_fence, delegation_permit, market_gate, market_permit)
             try:
                 outcome = self._native_place(payload, port, self._journal.account_scope)
             except Exception:
@@ -272,10 +322,15 @@ class _CommitPort:
         owner: GatewayDirectDispatcher,
         record: DirectCommandRecord,
         request_fence: RequestFence | None,
+        delegation_permit: object | None,
+        market_gate: object | None,
+        market_permit: object | None,
     ) -> None:
         self._owner = owner
         self._record = record
         self._request_fence = request_fence
+        self._delegation_permit = delegation_permit
+        self._market_gate, self._market_permit = market_gate, market_permit
         self.identity: dict[str, object] | None = None
         self.keys: tuple[str, ...] = ()
         self.prepared_digest: str | None = None
@@ -285,6 +340,35 @@ class _CommitPort:
 
     def close(self) -> None:
         self._closed = True
+
+    @contextmanager
+    def native_fence(self):
+        """Hold current trusted market evidence around the final native call."""
+        if self._closed or not self._owner._active:
+            raise DirectDispatchError('COMMIT_CLOSED')
+        if self._market_gate is None:
+            yield None
+            return
+        with _request_scope(self._request_fence, self._record) as recheck:
+            if recheck is None:
+                raise DirectDispatchError('INVALID_REQUEST_FENCE')
+            with self._market_gate.native_fence(self._market_permit, self._record):
+                def final_recheck():
+                    self._owner._owned()
+                    self._owner._admitted(self._record)
+                    recheck()
+                    if self._delegation_permit is not None:
+                        if self._market_gate.matches_delegation(self._market_permit, self._delegation_permit) is not True:
+                            raise DirectDispatchError('INVALID_DELEGATION')
+                        if self._delegation_permit.command.parent_ref is not None:
+                            raise DirectDispatchError('PARENT_NATIVE_FENCE_UNAVAILABLE')
+                        # Non-parent grants do not require a journal-backed
+                        # authority check. Registry is held by the outer scope.
+                        self._delegation_permit.recheck(None)
+                    recheck()
+                    self._market_gate.native_recheck(self._market_permit, self._record)
+                final_recheck()
+                yield final_recheck
 
     def commit(self, record: PreDispatchRecord) -> str | None:
         self._owner._owned()
@@ -304,7 +388,10 @@ class _CommitPort:
             keys = self._owner._identity_keys(record.identity)
         except Exception:
             raise DirectDispatchError("IDENTITY_INVALID") from None
-        with _request_scope(self._request_fence, self._record) as recheck:
+        with ExitStack() as stack:
+            recheck = stack.enter_context(_request_scope(self._request_fence, self._record))
+            if self._market_gate is not None:
+                stack.enter_context(self._market_gate.dispatch_fence(self._market_permit, self._record))
             self._owner._owned()
             if (
                 record.operation is not WriteOperation.PLACE
@@ -342,6 +429,11 @@ class _CommitPort:
                 self._owner._owned()
                 if recheck is not None:
                     recheck()
+                if self._market_gate is not None:
+                    self._market_gate.recheck(self._market_permit, current)
+
+            def before_commit() -> None:
+                before_dispatch()
 
             result = self._owner._journal.begin_dispatch(
                 current.strategy_scope,
@@ -353,7 +445,12 @@ class _CommitPort:
                 identity,
                 keys,
                 before_dispatch=before_dispatch,
+                before_commit=before_commit,
                 prepared_place=record.prepared_place,
+                delegation_permit=self._delegation_permit,
+                # The enclosing request scope already holds the Registry
+                # fence through the journal commit; it cannot be re-entered.
+                delegation_fence=nullcontext if self._delegation_permit is not None else None,
             )
             if not result.newly_started:
                 self._known_not_new = True

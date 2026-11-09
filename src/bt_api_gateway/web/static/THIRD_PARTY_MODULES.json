@@ -1,0 +1,17 @@
+[
+  "@ctrl/tinycolor",
+  "@element-plus/icons-vue",
+  "@popperjs/core",
+  "@vue/reactivity",
+  "@vue/runtime-core",
+  "@vue/runtime-dom",
+  "@vue/shared",
+  "@vueuse/core",
+  "@vueuse/shared",
+  "axios",
+  "dayjs",
+  "element-plus",
+  "lodash-es",
+  "pinia",
+  "vue-router"
+]

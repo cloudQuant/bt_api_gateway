@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bt_api_gateway"
-version = "0.2.0.dev63"
+version = "0.2.0.dev64"
 description = "Provider-neutral, durable shared-account command gateway"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -14,12 +14,13 @@ dependencies = ["bt_api_base>=0.16.0.dev63", "msgpack>=1.1"]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff>=0.6", "mypy>=1.10"]
+web = ["fastapi>=0.115,<1", "pydantic>=2,<3", "uvicorn>=0.30,<1"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-bt_api_gateway = ["py.typed"]
+bt_api_gateway = ["py.typed", "web/static/*", "web/static/assets/*"]
 
 [tool.ruff]
 line-length = 100

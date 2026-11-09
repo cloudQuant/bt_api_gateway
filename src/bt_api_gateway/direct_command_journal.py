@@ -11,6 +11,7 @@ import json
 import math
 import os
 import sqlite3
+import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator
@@ -165,6 +166,16 @@ class GatewayDirectCommandJournal:
         execution_max_facts: int = 100000,
         clock: Callable[[], float] = time.monotonic,
         timeout_seconds: float = 5.0,
+        controls_enabled: bool = False,
+        strategy_ledger_enabled: bool = False,
+        account_extensions_enabled: bool = False,
+        parent_authority_enabled: bool = False,
+        account_facts_financial_enabled: bool = False,
+        actor_stream_enabled: bool = False,
+        strategy_origin_enabled: bool = False,
+        control_cancel_enabled: bool = False,
+        account_fact_recovery_enabled: bool = False,
+        account_event_recovery_enabled: bool = False,
     ) -> None:
         self._configure(
             database_path,
@@ -175,15 +186,37 @@ class GatewayDirectCommandJournal:
             clock,
             timeout_seconds,
         )
+        if (type(controls_enabled) is not bool or type(strategy_ledger_enabled) is not bool
+                or type(account_extensions_enabled) is not bool or type(parent_authority_enabled) is not bool
+                or type(account_facts_financial_enabled) is not bool
+                or type(actor_stream_enabled) is not bool
+                or type(strategy_origin_enabled) is not bool
+                or type(control_cancel_enabled) is not bool
+                or type(account_fact_recovery_enabled) is not bool
+                or type(account_event_recovery_enabled) is not bool
+                or (strategy_ledger_enabled and not controls_enabled)
+                or (account_extensions_enabled and not strategy_ledger_enabled)
+                or (parent_authority_enabled and not account_extensions_enabled)
+                or (account_facts_financial_enabled and not parent_authority_enabled)
+                or (actor_stream_enabled and not account_facts_financial_enabled)
+                or (strategy_origin_enabled and not actor_stream_enabled)
+                or (control_cancel_enabled and not strategy_origin_enabled)
+                or (account_fact_recovery_enabled and not control_cancel_enabled)
+                or (account_event_recovery_enabled and not account_fact_recovery_enabled)):
+            raise DirectCommandJournalError("INVALID_INPUT")
+        self._schema_version = 19 if account_event_recovery_enabled else 18 if account_fact_recovery_enabled else 17 if control_cancel_enabled else 16 if strategy_origin_enabled else 15 if actor_stream_enabled else 14 if account_facts_financial_enabled else 13 if parent_authority_enabled else 12 if account_extensions_enabled else 11 if strategy_ledger_enabled else 10 if controls_enabled else 9
         self._journal_id = _text(expected_journal_id)
         if type(minimum_revision) is not int or minimum_revision < 0:
             raise DirectCommandJournalError("INVALID_REVISION")
         self._minimum_revision = minimum_revision
         try:
             with self._connection() as db, self._transaction_on(db):
-                self._verify_schema(db)
+                if controls_enabled:
+                    # Distinguish an anchored v9 candidate before exact v10 DDL verification.
+                    self._assert_anchor(db)
+                self._verify_schema(db, schema_version=self._schema_version)
                 self._assert_anchor(db)
-                self._verify_v2_upgrade_integrity(db, schema_version=9)
+                self._verify_v2_upgrade_integrity(db, schema_version=self._schema_version)
                 self._verify_v4_identity_integrity(db)
                 from .direct_execution_journal import _verify_execution_integrity
 
@@ -202,6 +235,44 @@ class GatewayDirectCommandJournal:
 
                 _verify_place_integrity(db, self._account, self._max_records)
                 _verify_place_error_integrity(db, self, self._execution_max_facts)
+                if self._schema_version >= 10:
+                    from .direct_control import verify_controls
+                    verify_controls(db, self._account, self._max_records)
+                if self._schema_version >= 11:
+                    from .strategy_position_ledger import _verify_strategy_ledger_integrity
+                    _verify_strategy_ledger_integrity(db, self._account)
+                if self._schema_version >= 12:
+                    from .direct_delegation import verify_delegated_integrity
+                    from .external_position_ledger import verify_external_integrity
+                    from .account_observer import verify_account_observers
+                    verify_delegated_integrity(db, self._account, self._max_records)
+                    verify_external_integrity(db, self._account)
+                    verify_account_observers(db, self._account)
+                if self._schema_version >= 13:
+                    from .direct_parent_authority import verify_parent_authority_integrity
+                    verify_parent_authority_integrity(db, self._account, self._max_records)
+                if self._schema_version >= 14:
+                    from .account_observation_journal import verify_account_fact_stream
+                    from .strategy_financial_ledger import verify_strategy_financial_integrity
+                    verify_account_fact_stream(db, self._account, self._journal_id)
+                    verify_strategy_financial_integrity(db, self._account)
+                if self._schema_version >= 15:
+                    from .delegate_actor_stream import verify_actor_stream
+                    verify_actor_stream(db, self._account, self._journal_id, self._max_records)
+                if self._schema_version >= 16:
+                    from .direct_strategy_origin import verify_strategy_origins
+                    verify_strategy_origins(db, self._account, self._journal_id)
+                if self._schema_version >= 17:
+                    from .direct_control_cancel import verify_control_cancel_integrity
+                    verify_control_cancel_integrity(db, self._account, self._journal_id, self._max_records)
+                if self._schema_version >= 18:
+                    from .account_fact_consumer_ownership import verify_account_fact_consumer_owners
+                    from .account_fact_compaction import verify_account_fact_compaction
+                    verify_account_fact_consumer_owners(db, self._account)
+                    verify_account_fact_compaction(db, self._account, self._journal_id)
+                if self._schema_version >= 19:
+                    from .account_event_consumer_ownership import verify_account_event_consumer_owners
+                    verify_account_event_consumer_owners(db, self._account)
         except sqlite3.DatabaseError as exc:
             raise DirectCommandJournalError("INVALID_DATABASE") from exc
 
@@ -311,6 +382,20 @@ class GatewayDirectCommandJournal:
         self._clock = clock
         self._timeout = timeout_seconds
         self._identity = SQLiteFileIdentity(Path(database_path))
+        self._monitor_gate = None
+        self._monitor_guard = None
+        self._strategy_ledger_ports = None
+        self._strategy_external_verifier = None
+        self._account_comparison_ports = None
+        self._strategy_financial_port = None
+        self._strategy_financial_guard = None
+        self._unknown_capacity_ports = None
+        self._unknown_capacity_guard = None
+        self._strategy_ledger_guard = None
+        self._dispatch_change_port = None
+        self._dispatch_change_guard = None
+        self._dispatch_port_lock = threading.Lock()
+        self._dispatch_active_transactions = 0
 
     @property
     def journal_id(self) -> str:
@@ -323,6 +408,26 @@ class GatewayDirectCommandJournal:
     @property
     def generation(self) -> str:
         return self._generation
+
+    def install_dispatch_change_port(self, *, guard: LocalAccountSessionGuard, port: object) -> None:
+        """Install the trusted owner's process-local dispatch invalidation port.
+
+        This port observes this journal's cooperating connections only; it is
+        not evidence that external sources or other database writers are fenced.
+        """
+        self._assert_account_guard(guard)
+        if (not all(callable(getattr(port, name, None)) for name in
+                    ('matches_owner', 'begin_change', 'finish_change', 'poison', 'poison_domain'))
+                or port.matches_owner(self._account, self._generation) is not True):
+            raise DirectCommandJournalError('DISPATCH_CHANGE_PORT_UNAVAILABLE')
+        with self._dispatch_port_lock:
+            if self._dispatch_change_port is not None:
+                if self._dispatch_change_port is not port or self._dispatch_change_guard is not guard:
+                    raise DirectCommandJournalError('DISPATCH_CHANGE_PORT_ALREADY_BOUND')
+                return
+            if self._dispatch_active_transactions:
+                raise DirectCommandJournalError('DISPATCH_CHANGE_PORT_BUSY')
+            self._dispatch_change_port, self._dispatch_change_guard = port, guard
 
     @staticmethod
     def _create_settlement_table(db: sqlite3.Connection) -> None:
@@ -721,6 +826,69 @@ class GatewayDirectCommandJournal:
 
             expected["direct_execution_trade_dates"] = _TRADE_DATE_DDL
             automatic.add("sqlite_autoindex_direct_execution_trade_dates_1")
+        if schema_version >= 10:
+            from .direct_control import _CONTROL_DDL
+            expected.update(_CONTROL_DDL)
+            automatic.update({"sqlite_autoindex_direct_control_causes_1", "sqlite_autoindex_direct_control_targets_1", "sqlite_autoindex_direct_control_blocked_1"})
+        if schema_version >= 11:
+            from .strategy_position_ledger import _STRATEGY_LEDGER_DDL
+            expected.update(_STRATEGY_LEDGER_DDL)
+            automatic.update({"sqlite_autoindex_strategy_position_baseline_1",
+                              "sqlite_autoindex_strategy_external_baseline_1"})
+        if schema_version >= 12:
+            from .direct_delegation import _DELEGATION_DDL
+            from .external_position_ledger import _EXTERNAL_LEDGER_DDL
+            from .account_observer import _ACCOUNT_OBSERVER_DDL
+            expected.update(_DELEGATION_DDL)
+            expected.update(_EXTERNAL_LEDGER_DDL)
+            expected.update(_ACCOUNT_OBSERVER_DDL)
+            automatic.update({"sqlite_autoindex_direct_delegated_commands_1",
+                              "sqlite_autoindex_direct_delegated_commands_2",
+                              "sqlite_autoindex_direct_account_observer_consumers_1",
+                              "sqlite_autoindex_external_position_events_1",
+                              "sqlite_autoindex_external_position_trades_1"})
+        if schema_version >= 13:
+            from .direct_parent_authority import _PARENT_AUTHORITY_DDL
+            expected.update(_PARENT_AUTHORITY_DDL)
+            automatic.update({"sqlite_autoindex_direct_execution_parents_1",
+                              "sqlite_autoindex_direct_execution_parents_2",
+                              "sqlite_autoindex_direct_execution_parent_operations_1",
+                              "sqlite_autoindex_direct_execution_rollover_evidence_1",
+                              "sqlite_autoindex_direct_execution_parent_cancel_targets_1"})
+        if schema_version >= 14:
+            from .account_observation_journal import _ACCOUNT_FACT_DDL
+            from .strategy_financial_ledger import _STRATEGY_FINANCIAL_DDL
+            expected.update(_ACCOUNT_FACT_DDL)
+            expected.update(_STRATEGY_FINANCIAL_DDL)
+            automatic.update({'sqlite_autoindex_account_fact_stream_meta_1',
+                              'sqlite_autoindex_account_fact_stream_consumers_1',
+                              'sqlite_autoindex_strategy_financial_snapshots_1'})
+        if schema_version >= 15:
+            from .delegate_actor_stream import _ACTOR_STREAM_DDL
+            expected.update(_ACTOR_STREAM_DDL)
+            automatic.add('sqlite_autoindex_direct_actor_stream_consumers_1')
+        if schema_version >= 16:
+            from .direct_strategy_origin import _STRATEGY_ORIGIN_DDL
+            expected.update(_STRATEGY_ORIGIN_DDL)
+            automatic.update({'sqlite_autoindex_direct_strategy_origins_1', 'sqlite_autoindex_direct_strategy_origins_2'})
+        if schema_version >= 17:
+            from .direct_control_cancel import _CONTROL_CANCEL_DDL
+            expected.update(_CONTROL_CANCEL_DDL)
+            automatic.update({'sqlite_autoindex_direct_control_cancel_proofs_1', 'sqlite_autoindex_direct_control_cancel_proofs_2'})
+        if schema_version >= 18:
+            from .account_fact_consumer_ownership import ACCOUNT_FACT_OWNER_DDL
+            from .account_fact_compaction import ACCOUNT_FACT_COMPACTION_DDL
+            expected.update(ACCOUNT_FACT_OWNER_DDL)
+            expected.update(ACCOUNT_FACT_COMPACTION_DDL)
+            automatic.update({'sqlite_autoindex_account_fact_consumer_owners_1',
+                              'sqlite_autoindex_account_fact_compaction_meta_1',
+                              'sqlite_autoindex_account_fact_compaction_items_1',
+                              'sqlite_autoindex_account_fact_compaction_items_2',
+                              'sqlite_autoindex_account_fact_snapshot_offers_1'})
+        if schema_version >= 19:
+            from .account_event_consumer_ownership import ACCOUNT_EVENT_OWNER_DDL
+            expected.update(ACCOUNT_EVENT_OWNER_DDL)
+            automatic.add('sqlite_autoindex_account_event_consumer_owners_1')
         actual = {row[0] for row in db.execute("SELECT name FROM sqlite_master")}
         if actual != set(expected) | automatic:
             raise DirectCommandJournalError("INVALID_DATABASE")
@@ -1289,12 +1457,18 @@ class GatewayDirectCommandJournal:
         *,
         ttl_seconds: float = 10.0,
         reservation_fence: Callable[[], ContextManager[None]] | None = None,
+        delegation_permit: object | None = None,
+        strategy_origin_permit: object | None = None,
+        origin_trading_fence: Callable[[], ContextManager[None]] | None = None,
+        before_reservation_commit: Callable[[], None] | None = None,
     ) -> DirectCommandRecord:
         """Create a reservation; repeated keys never renew its original TTL.
 
         TTL is a first-creation lifecycle option, not part of the payload digest.
         The optional trusted local fence stays held through the SQLite commit;
         it must not perform native or network I/O. Existing keys bypass it.
+        The optional owner-provided admission recheck runs inside the same
+        transaction after a new insert, and exceptions roll back that insert.
         """
         strategy, request_key, principal = map(_text, (strategy, request_key, principal))
         if (
@@ -1306,9 +1480,55 @@ class GatewayDirectCommandJournal:
             raise DirectCommandJournalError("INVALID_TTL")
         encoded = _json(payload)
         digest = hashlib.sha256(encoded.encode("ascii")).hexdigest()
+        delegated = None
+        if delegation_permit is not None:
+            from .direct_delegation import GatewayDelegationPermit
+            if type(delegation_permit) is not GatewayDelegationPermit or self._schema_version < 12:
+                raise DirectCommandJournalError("DELEGATION_UNAVAILABLE")
+            delegated = delegation_permit.command
+            if (delegation_permit.operation != "direct.reserve"
+                    or delegated.account_scope != self._account
+                    or delegated.strategy_scope != strategy or delegated.request_key != request_key
+                    or delegated.actor_principal != principal or delegated.payload_digest != digest):
+                raise DirectCommandJournalError("DELEGATION_MISMATCH")
         if reservation_fence is not None and not callable(reservation_fence):
             raise DirectCommandJournalError("INVALID_INPUT")
-        with ExitStack() as fence_stack, self._transaction() as db:
+        if before_reservation_commit is not None and not callable(before_reservation_commit):
+            raise DirectCommandJournalError("INVALID_INPUT")
+        if strategy_origin_permit is not None:
+            from .direct_strategy_origin import GatewayStrategyOriginPermit
+            if (self._schema_version < 16 or type(strategy_origin_permit) is not GatewayStrategyOriginPermit
+                    or delegation_permit is not None or not callable(reservation_fence)):
+                raise DirectCommandJournalError('STRATEGY_ORIGIN_UNAVAILABLE')
+            origin = strategy_origin_permit.binding
+            if (origin.account != self._account or origin.journal_id != self._journal_id
+                    or origin.generation != self._generation or origin.strategy != strategy
+                    or origin.request_key != request_key or origin.principal != principal or origin.payload_digest != digest):
+                raise DirectCommandJournalError('STRATEGY_ORIGIN_MISMATCH')
+        if origin_trading_fence is not None and (strategy_origin_permit is None or not callable(origin_trading_fence)):
+            raise DirectCommandJournalError('STRATEGY_ORIGIN_UNAVAILABLE')
+        if delegated is not None and reservation_fence is None:
+            # The Registry-issued admission must remain held through commit,
+            # including an idempotent re-observation of an existing key.
+            raise DirectCommandJournalError("DELEGATION_FENCE_REQUIRED")
+        needs_capacity_fence = self._unknown_capacity_needed(strategy, payload, existing_key=request_key)
+        with ExitStack() as fence_stack, ExitStack() as transaction_stack:
+            if delegation_permit is not None or strategy_origin_permit is not None:
+                manager = reservation_fence()
+                enter, exit_ = type(manager).__enter__, type(manager).__exit__
+                enter(manager)
+                fence_stack.push(lambda *exc: (exit_(manager, *exc), False)[1])
+            if needs_capacity_fence:
+                self._assert_account_guard(self._unknown_capacity_guard)
+                manager = self._unknown_capacity_ports[0]()
+                enter, exit_ = type(manager).__enter__, type(manager).__exit__
+                enter(manager)
+                fence_stack.push(lambda *exc: (exit_(manager, *exc), False)[1])
+            db = transaction_stack.enter_context(self._transaction())
+            if delegation_permit is not None:
+                delegation_permit.recheck(db)
+            if strategy_origin_permit is not None:
+                strategy_origin_permit.recheck(db)
             row = self._find(db, strategy, request_key)
             if row is not None:
                 if (
@@ -1317,14 +1537,43 @@ class GatewayDirectCommandJournal:
                     or row["payload_json"] != encoded
                 ):
                     raise DirectCommandJournalError("REQUEST_CONFLICT")
+                if self._schema_version >= 12:
+                    prior = db.execute(
+                        "SELECT envelope_json,envelope_digest FROM direct_delegated_commands "
+                        "WHERE account=? AND strategy=? AND request_key=?",
+                        (self._account, strategy, request_key),
+                    ).fetchone()
+                    if ((delegated is None) != (prior is None)
+                            or (delegated is not None and
+                                (prior["envelope_json"] != delegated.canonical_json
+                                 or prior["envelope_digest"] != delegated.digest))):
+                        raise DirectCommandJournalError("REQUEST_CONFLICT")
+                if delegation_permit is not None:
+                    delegation_permit.recheck(db)
+                if strategy_origin_permit is not None:
+                    strategy_origin_permit.recheck(db)
                 return self._record(row)
-            if reservation_fence is not None:
+            if self._schema_version >= 16 and delegated is None and strategy_origin_permit is None:
+                raise DirectCommandJournalError('STRATEGY_ORIGIN_UNAVAILABLE')
+            if origin_trading_fence is not None:
+                manager = origin_trading_fence()
+                enter, exit_ = type(manager).__enter__, type(manager).__exit__
+                enter(manager)
+                fence_stack.push(lambda *exc: (exit_(manager, *exc), False)[1])
+            if self._schema_version >= 10:
+                from .direct_control import check_controls
+                check_controls(db, self._account, strategy, payload,
+                               allow_verified_close=lambda: self._allow_verified_close(db, strategy, payload))
+            if reservation_fence is not None and delegated is None and strategy_origin_permit is None:
                 manager = reservation_fence()
                 # Ignore a context manager's suppression result: a failed
                 # transaction must never be reported as a successful reserve.
                 enter, exit_ = type(manager).__enter__, type(manager).__exit__
                 enter(manager)
                 fence_stack.push(lambda *exc: (exit_(manager, *exc), False)[1])
+            self._check_unknown_scope(db, strategy, payload, capacity_fenced=needs_capacity_fence)
+            self._check_strategy_capacity(db, strategy, payload)
+            self._assert_monitor_gate(db, strategy, payload)
             if (
                 db.execute(
                     "SELECT count(*) FROM direct_journal_commands WHERE account=?", (self._account,)
@@ -1337,13 +1586,14 @@ class GatewayDirectCommandJournal:
             ):
                 raise DirectCommandJournalError("CAPACITY_EXCEEDED")
             now = self._now()
+            reservation_id = str(uuid.uuid4())
             db.execute(
                 "INSERT INTO direct_journal_commands VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'RESERVED', 1, NULL, NULL)",
                 (
                     self._account,
                     strategy,
                     request_key,
-                    str(uuid.uuid4()),
+                    reservation_id,
                     principal,
                     digest,
                     encoded,
@@ -1351,8 +1601,759 @@ class GatewayDirectCommandJournal:
                     now + ttl_seconds,
                 ),
             )
+            if delegated is not None:
+                db.execute(
+                    "INSERT INTO direct_delegated_commands VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (self._account, strategy, request_key, reservation_id, principal,
+                     delegated.canonical_json, delegated.digest),
+                )
+            if strategy_origin_permit is not None:
+                from .direct_strategy_origin import append_strategy_origin
+                append_strategy_origin(db, strategy_origin_permit, reservation_id)
             self._bump(db)
-            return self._record(self._require(db, strategy, request_key, principal))
+            self._check_unknown_scope(db, strategy, payload, exclude_reservation_id=reservation_id, capacity_fenced=needs_capacity_fence)
+            self._check_strategy_capacity(db, strategy, payload, exclude_reservation_id=reservation_id)
+            if self._schema_version >= 10:
+                check_controls(db, self._account, strategy, payload,
+                               allow_verified_close=lambda: self._allow_verified_close(
+                                   db, strategy, payload, exclude_reservation_id=reservation_id))
+            self._assert_monitor_gate(db, strategy, payload, exclude_reservation_id=reservation_id)
+            if delegation_permit is not None:
+                delegation_permit.recheck(db)
+            if strategy_origin_permit is not None:
+                strategy_origin_permit.recheck(db)
+            result = self._record(self._require(db, strategy, request_key, principal))
+            if before_reservation_commit is not None:
+                before_reservation_commit()
+            return result
+
+    def enable_controls(self, guard: LocalAccountSessionGuard):
+        """Explicitly upgrade an audited v9 journal under its live account guard."""
+        from .direct_control import _CONTROL_DDL, GatewayDirectControl
+        if self._schema_version != 9 or type(guard) is not LocalAccountSessionGuard:
+            raise DirectCommandJournalError("CONTROL_UPGRADE_REQUIRED")
+        guard.assert_owned()
+        if (guard.account_key_digest != hashlib.sha256(self._account.encode("utf-8")).hexdigest()
+                or guard.acquire() != self._generation):
+            raise DirectCommandJournalError("GUARD_BINDING_MISMATCH")
+        with self._transaction() as db:
+            self._verify_v2_upgrade_integrity(db, schema_version=9)
+            self._verify_v4_identity_integrity(db)
+            from .direct_execution_journal import _verify_execution_integrity, _verify_consumer_integrity, _verify_cancel_error_integrity, _verify_place_error_integrity
+            from .direct_cancel_journal import _verify_cancel_integrity
+            from .direct_place_journal import _verify_place_integrity
+            _verify_execution_integrity(db, self._account, self._execution_max_facts)
+            _verify_consumer_integrity(db, self._account)
+            _verify_cancel_integrity(db, self._account, self._max_records)
+            _verify_cancel_error_integrity(db, self._account, self._execution_max_facts)
+            _verify_place_integrity(db, self._account, self._max_records)
+            _verify_place_error_integrity(db, self, self._execution_max_facts)
+            for ddl in _CONTROL_DDL.values():
+                db.execute(ddl)
+            db.execute("UPDATE direct_journal_meta SET schema_version=10,revision=revision+1 WHERE account=?", (self._account,))
+            guard.assert_owned()
+        self._schema_version = 10
+        return GatewayDirectControl(self, guard)
+
+    def _assert_account_guard(self, guard: LocalAccountSessionGuard) -> None:
+        if type(guard) is not LocalAccountSessionGuard:
+            raise DirectCommandJournalError("INVALID_GUARD")
+        guard.assert_owned()
+        if (guard.account_key_digest != hashlib.sha256(self._account.encode("utf-8")).hexdigest()
+                or guard.acquire() != self._generation):
+            raise DirectCommandJournalError("GUARD_BINDING_MISMATCH")
+
+    def enable_strategy_ledger(self, guard: LocalAccountSessionGuard) -> None:
+        """Explicitly add the empty v11 baseline table under the account guard.
+
+        This does not assert an empty account or initialize its baseline.
+        The existing v10 journal, including every control row, is fully audited
+        inside the upgrade transaction before any DDL is changed.
+        """
+        if self._schema_version != 10:
+            raise DirectCommandJournalError("STRATEGY_LEDGER_UPGRADE_REQUIRED")
+        self._assert_account_guard(guard)
+        with self._transaction() as db:
+            self._verify_v2_upgrade_integrity(db, schema_version=10)
+            self._verify_v4_identity_integrity(db)
+            from .direct_execution_journal import (
+                _verify_cancel_error_integrity, _verify_consumer_integrity,
+                _verify_execution_integrity, _verify_place_error_integrity,
+            )
+            from .direct_cancel_journal import _verify_cancel_integrity
+            from .direct_place_journal import _verify_place_integrity
+            from .direct_control import verify_controls
+            from .strategy_position_ledger import _create_strategy_ledger_tables
+
+            _verify_execution_integrity(db, self._account, self._execution_max_facts)
+            _verify_consumer_integrity(db, self._account)
+            _verify_cancel_integrity(db, self._account, self._max_records)
+            _verify_cancel_error_integrity(db, self._account, self._execution_max_facts)
+            _verify_place_integrity(db, self._account, self._max_records)
+            _verify_place_error_integrity(db, self, self._execution_max_facts)
+            verify_controls(db, self._account, self._max_records)
+            self._assert_account_guard(guard)
+            _create_strategy_ledger_tables(db)
+            db.execute("UPDATE direct_journal_meta SET schema_version=11,revision=revision+1 WHERE account=?", (self._account,))
+            self._assert_account_guard(guard)
+        self._schema_version = 11
+
+    def enable_account_extensions(self, guard: LocalAccountSessionGuard) -> None:
+        """Explicitly upgrade an audited v11 journal; no grant or baseline is created."""
+        if self._schema_version != 11:
+            raise DirectCommandJournalError("ACCOUNT_EXTENSIONS_UPGRADE_REQUIRED")
+        self._assert_account_guard(guard)
+        with self._transaction() as db:
+            self._verify_v2_upgrade_integrity(db, schema_version=11)
+            self._verify_v4_identity_integrity(db)
+            from .direct_execution_journal import (
+                _verify_cancel_error_integrity, _verify_consumer_integrity,
+                _verify_execution_integrity, _verify_place_error_integrity,
+            )
+            from .direct_cancel_journal import _verify_cancel_integrity
+            from .direct_place_journal import _verify_place_integrity
+            from .direct_control import verify_controls
+            from .strategy_position_ledger import _verify_strategy_ledger_integrity
+            from .direct_delegation import _DELEGATION_DDL
+            from .external_position_ledger import _EXTERNAL_LEDGER_DDL
+            from .account_observer import _ACCOUNT_OBSERVER_DDL
+
+            _verify_execution_integrity(db, self._account, self._execution_max_facts)
+            _verify_consumer_integrity(db, self._account)
+            _verify_cancel_integrity(db, self._account, self._max_records)
+            _verify_cancel_error_integrity(db, self._account, self._execution_max_facts)
+            _verify_place_integrity(db, self, self._max_records)
+            _verify_place_error_integrity(db, self, self._execution_max_facts)
+            verify_controls(db, self._account, self._max_records)
+            _verify_strategy_ledger_integrity(db, self._account)
+            self._assert_account_guard(guard)
+            for ddl in (*_DELEGATION_DDL.values(), *_EXTERNAL_LEDGER_DDL.values(), *_ACCOUNT_OBSERVER_DDL.values()):
+                db.execute(ddl)
+            db.execute("UPDATE direct_journal_meta SET schema_version=12,revision=revision+1 WHERE account=?", (self._account,))
+            self._assert_account_guard(guard)
+        self._schema_version = 12
+
+    def enable_parent_authority(self, guard: LocalAccountSessionGuard) -> None:
+        """Explicitly upgrade an audited v12 journal to an empty parent authority."""
+        if self._schema_version != 12:
+            raise DirectCommandJournalError("PARENT_AUTHORITY_UPGRADE_REQUIRED")
+        self._assert_account_guard(guard)
+        with self._transaction() as db:
+            self._verify_v2_upgrade_integrity(db, schema_version=12)
+            self._verify_v4_identity_integrity(db)
+            from .direct_execution_journal import (
+                _verify_cancel_error_integrity, _verify_consumer_integrity,
+                _verify_execution_integrity, _verify_place_error_integrity,
+            )
+            from .direct_cancel_journal import _verify_cancel_integrity
+            from .direct_place_journal import _verify_place_integrity
+            from .direct_control import verify_controls
+            from .strategy_position_ledger import _verify_strategy_ledger_integrity
+            from .direct_parent_authority import _PARENT_AUTHORITY_DDL
+
+            _verify_execution_integrity(db, self._account, self._execution_max_facts)
+            _verify_consumer_integrity(db, self._account)
+            _verify_cancel_integrity(db, self._account, self._max_records)
+            _verify_cancel_error_integrity(db, self._account, self._execution_max_facts)
+            _verify_place_integrity(db, self, self._max_records)
+            _verify_place_error_integrity(db, self, self._execution_max_facts)
+            verify_controls(db, self._account, self._max_records)
+            _verify_strategy_ledger_integrity(db, self._account)
+            self._assert_account_guard(guard)
+            for ddl in _PARENT_AUTHORITY_DDL.values():
+                db.execute(ddl)
+            db.execute("UPDATE direct_journal_meta SET schema_version=13,revision=revision+1 WHERE account=?", (self._account,))
+            self._assert_account_guard(guard)
+        self._schema_version = 13
+
+    def enable_account_facts_financial(self, guard: LocalAccountSessionGuard) -> None:
+        """Explicit v13 upgrade; bootstrap current facts, never fabricate prior history."""
+        if self._schema_version != 13:
+            raise DirectCommandJournalError('ACCOUNT_FACTS_FINANCIAL_UPGRADE_REQUIRED')
+        self._assert_account_guard(guard)
+        with self._transaction() as db:
+            self._verify_v2_upgrade_integrity(db, schema_version=13)
+            self._verify_v4_identity_integrity(db)
+            from .direct_execution_journal import (_verify_cancel_error_integrity, _verify_consumer_integrity,
+                _verify_execution_integrity, _verify_place_error_integrity)
+            from .direct_cancel_journal import _verify_cancel_integrity
+            from .direct_place_journal import _verify_place_integrity
+            from .direct_control import verify_controls
+            from .strategy_position_ledger import _verify_strategy_ledger_integrity
+            from .account_observation_journal import initialize_account_fact_stream
+            from .strategy_financial_ledger import _create_strategy_financial_tables
+            _verify_execution_integrity(db, self._account, self._execution_max_facts)
+            _verify_consumer_integrity(db, self._account)
+            _verify_cancel_integrity(db, self._account, self._max_records)
+            _verify_cancel_error_integrity(db, self._account, self._execution_max_facts)
+            _verify_place_integrity(db, self, self._max_records)
+            _verify_place_error_integrity(db, self, self._execution_max_facts)
+            verify_controls(db, self._account, self._max_records)
+            _verify_strategy_ledger_integrity(db, self._account)
+            self._assert_account_guard(guard)
+            initialize_account_fact_stream(db, self._account, self._journal_id)
+            _create_strategy_financial_tables(db)
+            db.execute('UPDATE direct_journal_meta SET schema_version=14,revision=revision+1 WHERE account=?', (self._account,))
+            self._assert_account_guard(guard)
+        self._schema_version = 14
+
+    def enable_actor_stream(self, guard: LocalAccountSessionGuard) -> None:
+        """Explicit v14 upgrade; actor cursors are independent of all existing streams."""
+        if self._schema_version != 14:
+            raise DirectCommandJournalError('ACTOR_STREAM_UPGRADE_REQUIRED')
+        self._assert_account_guard(guard)
+        with self._transaction() as db:
+            self._verify_v2_upgrade_integrity(db, schema_version=14)
+            self._verify_v4_identity_integrity(db)
+            from .direct_execution_journal import (_verify_cancel_error_integrity, _verify_consumer_integrity,
+                _verify_execution_integrity, _verify_place_error_integrity)
+            from .direct_cancel_journal import _verify_cancel_integrity
+            from .direct_place_journal import _verify_place_integrity
+            from .delegate_actor_stream import _ACTOR_STREAM_DDL
+            _verify_execution_integrity(db, self._account, self._execution_max_facts)
+            _verify_consumer_integrity(db, self._account)
+            _verify_cancel_integrity(db, self._account, self._max_records)
+            _verify_cancel_error_integrity(db, self._account, self._execution_max_facts)
+            _verify_place_integrity(db, self, self._max_records)
+            _verify_place_error_integrity(db, self, self._execution_max_facts)
+            self._assert_account_guard(guard)
+            for ddl in _ACTOR_STREAM_DDL.values():
+                db.execute(ddl)
+            db.execute('UPDATE direct_journal_meta SET schema_version=15,revision=revision+1 WHERE account=?', (self._account,))
+            self._assert_account_guard(guard)
+        self._schema_version = 15
+
+    def enable_strategy_origin(self, guard: LocalAccountSessionGuard) -> None:
+        """Explicit v15 upgrade; historical strategy identities remain unproven."""
+        if self._schema_version != 15:
+            raise DirectCommandJournalError('STRATEGY_ORIGIN_UPGRADE_REQUIRED')
+        self._assert_account_guard(guard)
+        with self._transaction() as db:
+            self._verify_v2_upgrade_integrity(db, schema_version=15)
+            self._verify_v4_identity_integrity(db)
+            from .direct_execution_journal import (_verify_cancel_error_integrity, _verify_consumer_integrity,
+                _verify_execution_integrity, _verify_place_error_integrity)
+            from .direct_cancel_journal import _verify_cancel_integrity
+            from .direct_place_journal import _verify_place_integrity
+            from .direct_strategy_origin import _STRATEGY_ORIGIN_DDL
+            _verify_execution_integrity(db, self._account, self._execution_max_facts)
+            _verify_consumer_integrity(db, self._account)
+            _verify_cancel_integrity(db, self._account, self._max_records)
+            _verify_cancel_error_integrity(db, self._account, self._execution_max_facts)
+            _verify_place_integrity(db, self, self._max_records)
+            _verify_place_error_integrity(db, self, self._execution_max_facts)
+            self._assert_account_guard(guard)
+            for ddl in _STRATEGY_ORIGIN_DDL.values():
+                db.execute(ddl)
+            db.execute('UPDATE direct_journal_meta SET schema_version=16,revision=revision+1 WHERE account=?', (self._account,))
+            self._assert_account_guard(guard)
+        self._schema_version = 16
+
+    def enable_control_cancel(self, guard: LocalAccountSessionGuard) -> None:
+        """Explicit v16 upgrade; existing UNKNOWN claims are not retried."""
+        if self._schema_version != 16:
+            raise DirectCommandJournalError('CONTROL_CANCEL_UPGRADE_REQUIRED')
+        self._assert_account_guard(guard)
+        with self._transaction() as db:
+            self._verify_v2_upgrade_integrity(db, schema_version=16)
+            self._verify_v4_identity_integrity(db)
+            from .direct_execution_journal import (_verify_cancel_error_integrity, _verify_consumer_integrity,
+                _verify_execution_integrity, _verify_place_error_integrity)
+            from .direct_cancel_journal import _verify_cancel_integrity
+            from .direct_place_journal import _verify_place_integrity
+            from .direct_control_cancel import _CONTROL_CANCEL_DDL
+            _verify_execution_integrity(db, self._account, self._execution_max_facts)
+            _verify_consumer_integrity(db, self._account)
+            _verify_cancel_integrity(db, self._account, self._max_records)
+            _verify_cancel_error_integrity(db, self._account, self._execution_max_facts)
+            _verify_place_integrity(db, self, self._max_records)
+            _verify_place_error_integrity(db, self, self._execution_max_facts)
+            self._assert_account_guard(guard)
+            for ddl in _CONTROL_CANCEL_DDL.values():
+                db.execute(ddl)
+            db.execute('UPDATE direct_journal_meta SET schema_version=17,revision=revision+1 WHERE account=?', (self._account,))
+            self._assert_account_guard(guard)
+        self._schema_version = 17
+
+    def enable_account_fact_recovery(self, guard: LocalAccountSessionGuard) -> None:
+        """Explicit v17 upgrade; retain all existing observations and ACKs."""
+        if self._schema_version != 17:
+            raise DirectCommandJournalError('ACCOUNT_FACT_RECOVERY_UPGRADE_REQUIRED')
+        self._assert_account_guard(guard)
+        with self._transaction() as db:
+            self._verify_v2_upgrade_integrity(db, schema_version=17)
+            self._verify_v4_identity_integrity(db)
+            from .direct_execution_journal import (_verify_cancel_error_integrity, _verify_consumer_integrity,
+                _verify_execution_integrity, _verify_place_error_integrity)
+            from .direct_cancel_journal import _verify_cancel_integrity
+            from .direct_place_journal import _verify_place_integrity
+            from .account_fact_consumer_ownership import ACCOUNT_FACT_OWNER_DDL
+            from .account_fact_compaction import initialize_account_fact_compaction
+            _verify_execution_integrity(db, self._account, self._execution_max_facts)
+            _verify_consumer_integrity(db, self._account)
+            _verify_cancel_integrity(db, self._account, self._max_records)
+            _verify_cancel_error_integrity(db, self._account, self._execution_max_facts)
+            _verify_place_integrity(db, self, self._max_records)
+            _verify_place_error_integrity(db, self, self._execution_max_facts)
+            self._assert_account_guard(guard)
+            initialize_account_fact_compaction(db, self._account, self._journal_id)
+            for ddl in ACCOUNT_FACT_OWNER_DDL.values():
+                db.execute(ddl)
+            db.execute('UPDATE direct_journal_meta SET schema_version=18,revision=revision+1 WHERE account=?', (self._account,))
+            self._assert_account_guard(guard)
+        self._schema_version = 18
+
+    def enable_account_event_recovery(self, guard: LocalAccountSessionGuard) -> None:
+        """Explicit v18 upgrade; preserve prior event offers and durable ACKs."""
+        if self._schema_version != 18:
+            raise DirectCommandJournalError('ACCOUNT_EVENT_RECOVERY_UPGRADE_REQUIRED')
+        self._assert_account_guard(guard)
+        with self._transaction() as db:
+            self._verify_v2_upgrade_integrity(db, schema_version=18)
+            self._verify_v4_identity_integrity(db)
+            from .direct_execution_journal import (_verify_cancel_error_integrity, _verify_consumer_integrity,
+                _verify_execution_integrity, _verify_place_error_integrity)
+            from .direct_cancel_journal import _verify_cancel_integrity
+            from .direct_place_journal import _verify_place_integrity
+            from .account_event_consumer_ownership import ACCOUNT_EVENT_OWNER_DDL
+            _verify_execution_integrity(db, self._account, self._execution_max_facts)
+            _verify_consumer_integrity(db, self._account)
+            _verify_cancel_integrity(db, self._account, self._max_records)
+            _verify_cancel_error_integrity(db, self._account, self._execution_max_facts)
+            _verify_place_integrity(db, self, self._max_records)
+            _verify_place_error_integrity(db, self, self._execution_max_facts)
+            self._assert_account_guard(guard)
+            for ddl in ACCOUNT_EVENT_OWNER_DDL.values():
+                db.execute(ddl)
+            db.execute('UPDATE direct_journal_meta SET schema_version=19,revision=revision+1 WHERE account=?', (self._account,))
+            self._assert_account_guard(guard)
+        self._schema_version = 19
+
+    def install_monitor_gate(self, gate: Callable[[], bool], *, guard: LocalAccountSessionGuard) -> None:
+        """Install the required-monitor owner's local, nonblocking write gate.
+
+        Never pass a wire request callback here. Once installed, the same
+        callable cannot be replaced to silently bypass a failed required gate.
+        """
+        self._assert_account_guard(guard)
+        if not callable(gate):
+            raise DirectCommandJournalError("INVALID_INPUT")
+        if self._monitor_gate is not None:
+            if self._monitor_gate is not gate or self._monitor_guard is not guard:
+                raise DirectCommandJournalError("MONITOR_GATE_ALREADY_BOUND")
+            return
+        self._monitor_gate, self._monitor_guard = gate, guard
+
+    def _assert_monitor_gate(self, db: sqlite3.Connection, strategy: str, payload: object,
+                             *, exclude_reservation_id: str | None = None) -> None:
+        if self._monitor_gate is None:
+            return
+        self._assert_account_guard(self._monitor_guard)
+        try:
+            allowed = self._monitor_gate()
+        except Exception:
+            allowed = False
+        if allowed is not True and not self._allow_verified_close(
+                db, strategy, payload, exclude_reservation_id=exclude_reservation_id):
+            raise DirectCommandJournalError("CONTROL_STOP_NEW")
+
+    def install_strategy_ledger_ports(
+        self, *, guard: LocalAccountSessionGuard, resolve_binding: Callable,
+        current_trading_day: Callable, verify_day_transition: Callable,
+        verify_current_continuity: Callable, verify_external_current: Callable | None = None,
+    ) -> None:
+        """Bind trusted local contract/day authorities to this account owner.
+
+        These callbacks must be nonblocking local checks; they may not perform
+        network or provider I/O while the SQLite write transaction is held.
+        """
+        if self._schema_version < 11:
+            raise DirectCommandJournalError("STRATEGY_LEDGER_UPGRADE_REQUIRED")
+        if verify_external_current is not None and self._schema_version < 12:
+            raise DirectCommandJournalError("ACCOUNT_EXTENSIONS_UPGRADE_REQUIRED")
+        self._assert_account_guard(guard)
+        ports = (resolve_binding, current_trading_day, verify_day_transition, verify_current_continuity)
+        if (not all(callable(port) for port in ports)
+                or (verify_external_current is not None and not callable(verify_external_current))):
+            raise DirectCommandJournalError("INVALID_INPUT")
+        if self._strategy_ledger_ports is not None:
+            if (any(old is not new for old, new in zip(self._strategy_ledger_ports, ports))
+                    or self._strategy_ledger_guard is not guard
+                    or self._strategy_external_verifier is not verify_external_current):
+                raise DirectCommandJournalError("STRATEGY_LEDGER_ALREADY_BOUND")
+            return
+        self._strategy_ledger_ports, self._strategy_ledger_guard = ports, guard
+        self._strategy_external_verifier = verify_external_current
+
+    def initialize_empty_strategy_ledger(
+        self, evidence: object, *, guard: LocalAccountSessionGuard,
+        baseline_fence: Callable[[], ContextManager[None]], verify_current_empty: Callable,
+    ) -> None:
+        """Initialize once under a trusted same-cut provider fence held to commit.
+
+        A verified empty result must cover the entire account's positions and
+        open orders. No installed provider verifier currently supplies that
+        proof; clients and configuration cannot supply this authority.
+        """
+        if self._schema_version < 11 or not callable(baseline_fence):
+            raise DirectCommandJournalError("STRATEGY_LEDGER_UNAVAILABLE")
+        self._assert_account_guard(guard)
+        from .strategy_position_ledger import StrategyBaselineEvidence, initialize_empty_strategy_baseline
+        if (type(evidence) is not StrategyBaselineEvidence or evidence.account_scope != self._account
+                or evidence.journal_id != self._journal_id or evidence.owner_generation != self._generation):
+            raise DirectCommandJournalError("STRATEGY_LEDGER_UNAVAILABLE")
+        with ExitStack() as fence_stack, self._transaction() as db:
+            manager = baseline_fence()
+            enter, exit_ = type(manager).__enter__, type(manager).__exit__
+            enter(manager)
+            fence_stack.push(lambda *exc: (exit_(manager, *exc), False)[1])
+            before = db.execute("SELECT 1 FROM strategy_position_baseline WHERE account=?", (self._account,)).fetchone()
+            initialize_empty_strategy_baseline(db, evidence, verify_current_empty=verify_current_empty)
+            if before is None:
+                self._bump(db)
+            self._assert_account_guard(guard)
+
+    def initialize_external_strategy_ledger(
+        self, evidence: object, *, guard: LocalAccountSessionGuard,
+        baseline_fence: Callable[[], ContextManager[None]], verify_authorized_snapshot: Callable,
+    ) -> None:
+        """Install operator-authorized external holdings under the owner fence.
+
+        The installed verifier must authenticate the operator and the complete
+        provider snapshot at one comparable cut, held until transaction commit.
+        """
+        if self._schema_version < 11 or not callable(baseline_fence):
+            raise DirectCommandJournalError("STRATEGY_LEDGER_UNAVAILABLE")
+        self._assert_account_guard(guard)
+        from .strategy_position_ledger import StrategyBaselineEvidence, initialize_external_strategy_baseline
+        if (type(evidence) is not StrategyBaselineEvidence or evidence.account_scope != self._account
+                or evidence.journal_id != self._journal_id or evidence.owner_generation != self._generation):
+            raise DirectCommandJournalError("STRATEGY_LEDGER_UNAVAILABLE")
+        with ExitStack() as fence_stack, self._transaction() as db:
+            manager = baseline_fence()
+            enter, exit_ = type(manager).__enter__, type(manager).__exit__
+            enter(manager)
+            fence_stack.push(lambda *exc: (exit_(manager, *exc), False)[1])
+            before = db.execute("SELECT 1 FROM strategy_position_baseline WHERE account=?", (self._account,)).fetchone()
+            initialize_external_strategy_baseline(db, evidence, verify_authorized_snapshot=verify_authorized_snapshot)
+            if before is None:
+                self._bump(db)
+            self._assert_account_guard(guard)
+
+    def install_unknown_close_capacity(self, *, guard: LocalAccountSessionGuard, source_fence: Callable,
+                                       verify_other_close_capacity: Callable):
+        """Install owner-only same-cut proof; an absent proof conservatively blocks."""
+        if not callable(source_fence) or not callable(verify_other_close_capacity):
+            raise DirectCommandJournalError('UNKNOWN_SCOPE_UNAVAILABLE')
+        self._assert_account_guard(guard)
+        ports = (source_fence, verify_other_close_capacity)
+        if self._unknown_capacity_ports is not None:
+            if self._unknown_capacity_ports != ports or self._unknown_capacity_guard is not guard:
+                raise DirectCommandJournalError('UNKNOWN_SCOPE_ALREADY_BOUND')
+            return
+        self._unknown_capacity_ports, self._unknown_capacity_guard = ports, guard
+
+    def _unknown_capacity_needed(self, strategy, payload, *, existing_key=None, exclude_reservation_id=None):
+        if (self._unknown_capacity_ports is None or type(payload) is not dict
+                or payload.get('offset') not in {'close', 'close_today', 'close_yesterday'}):
+            return False
+        with self._transaction() as db:
+            if existing_key is not None and self._find(db, strategy, existing_key) is not None:
+                return False
+            try:
+                self._check_unknown_scope(db, strategy, payload, exclude_reservation_id=exclude_reservation_id)
+            except DirectCommandJournalError as exc:
+                if exc.code == 'SYSTEM_ORDER_UNKNOWN':
+                    return True
+                raise
+        return False
+
+    def _check_unknown_scope(self, db, strategy, payload, *, exclude_reservation_id=None, capacity_fenced=False):
+        from .unknown_order_scope import check_unknown_order_scope
+        resolver = None if self._strategy_ledger_ports is None else self._strategy_ledger_ports[0]
+        verifier = None
+        if capacity_fenced:
+            self._assert_account_guard(self._unknown_capacity_guard)
+            verifier = self._unknown_capacity_ports[1]
+        check_unknown_order_scope(db, self._account, strategy, payload, resolve_binding=resolver,
+                                  exclude_reservation_id=exclude_reservation_id,
+                                  verify_other_close_capacity=verifier)
+
+    def _check_strategy_capacity(self, db: sqlite3.Connection, strategy: str, payload: object,
+                                 *, exclude_reservation_id: str | None = None) -> None:
+        if self._schema_version < 11:
+            return
+        if type(payload) is not dict:
+            raise DirectCommandJournalError("STRATEGY_LEDGER_UNAVAILABLE")
+        offset = payload.get("offset")
+        if offset == "open":
+            return
+        if offset not in {"close", "close_today", "close_yesterday"} or self._strategy_ledger_ports is None:
+            raise DirectCommandJournalError("STRATEGY_LEDGER_UNAVAILABLE")
+        self._assert_account_guard(self._strategy_ledger_guard)
+        resolve_binding, current_day, verify_transition, verify_continuity = self._strategy_ledger_ports
+        try:
+            binding = resolve_binding(payload)
+            day = current_day()
+        except Exception as exc:
+            raise DirectCommandJournalError("STRATEGY_LEDGER_UNAVAILABLE") from exc
+        from .strategy_position_ledger import check_strategy_close
+        check_strategy_close(db, self._account, strategy, payload, trading_day=day,
+                             instrument_binding=binding, resolve_binding=resolve_binding,
+                             verify_day_transition=verify_transition,
+                             verify_current_continuity=verify_continuity,
+                             verify_external_current=self._strategy_external_verifier,
+                             exclude_reservation_id=exclude_reservation_id)
+
+    def _allow_verified_close(self, db: sqlite3.Connection, strategy: str, payload: object,
+                              *, exclude_reservation_id: str | None = None) -> bool:
+        """A request label alone cannot qualify for a STOP_NEW exception."""
+        if (self._schema_version < 11 or self._strategy_ledger_ports is None
+                or type(payload) is not dict
+                or payload.get("offset") not in {"close", "close_today", "close_yesterday"}):
+            return False
+        self._check_strategy_capacity(db, strategy, payload,
+                                      exclude_reservation_id=exclude_reservation_id)
+        return True
+
+    def record_verified_external_fact(
+        self, fact_digest: str, evidence: object, *, guard: LocalAccountSessionGuard,
+        source_fence: Callable[[], ContextManager[None]], verify_source_and_exclusion: Callable,
+    ) -> bool:
+        """Record a classified external fact under an installed owner's source fence.
+
+        Never expose the callbacks or evidence authority to an RPC peer.
+        """
+        from .external_position_ledger import ExternalFactEvidence, record_external_fact
+        if (self._schema_version < 12 or type(evidence) is not ExternalFactEvidence
+                or evidence.account_scope != self._account or evidence.journal_id != self._journal_id
+                or evidence.owner_generation != self._generation or not callable(source_fence)
+                or not callable(verify_source_and_exclusion)):
+            raise DirectCommandJournalError("EXTERNAL_LEDGER_UNAVAILABLE")
+        self._assert_account_guard(guard)
+        with ExitStack() as stack:
+            manager = source_fence()
+            enter, exit_ = type(manager).__enter__, type(manager).__exit__
+            enter(manager)
+            stack.push(lambda *exc: (exit_(manager, *exc), False)[1])
+            db = stack.enter_context(self._transaction())
+            changed = record_external_fact(db, self._account, fact_digest, evidence,
+                                           verify_source_and_exclusion=verify_source_and_exclusion)
+            if changed:
+                if self._schema_version >= 14:
+                    from .account_observation_journal import append_account_fact
+                    append_account_fact(db, self._account, fact_digest)
+                self._bump(db)
+            self._assert_account_guard(guard)
+            return changed
+
+    def install_account_comparison_ports(
+        self, *, guard: LocalAccountSessionGuard, source_fence: Callable,
+        read_account_cut: Callable, verify_account_cut: Callable,
+        verify_external_current: Callable, verify_external_cut_current: Callable,
+    ) -> None:
+        """Install nonblocking trusted owner ports; this grants no network ACL."""
+        if self._schema_version < 12:
+            raise DirectCommandJournalError("ACCOUNT_EXTENSIONS_UPGRADE_REQUIRED")
+        self._assert_account_guard(guard)
+        ports = (source_fence, read_account_cut, verify_account_cut,
+                 verify_external_current, verify_external_cut_current)
+        if not all(callable(port) for port in ports):
+            raise DirectCommandJournalError("INVALID_INPUT")
+        if self._account_comparison_ports is not None:
+            if (any(old is not new for old, new in zip(self._account_comparison_ports, ports))
+                    or self._account_comparison_guard is not guard):
+                raise DirectCommandJournalError("ACCOUNT_COMPARISON_ALREADY_BOUND")
+            return
+        self._account_comparison_ports, self._account_comparison_guard = ports, guard
+
+    def install_strategy_financial_port(self, *, guard: LocalAccountSessionGuard, source_fence: Callable) -> None:
+        """Install a trusted same-cut source fence; remote values are not authority."""
+        if self._schema_version < 14 or not callable(source_fence):
+            raise DirectCommandJournalError('STRATEGY_FINANCIAL_UNAVAILABLE')
+        self._assert_account_guard(guard)
+        if self._strategy_financial_port is not None:
+            if self._strategy_financial_port is not source_fence or self._strategy_financial_guard is not guard:
+                raise DirectCommandJournalError('STRATEGY_FINANCIAL_ALREADY_BOUND')
+            return
+        self._strategy_financial_port, self._strategy_financial_guard = source_fence, guard
+
+    def append_strategy_financial(self, snapshot, *, guard: LocalAccountSessionGuard) -> bool:
+        from .strategy_financial_ledger import StrategyFinancialSnapshot, append_financial_snapshot
+        if (self._schema_version < 14 or self._strategy_financial_port is None
+                or guard is not self._strategy_financial_guard or type(snapshot) is not StrategyFinancialSnapshot
+                or snapshot.account != self._account or snapshot.journal_id != self._journal_id
+                or snapshot.owner_generation != self._generation):
+            raise DirectCommandJournalError('STRATEGY_FINANCIAL_UNAVAILABLE')
+        self._assert_account_guard(guard)
+        with ExitStack() as stack:
+            manager = self._strategy_financial_port(self._account, snapshot.strategy, snapshot.currency)
+            check = type(manager).__enter__(manager)
+            exit_ = type(manager).__exit__
+            stack.push(lambda *exc: (exit_(manager, *exc), False)[1])
+            if not callable(check):
+                raise DirectCommandJournalError('STRATEGY_FINANCIAL_UNAVAILABLE')
+            db = stack.enter_context(self._transaction())
+            changed = append_financial_snapshot(db, snapshot, verify_current=check)
+            if check(db, snapshot) is not True:
+                raise DirectCommandJournalError('STRATEGY_FINANCIAL_UNAVAILABLE')
+            if changed:
+                self._bump(db)
+            self._assert_account_guard(guard)
+            return changed
+
+    def read_strategy_financial(self, strategy: str, currency: str, *, admission_fence: Callable):
+        from .strategy_financial_ledger import read_financial_snapshot
+        strategy, currency = _text(strategy), _text(currency)
+        if self._schema_version < 14 or self._strategy_financial_port is None or not callable(admission_fence):
+            raise DirectCommandJournalError('STRATEGY_FINANCIAL_UNAVAILABLE')
+        self._assert_account_guard(self._strategy_financial_guard)
+        with ExitStack() as stack:
+            authority = admission_fence()
+            auth_check = type(authority).__enter__(authority)
+            auth_exit = type(authority).__exit__
+            stack.push(lambda *exc: (auth_exit(authority, *exc), False)[1])
+            source = self._strategy_financial_port(self._account, strategy, currency)
+            check = type(source).__enter__(source)
+            source_exit = type(source).__exit__
+            stack.push(lambda *exc: (source_exit(source, *exc), False)[1])
+            if not callable(auth_check) or not callable(check):
+                raise DirectCommandJournalError('STRATEGY_FINANCIAL_UNAVAILABLE')
+            db = stack.enter_context(self._transaction())
+            auth_check()
+            result = read_financial_snapshot(db, self._account, strategy, currency, verify_current=check)
+            if result.owner_generation != self._generation or check(db, result) is not True:
+                raise DirectCommandJournalError('STRATEGY_FINANCIAL_UNAVAILABLE')
+            auth_check()
+            self._assert_account_guard(self._strategy_financial_guard)
+            return result
+
+    def read_account_net_comparison(self, instrument: object):
+        """Compare one instrument at a provable current cut, otherwise UNAVAILABLE.
+
+        The installed local port, never a wire request, supplies account quantity
+        and cut. A service must separately authorize this account-wide view.
+        """
+        from decimal import Decimal
+        from bt_api_base.market_protocol import MarketInstrumentKey
+        from .external_position_ledger import external_net
+        from .strategy_position_ledger import StrategyInstrumentBinding, StrategyNetComparison, compare_account_net
+
+        unavailable = StrategyNetComparison("UNAVAILABLE", None, None, None, None, None)
+        if (type(instrument) is not MarketInstrumentKey or self._schema_version < 12
+                or self._strategy_ledger_ports is None or self._account_comparison_ports is None):
+            return unavailable
+        fence, read_cut, verify_account, verify_external, verify_external_cut = self._account_comparison_ports
+        resolve_binding, _, verify_transition, verify_continuity = self._strategy_ledger_ports
+        try:
+            self._assert_account_guard(self._account_comparison_guard)
+            with ExitStack() as stack:
+                manager = fence()
+                enter, exit_ = type(manager).__enter__, type(manager).__exit__
+                enter(manager)
+                stack.push(lambda *exc: (exit_(manager, *exc), False)[1])
+                db = stack.enter_context(self._transaction())
+                current = read_cut(db, self._account, instrument)
+                if type(current) is not tuple or len(current) != 4:
+                    return unavailable
+                binding, day, cut, account_net = current
+                if type(binding) is not StrategyInstrumentBinding or binding.instrument != instrument:
+                    return unavailable
+                external = external_net(db, self._account, instrument, trading_day=day, cut=cut,
+                                        verify_current=verify_external_cut)
+
+                def verify_external_value(db_, account_, binding_, day_, cut_, expected_):
+                    actual = external_net(db_, account_, binding_.instrument, trading_day=day_, cut=cut_,
+                                          verify_current=verify_external_cut)
+                    return actual == Decimal(expected_)
+
+                result = compare_account_net(db, self._account, binding, trading_day=day,
+                    account_net=account_net, external_net=format(external, "f"), cut=cut,
+                    resolve_binding=resolve_binding, verify_day_transition=verify_transition,
+                    verify_current_continuity=verify_continuity, verify_account_cut=verify_account,
+                    verify_external_cut=verify_external_value, verify_external_current=verify_external)
+                if read_cut(db, self._account, instrument) != current:
+                    return unavailable
+                self._assert_account_guard(self._account_comparison_guard)
+                return result
+        except Exception:
+            return unavailable
+
+    def read_strategy_position(self, strategy: str, payload: dict, *, expected_instrument: object):
+        """Read an owner-resolved strategy position; this method grants no ACL.
+
+        The service caller must derive ``strategy`` from its authenticated
+        principal and verify visibility before invoking it.  The trusted local
+        resolver, rather than payload labels, identifies the full instrument.
+        """
+        from bt_api_base.market_protocol import MarketInstrumentKey
+        from .strategy_position_ledger import StrategyInstrumentBinding
+        if (self._schema_version < 11 or self._strategy_ledger_ports is None
+                or type(payload) is not dict or type(expected_instrument) is not MarketInstrumentKey):
+            raise DirectCommandJournalError("STRATEGY_LEDGER_UNAVAILABLE")
+        strategy = _text(strategy)
+        self._assert_account_guard(self._strategy_ledger_guard)
+        resolve_binding, current_day, verify_transition, verify_continuity = self._strategy_ledger_ports
+        try:
+            binding = resolve_binding(payload)
+            day = current_day()
+        except Exception as exc:
+            raise DirectCommandJournalError("STRATEGY_LEDGER_UNAVAILABLE") from exc
+        if type(binding) is not StrategyInstrumentBinding or binding.instrument != expected_instrument:
+            raise DirectCommandJournalError("STRATEGY_LEDGER_UNAVAILABLE")
+        from .strategy_position_ledger import _resolve, strategy_position
+        with self._transaction() as db:
+            if not _resolve(payload, binding, resolve_binding):
+                raise DirectCommandJournalError("STRATEGY_LEDGER_UNAVAILABLE")
+            result = strategy_position(db, self._account, strategy, binding, trading_day=day,
+                                       resolve_binding=resolve_binding,
+                                       verify_day_transition=verify_transition,
+                                       verify_current_continuity=verify_continuity,
+                                       verify_external_current=self._strategy_external_verifier)
+            try:
+                unchanged = (current_day() == day and resolve_binding(payload) == binding
+                             and binding.instrument == expected_instrument)
+            except Exception as exc:
+                raise DirectCommandJournalError("STRATEGY_LEDGER_UNAVAILABLE") from exc
+            if not unchanged:
+                raise DirectCommandJournalError("STRATEGY_LEDGER_UNAVAILABLE")
+            self._assert_account_guard(self._strategy_ledger_guard)
+            return result
+
+    def read_strategy_close_capacity(self, strategy: str, payload: dict, *, expected_instrument: object):
+        """Read own-strategy close capacity without reserving it or granting ACL."""
+        from bt_api_base.market_protocol import MarketInstrumentKey
+        from .strategy_position_ledger import StrategyInstrumentBinding
+        if (self._schema_version < 11 or self._strategy_ledger_ports is None
+                or type(payload) is not dict or type(expected_instrument) is not MarketInstrumentKey):
+            raise DirectCommandJournalError("STRATEGY_LEDGER_UNAVAILABLE")
+        strategy = _text(strategy)
+        self._assert_account_guard(self._strategy_ledger_guard)
+        resolve_binding, current_day, verify_transition, verify_continuity = self._strategy_ledger_ports
+        try:
+            binding = resolve_binding(payload)
+            day = current_day()
+        except Exception as exc:
+            raise DirectCommandJournalError("STRATEGY_LEDGER_UNAVAILABLE") from exc
+        if type(binding) is not StrategyInstrumentBinding or binding.instrument != expected_instrument:
+            raise DirectCommandJournalError("STRATEGY_LEDGER_UNAVAILABLE")
+        from .strategy_position_ledger import strategy_close_capacity
+        with self._transaction() as db:
+            result = strategy_close_capacity(db, self._account, strategy, payload,
+                                             trading_day=day, instrument_binding=binding,
+                                             resolve_binding=resolve_binding,
+                                             verify_day_transition=verify_transition,
+                                             verify_current_continuity=verify_continuity,
+                                             verify_external_current=self._strategy_external_verifier)
+            try:
+                unchanged = (current_day() == day and resolve_binding(payload) == binding
+                             and binding.instrument == expected_instrument)
+            except Exception as exc:
+                raise DirectCommandJournalError("STRATEGY_LEDGER_UNAVAILABLE") from exc
+            if not unchanged:
+                raise DirectCommandJournalError("STRATEGY_LEDGER_UNAVAILABLE")
+            self._assert_account_guard(self._strategy_ledger_guard)
+            return result
 
     def get(self, strategy: str, request_key: str, principal: str) -> DirectCommandRecord:
         strategy, request_key, principal = map(_text, (strategy, request_key, principal))
@@ -1374,6 +2375,97 @@ class GatewayDirectCommandJournal:
             if record.status == "RESERVED":
                 remaining = max(0.0, record.expires_at - now) if current else 0.0
             return DirectCommandObservation(record, current, remaining)
+
+    def read_delegated_strategy_command(
+        self, strategy: str, request_key: str, *, admission_fence: Callable
+    ) -> DirectCommandRecord:
+        """Read a delegated command using an installed strategy-bound admission.
+
+        The trusted caller must bind the authenticated strategy, account, run,
+        action and complete request arguments to its Registry-issued fence.
+        This owner-local method must never accept a fence supplied over RPC.
+        The record retains the original actor principal.
+        """
+        strategy, request_key = map(_text, (strategy, request_key))
+        if self._schema_version < 12 or not callable(admission_fence):
+            raise DirectCommandJournalError("DELEGATION_UNAVAILABLE")
+        with ExitStack() as stack:
+            manager = admission_fence()
+            check = type(manager).__enter__(manager)
+            exit_ = type(manager).__exit__
+            stack.push(lambda *exc: (exit_(manager, *exc), False)[1])
+            if not callable(check):
+                raise DirectCommandJournalError("INVALID_ADMISSION")
+            db = stack.enter_context(self._transaction())
+            check()
+            delegated = db.execute(
+                "SELECT 1 FROM direct_delegated_commands WHERE account=? AND strategy=? AND request_key=?",
+                (self._account, strategy, request_key),
+            ).fetchone()
+            if delegated is None:
+                raise DirectCommandJournalError("NOT_FOUND")
+            row = self._find(db, strategy, request_key)
+            if row is None:
+                raise DirectCommandJournalError("INVALID_DATABASE")
+            check()
+            return self._record(row)
+
+    def read_delegate_command(self, *, delegation_permit, admission_fence) -> DirectCommandRecord:
+        """Read the authenticated actor's exact immutable delegated command."""
+        from .direct_delegation import GatewayDelegationPermit
+        if (self._schema_version < 12 or type(delegation_permit) is not GatewayDelegationPermit
+                or delegation_permit.operation not in {'direct.command_status', 'direct.cancel', 'direct.cancel_status', 'direct.release'}
+                or not callable(admission_fence)):
+            raise DirectCommandJournalError('DELEGATION_UNAVAILABLE')
+        command = delegation_permit.command
+        with ExitStack() as stack:
+            manager = admission_fence()
+            enter, exit_ = type(manager).__enter__, type(manager).__exit__
+            enter(manager)
+            stack.push(lambda *exc: (exit_(manager, *exc), False)[1])
+            db = stack.enter_context(self._transaction())
+            delegation_permit.recheck(db)
+            row = self._require(db, command.strategy_scope, command.request_key, command.actor_principal)
+            saved = db.execute('SELECT envelope_json,envelope_digest FROM direct_delegated_commands '
+                'WHERE account=? AND strategy=? AND request_key=?',
+                (self._account, command.strategy_scope, command.request_key)).fetchone()
+            if (command.account_scope != self._account or row['digest'] != command.payload_digest
+                    or saved is None or saved['envelope_json'] != command.canonical_json
+                    or saved['envelope_digest'] != command.digest):
+                raise DirectCommandJournalError('DELEGATION_MISMATCH')
+            delegation_permit.recheck(db)
+            return self._record(row)
+
+    def read_delegate_release(self, operation_id: str, *, delegation_permit, admission_fence):
+        """Find the exact persisted release operation, not merely an order state."""
+        from .direct_delegation import GatewayDelegationPermit
+        operation_id = _text(operation_id)
+        if (self._schema_version < 12 or type(delegation_permit) is not GatewayDelegationPermit
+                or delegation_permit.operation != 'direct.command_status' or not callable(admission_fence)):
+            raise DirectCommandJournalError('DELEGATION_UNAVAILABLE')
+        command = delegation_permit.command
+        with ExitStack() as stack:
+            manager = admission_fence()
+            enter, exit_ = type(manager).__enter__, type(manager).__exit__
+            enter(manager)
+            stack.push(lambda *exc: (exit_(manager, *exc), False)[1])
+            db = stack.enter_context(self._transaction())
+            delegation_permit.recheck(db)
+            row = self._require(db, command.strategy_scope, command.request_key, command.actor_principal)
+            saved = db.execute('SELECT envelope_json,envelope_digest FROM direct_delegated_commands '
+                'WHERE account=? AND strategy=? AND request_key=?',
+                (self._account, command.strategy_scope, command.request_key)).fetchone()
+            release = db.execute('SELECT * FROM direct_journal_releases WHERE account=? AND operation_id=?',
+                                 (self._account, operation_id)).fetchone()
+            if (command.account_scope != self._account or saved is None or saved['envelope_json'] != command.canonical_json
+                    or saved['envelope_digest'] != command.digest or row['digest'] != command.payload_digest
+                    or release is None or release['strategy'] != command.strategy_scope
+                    or release['request_key'] != command.request_key or release['reservation_id'] != row['reservation_id']
+                    or release['digest'] != command.payload_digest or release['principal'] != command.actor_principal
+                    or row['status'] not in {'RELEASED', 'EXPIRED'}):
+                raise DirectCommandJournalError('RELEASE_NOT_FOUND')
+            delegation_permit.recheck(db)
+            return self._record(row), release['expected_version']
 
     def recovery_page(self, *, limit: int, cursor: RecoveryCursor | None = None) -> RecoveryPage:
         """Read every account row for trusted owner recovery at one revision.
@@ -1415,12 +2507,29 @@ class GatewayDirectCommandJournal:
         principal: str,
         operation_id: str,
         expected_version: int,
+        *,
+        delegation_permit: object | None = None,
+        delegation_fence: Callable | None = None,
+        release_target_recheck: Callable | None = None,
     ) -> DirectCommandRecord:
         strategy, request_key, reservation_id, digest, principal, operation_id = map(
             _text, (strategy, request_key, reservation_id, digest, principal, operation_id)
         )
         self._version(expected_version)
-        with self._transaction() as db:
+        if delegation_permit is not None:
+            from .direct_delegation import GatewayDelegationPermit
+            if (self._schema_version < 12 or type(delegation_permit) is not GatewayDelegationPermit
+                    or delegation_permit.operation != 'direct.release' or not callable(delegation_fence)):
+                raise DirectCommandJournalError('DELEGATION_UNAVAILABLE')
+        elif delegation_fence is not None or release_target_recheck is not None:
+            raise DirectCommandJournalError('DELEGATION_UNAVAILABLE')
+        with ExitStack() as stack:
+            if delegation_permit is not None:
+                manager = delegation_fence()
+                enter, exit_ = type(manager).__enter__, type(manager).__exit__
+                enter(manager)
+                stack.push(lambda *exc: (exit_(manager, *exc), False)[1])
+            db = stack.enter_context(self._transaction())
             args = (strategy, request_key, reservation_id, digest, principal, expected_version)
             old = db.execute(
                 "SELECT strategy, request_key, reservation_id, digest, principal, expected_version FROM direct_journal_releases WHERE account=? AND operation_id=?",
@@ -1429,7 +2538,28 @@ class GatewayDirectCommandJournal:
             if old is not None and tuple(old) != args:
                 raise DirectCommandJournalError("OPERATION_CONFLICT")
             row = self._bound(db, strategy, request_key, reservation_id, digest, principal)
+            delegated = None
+            if self._schema_version >= 12:
+                delegated = db.execute('SELECT envelope_json,envelope_digest FROM direct_delegated_commands '
+                    'WHERE account=? AND strategy=? AND request_key=?', (self._account, strategy, request_key)).fetchone()
+            if (delegated is None) != (delegation_permit is None):
+                raise DirectCommandJournalError('DELEGATION_MISMATCH')
+            def check_delegate():
+                if delegation_permit is None:
+                    return
+                command = delegation_permit.command
+                if (command.account_scope != self._account or command.strategy_scope != strategy
+                        or command.request_key != request_key or command.actor_principal != principal
+                        or command.payload_digest != digest or command.canonical_json != delegated['envelope_json']
+                        or command.digest != delegated['envelope_digest']):
+                    raise DirectCommandJournalError('DELEGATION_MISMATCH')
+                delegation_permit.recheck(db)
+                if command.parent_ref is not None and (not callable(release_target_recheck)
+                        or release_target_recheck(db, command, operation_id, reservation_id, digest) is not True):
+                    raise DirectCommandJournalError('PARENT_RELEASE_DENIED')
+            check_delegate()
             if old is not None:
+                check_delegate()
                 return self._record(row)
             prior = db.execute(
                 "SELECT operation_id FROM direct_journal_releases WHERE account=? AND strategy=? AND request_key=?",
@@ -1458,6 +2588,7 @@ class GatewayDirectCommandJournal:
                 (self._account, operation_id, *args),
             )
             self._bump(db)
+            check_delegate()
             return self._record(self._require(db, strategy, request_key, principal))
 
     def expire(self, strategy: str, request_key: str, principal: str) -> DirectCommandRecord:
@@ -1487,14 +2618,18 @@ class GatewayDirectCommandJournal:
         strong_identity_keys: tuple[str, ...],
         *,
         before_dispatch: Callable[[], None] | None = None,
+        before_commit: Callable[[], None] | None = None,
         prepared_place: object | None = None,
+        delegation_permit: object | None = None,
+        delegation_fence: Callable[[], ContextManager[None]] | None = None,
     ) -> DispatchStart:
         """Begin dispatch under the write transaction and an optional local recheck.
 
         The trusted recheck runs with SQLite's write lock held; it must not do
         provider I/O, enter another journal transaction, or reenter its fence.
         """
-        if before_dispatch is not None and not callable(before_dispatch):
+        if ((before_dispatch is not None and not callable(before_dispatch))
+                or (before_commit is not None and not callable(before_commit))):
             raise DirectCommandJournalError("INVALID_INPUT")
         strategy, request_key, reservation_id, digest, principal = map(
             _text, (strategy, request_key, reservation_id, digest, principal)
@@ -1503,8 +2638,51 @@ class GatewayDirectCommandJournal:
         identity = _json(native_identity, scalar_map=True)
         keys = _strong_keys(strong_identity_keys)
         keys_json = _json(list(keys))
-        with self._transaction() as db:
+        with self._transaction() as preflight:
+            preflight_row = self._bound(preflight, strategy, request_key, reservation_id, digest, principal)
+            preflight_payload = json.loads(preflight_row['payload_json'])
+        needs_capacity_fence = (preflight_row['status'] == 'RESERVED' and self._unknown_capacity_needed(
+            strategy, preflight_payload, exclude_reservation_id=reservation_id))
+        if delegation_permit is not None:
+            from .direct_delegation import GatewayDelegationPermit
+            if (type(delegation_permit) is not GatewayDelegationPermit or self._schema_version < 12
+                    or delegation_permit.operation != "direct.dispatch"
+                    or not callable(delegation_fence)):
+                raise DirectCommandJournalError("DELEGATION_UNAVAILABLE")
+        elif delegation_fence is not None:
+            raise DirectCommandJournalError("DELEGATION_UNAVAILABLE")
+        with ExitStack() as fence_stack:
+            if delegation_permit is not None:
+                manager = delegation_fence()
+                enter, exit_ = type(manager).__enter__, type(manager).__exit__
+                enter(manager)
+                fence_stack.push(lambda *exc: (exit_(manager, *exc), False)[1])
+            if needs_capacity_fence:
+                self._assert_account_guard(self._unknown_capacity_guard)
+                manager = self._unknown_capacity_ports[0]()
+                enter, exit_ = type(manager).__enter__, type(manager).__exit__
+                enter(manager)
+                fence_stack.push(lambda *exc: (exit_(manager, *exc), False)[1])
+            db = fence_stack.enter_context(self._transaction())
             row = self._bound(db, strategy, request_key, reservation_id, digest, principal)
+            delegated_row = None
+            if self._schema_version >= 12:
+                delegated_row = db.execute(
+                    "SELECT envelope_json,envelope_digest FROM direct_delegated_commands "
+                    "WHERE account=? AND strategy=? AND request_key=?",
+                    (self._account, strategy, request_key),
+                ).fetchone()
+            if (delegated_row is None) != (delegation_permit is None):
+                raise DirectCommandJournalError("DELEGATION_MISMATCH")
+            if delegated_row is not None:
+                command = delegation_permit.command
+                if (command.account_scope != self._account or command.strategy_scope != strategy
+                        or command.request_key != request_key or command.actor_principal != principal
+                        or command.payload_digest != digest
+                        or command.canonical_json != delegated_row["envelope_json"]
+                        or command.digest != delegated_row["envelope_digest"]):
+                    raise DirectCommandJournalError("DELEGATION_MISMATCH")
+                delegation_permit.recheck(db)
             if row["status"] in ("DISPATCHING", "SENT", "NOT_SENT", "UNKNOWN"):
                 if prepared_place is not None:
                     from .direct_place_journal import _get_prepared, _validate_prepared
@@ -1522,12 +2700,16 @@ class GatewayDirectCommandJournal:
                 prior_version = row["version"] - (1 if row["status"] == "DISPATCHING" else 2)
                 if expected_version != prior_version:
                     raise DirectCommandJournalError("VERSION_CONFLICT")
+                if delegation_permit is not None:
+                    delegation_permit.recheck(db)
                 return DispatchStart(self._record(row), False)
             if row["status"] != "RESERVED":
                 raise DirectCommandJournalError("STATE_CONFLICT")
             if row["version"] != expected_version:
                 raise DirectCommandJournalError("VERSION_CONFLICT")
             if row["generation"] != self._generation or self._now() >= row["expires_at"]:
+                if delegation_permit is not None:
+                    delegation_permit.recheck(db)
                 db.execute(
                     "UPDATE direct_journal_commands SET status='EXPIRED', version=version+1 WHERE account=? AND strategy=? AND request_key=?",
                     (self._account, strategy, request_key),
@@ -1542,6 +2724,10 @@ class GatewayDirectCommandJournal:
             ).fetchone()
             if collision is not None:
                 raise DirectCommandJournalError("IDENTITY_CONFLICT")
+            if self._schema_version >= 12:
+                from .external_position_ledger import external_identity_collision
+                if external_identity_collision(db, self._account, keys):
+                    raise DirectCommandJournalError("EXTERNAL_IDENTITY_CONFLICT")
             for key in keys:
                 if (
                     db.execute(
@@ -1551,9 +2737,31 @@ class GatewayDirectCommandJournal:
                     is not None
                 ):
                     raise DirectCommandJournalError("IDENTITY_CONFLICT")
+            if self._schema_version >= 10:
+                from .direct_control import check_controls
+                blocked = db.execute(
+                    "SELECT cause.mode FROM direct_control_blocked blocked "
+                    "JOIN direct_control_causes cause ON cause.account=blocked.account AND cause.cause_id=blocked.cause_id "
+                    "WHERE blocked.account=? AND blocked.reservation_id=?", (self._account, row["reservation_id"]),
+                ).fetchall()
+                if blocked and (any(item[0] != "STOP_NEW" for item in blocked)
+                                or not self._allow_verified_close(db, strategy, json.loads(row["payload_json"]),
+                                                                  exclude_reservation_id=reservation_id)):
+                    raise DirectCommandJournalError("CONTROL_PREVIOUSLY_BLOCKED")
+                check_controls(db, self._account, strategy, json.loads(row["payload_json"]),
+                               allow_verified_close=lambda: self._allow_verified_close(
+                                   db, strategy, json.loads(row["payload_json"]),
+                                   exclude_reservation_id=reservation_id))
+            self._check_unknown_scope(db, strategy, json.loads(row["payload_json"]), exclude_reservation_id=reservation_id, capacity_fenced=needs_capacity_fence)
+            self._check_strategy_capacity(db, strategy, json.loads(row["payload_json"]),
+                                          exclude_reservation_id=reservation_id)
+            self._assert_monitor_gate(db, strategy, json.loads(row["payload_json"]),
+                                      exclude_reservation_id=reservation_id)
             if before_dispatch is not None:
                 before_dispatch()
             if self._now() >= row["expires_at"]:
+                if delegation_permit is not None:
+                    delegation_permit.recheck(db)
                 db.execute(
                     "UPDATE direct_journal_commands SET status='EXPIRED', version=version+1 WHERE account=? AND strategy=? AND request_key=?",
                     (self._account, strategy, request_key),
@@ -1598,6 +2806,20 @@ class GatewayDirectCommandJournal:
                         (self._account, key, reservation_id),
                     )
             self._bump(db)
+            self._check_unknown_scope(db, strategy, json.loads(row["payload_json"]), exclude_reservation_id=reservation_id, capacity_fenced=needs_capacity_fence)
+            self._check_strategy_capacity(db, strategy, json.loads(row["payload_json"]),
+                                          exclude_reservation_id=reservation_id)
+            if self._schema_version >= 10:
+                check_controls(db, self._account, strategy, json.loads(row["payload_json"]),
+                               allow_verified_close=lambda: self._allow_verified_close(
+                                   db, strategy, json.loads(row["payload_json"]),
+                                   exclude_reservation_id=reservation_id))
+            self._assert_monitor_gate(db, strategy, json.loads(row["payload_json"]),
+                                      exclude_reservation_id=reservation_id)
+            if delegation_permit is not None:
+                delegation_permit.recheck(db)
+            if before_commit is not None:
+                before_commit()
             return DispatchStart(
                 self._record(self._require(db, strategy, request_key, principal)), True
             )
@@ -1737,15 +2959,72 @@ class GatewayDirectCommandJournal:
 
     @contextmanager
     def _transaction_on(self, db: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+        # Bind the observer before entering SQLite. Installation fails rather
+        # than missing a transaction that started without the observer.
+        with self._dispatch_port_lock:
+            self._dispatch_active_transactions += 1
+            port = self._dispatch_change_port
+        try:
+            with self._transaction_with_change_port(db, port):
+                yield db
+        finally:
+            with self._dispatch_port_lock:
+                self._dispatch_active_transactions -= 1
+
+    @contextmanager
+    def _transaction_with_change_port(self, db: sqlite3.Connection, port: object) -> Iterator[sqlite3.Connection]:
         db.execute("BEGIN IMMEDIATE")
+        token = None
+        denied = False
+        if port is not None:
+            def authorize(action, _table, _column, database, _trigger):
+                nonlocal token, denied
+                # A connection is created per transaction, so the authorizer
+                # is installed before any application statement can be cached.
+                # TEMP staging and read-only statements do not modify the
+                # durable account database. Conservatively fence every main
+                # table write, including cursors and journal metadata.
+                if database == 'main' and action in (sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE):
+                    if token is None and not denied:
+                        try:
+                            token = port.begin_change('parent_facts')
+                            if token is None:
+                                raise RuntimeError('empty change token')
+                        except Exception:
+                            denied = True
+                    if denied:
+                        return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
+            db.set_authorizer(authorize)
         try:
             yield db
             self._identity.verify()
             self._commit(db)
         except BaseException:
-            if db.in_transaction:
-                db.execute("ROLLBACK")
+            try:
+                if db.in_transaction:
+                    db.execute("ROLLBACK")
+            finally:
+                if port is not None:
+                    try:
+                        if token is not None:
+                            port.poison(token)
+                        elif denied:
+                            port.poison_domain('parent_facts')
+                    except Exception:
+                        port.poison_domain('parent_facts')
             raise
+        else:
+            if token is not None:
+                try:
+                    # The journal is not a proof of all selected sources.
+                    port.finish_change(token, 'UNAVAILABLE')
+                except BaseException:
+                    port.poison_domain('parent_facts')
+                    raise
+        finally:
+            if port is not None:
+                db.set_authorizer(None)
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
@@ -1753,4 +3032,42 @@ class GatewayDirectCommandJournal:
             self._assert_anchor(db)
             if self._schema_version >= 4:
                 self._verify_exact_ddl(db, self._schema_version)
+            if self._schema_version >= 10:
+                from .direct_control import verify_controls
+                verify_controls(db, self._account, self._max_records)
+            if self._schema_version >= 11:
+                from .strategy_position_ledger import _verify_strategy_ledger_integrity
+                _verify_strategy_ledger_integrity(db, self._account)
+            if self._schema_version >= 12:
+                from .direct_delegation import verify_delegated_integrity
+                from .external_position_ledger import verify_external_integrity
+                from .account_observer import verify_account_observers
+                verify_delegated_integrity(db, self._account, self._max_records)
+                verify_external_integrity(db, self._account)
+                verify_account_observers(db, self._account)
+            if self._schema_version >= 13:
+                from .direct_parent_authority import verify_parent_authority_integrity
+                verify_parent_authority_integrity(db, self._account, self._max_records)
+            if self._schema_version >= 14:
+                from .account_observation_journal import verify_account_fact_stream
+                from .strategy_financial_ledger import verify_strategy_financial_integrity
+                verify_account_fact_stream(db, self._account, self._journal_id)
+                verify_strategy_financial_integrity(db, self._account)
+            if self._schema_version >= 15:
+                from .delegate_actor_stream import verify_actor_stream
+                verify_actor_stream(db, self._account, self._journal_id, self._max_records)
+            if self._schema_version >= 16:
+                from .direct_strategy_origin import verify_strategy_origins
+                verify_strategy_origins(db, self._account, self._journal_id)
+            if self._schema_version >= 17:
+                from .direct_control_cancel import verify_control_cancel_integrity
+                verify_control_cancel_integrity(db, self._account, self._journal_id, self._max_records)
+            if self._schema_version >= 18:
+                from .account_fact_consumer_ownership import verify_account_fact_consumer_owners
+                from .account_fact_compaction import verify_account_fact_compaction
+                verify_account_fact_consumer_owners(db, self._account)
+                verify_account_fact_compaction(db, self._account, self._journal_id)
+            if self._schema_version >= 19:
+                from .account_event_consumer_ownership import verify_account_event_consumer_owners
+                verify_account_event_consumer_owners(db, self._account)
             yield db
