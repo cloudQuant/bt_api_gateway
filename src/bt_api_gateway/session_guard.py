@@ -16,6 +16,8 @@ import secrets
 import stat
 import sys
 import threading
+import time
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -452,6 +454,145 @@ class LocalAccountSessionGuard:
         self._closed_record_durable = False
         self._os_locked = False
         self._phase = "idle"
+
+
+_MAX_AUDIT_TEXT_BYTES = {"operator_ref": 256, "reason": 1024}
+
+
+def reconcile_abandoned_account_session(
+    directory: Path,
+    account_key: str,
+    *,
+    operator_ref: str,
+    reason: str,
+    blocking_evidence: Callable[[], Mapping[str, int]],
+    clock: Callable[[], float] = time.time,
+) -> dict[str, Any]:
+    """Close an ``active`` record whose owner process no longer holds the lock.
+
+    This is the explicit operator reconciliation that :meth:`acquire` asks for
+    after an unclean exit; elapsed time never grants it. It proceeds only while
+    this call holds the same nonblocking OS lock (so no local owner is alive and
+    none can start meanwhile) and only when ``blocking_evidence`` reports zero
+    in every category, e.g. no journal command whose venue outcome is unknown.
+    An append-only audit entry naming the operator and reason is made durable
+    before the record is closed; a failed close may leave an extra audit entry
+    and is retried by running the reconciliation again.
+
+    Returns ``{"status": "NOT_REQUIRED"}`` when nothing is recorded active and
+    ``{"status": "RECONCILED", ...}`` after closing the abandoned record.
+    """
+
+    operator = _audit_text(operator_ref, "operator_ref")
+    why = _audit_text(reason, "reason")
+    if not callable(blocking_evidence) or not callable(clock):
+        raise ValueError("blocking_evidence and clock must be callable")
+    guard = LocalAccountSessionGuard(directory, account_key, f"reconcile:{operator}")
+    try:
+        guard._verify_directory()
+        guard._open_lock_file()
+        guard._verify_file_identity()
+        guard._lock_file()
+        guard._os_locked = True
+        guard._phase = "acquire_cleanup"
+        guard._verify_file_identity()
+        prior = guard._read_record()
+        if prior is None or prior["status"] != "active":
+            return {"status": "NOT_REQUIRED", "account_digest": guard._account_digest}
+        evidence = _checked_evidence(blocking_evidence())
+        if any(evidence.values()):
+            error = LocalAccountSessionGuardError(
+                "SESSION_RECONCILIATION_BLOCKED",
+                "unresolved work blocks closing the abandoned account session",
+            )
+            error.evidence = evidence  # type: ignore[attr-defined]
+            raise error
+        entry = {
+            "abandoned_generation": prior["generation"],
+            "abandoned_owner_ref": prior["owner_ref"],
+            "account_digest": guard._account_digest,
+            "evidence": evidence,
+            "operator_ref": operator,
+            "reason": why,
+            "reconciled_at": float(clock()),
+            "version": 1,
+        }
+        _append_audit(guard._directory, guard._account_digest, entry)
+        guard._verify_file_identity()
+        if guard._read_record() != prior:
+            raise LocalAccountSessionGuardError(
+                "SESSION_STATE_CHANGED", "account session record changed during reconciliation"
+            )
+        guard._write_record(dict(prior, status="closed"))
+        return {
+            "status": "RECONCILED",
+            "account_digest": guard._account_digest,
+            "abandoned_generation": prior["generation"],
+            "evidence": evidence,
+        }
+    except LocalAccountSessionGuardError:
+        raise
+    except OSError as exc:
+        raise LocalAccountSessionGuardError(
+            "SESSION_IO_ERROR", "account session reconciliation storage failed"
+        ) from exc
+    finally:
+        guard._cleanup_unpublished_or_raise()
+
+
+def _audit_text(value: str, name: str) -> str:
+    encoded = _bounded_text(value, name, _MAX_AUDIT_TEXT_BYTES[name])
+    text = encoded.decode("utf-8")
+    if any(ord(character) < 32 or ord(character) == 127 for character in text) or not text.strip():
+        raise ValueError(f"{name} must be printable text")
+    return text
+
+
+def _checked_evidence(value: Mapping[str, int]) -> dict[str, int]:
+    if not isinstance(value, Mapping) or not value:
+        raise ValueError("blocking evidence must be a non-empty mapping")
+    checked: dict[str, int] = {}
+    for key, count in value.items():
+        if type(key) is not str or not key or type(count) is not int or count < 0:
+            raise ValueError("blocking evidence must map names to non-negative counts")
+        checked[key] = count
+    return dict(sorted(checked.items()))
+
+
+def _append_audit(directory: Path, account_digest: str, entry: dict[str, Any]) -> None:
+    payload = (
+        json.dumps(entry, ensure_ascii=True, separators=(",", ":"), sort_keys=True) + "\n"
+    ).encode("ascii")
+    path = directory / f"account-{account_digest}.reconciliations.jsonl"
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+    flags |= getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        existing = path.lstat()
+    except FileNotFoundError:
+        existing = None
+    if existing is not None:
+        _reject_reparse_point(existing, "reconciliation audit file")
+        if not stat.S_ISREG(existing.st_mode):
+            raise LocalAccountSessionGuardError(
+                "SESSION_PATH_CHANGED", "reconciliation audit path is not a regular file"
+            )
+    fd = os.open(path, flags, 0o600)
+    try:
+        written = 0
+        while written < len(payload):
+            count = os.write(fd, payload[written:])
+            if count <= 0:
+                raise OSError("reconciliation audit write made no progress")
+            written += count
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    if existing is None and os.name != "nt":
+        directory_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
 
 def _trusted_directory(directory: Path) -> Path:

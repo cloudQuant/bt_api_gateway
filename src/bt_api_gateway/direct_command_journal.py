@@ -11,6 +11,7 @@ import json
 import math
 import os
 import sqlite3
+import stat
 import threading
 import time
 import uuid
@@ -3165,3 +3166,82 @@ class GatewayDirectCommandJournal:
                 from .account_event_consumer_ownership import verify_account_event_consumer_owners
                 verify_account_event_consumer_owners(db, self._account)
             yield db
+
+
+_RECONCILIATION_BLOCKING_STATUSES = (
+    ("commands", "direct_journal_commands", ("DISPATCHING", "UNKNOWN")),
+    ("cancels", "direct_cancel_attempts", ("DISPATCHING", "UNKNOWN")),
+    ("settlements", "direct_journal_settlement", ("ATTEMPTING", "UNKNOWN")),
+)
+
+
+def inspect_unresolved_dispatch(
+    path: str | Path, account: str, *, timeout_seconds: float = 5.0
+) -> dict[str, int]:
+    """Count journal rows whose venue outcome an abandoned owner left open.
+
+    Read-only and meant for operator session reconciliation while the account
+    session lock is held, so no Gateway owner is writing. A command or cancel
+    still ``DISPATCHING`` or ``UNKNOWN`` may have reached the venue, and an
+    ``ATTEMPTING``/``UNKNOWN`` settlement confirmation may have been sent; each
+    count must be zero before the session record may be closed. The journal
+    must already exist and belong to ``account``.
+    """
+
+    account = _text(account)
+    if (
+        type(timeout_seconds) not in (int, float)
+        or not math.isfinite(timeout_seconds)
+        or not 0 < timeout_seconds <= 60
+    ):
+        raise DirectCommandJournalError("INVALID_INPUT")
+    journal = Path(path)
+    try:
+        info = journal.lstat()
+    except FileNotFoundError:
+        raise DirectCommandJournalError("DATABASE_UNAVAILABLE") from None
+    except OSError as exc:
+        raise DirectCommandJournalError("DATABASE_UNAVAILABLE") from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise DirectCommandJournalError("DATABASE_UNAVAILABLE")
+    try:
+        db = sqlite3.connect(
+            journal.absolute().as_uri() + "?mode=ro",
+            uri=True,
+            timeout=float(timeout_seconds),
+            isolation_level=None,
+        )
+    except sqlite3.Error as exc:
+        raise DirectCommandJournalError("DATABASE_UNAVAILABLE") from exc
+    try:
+        db.execute("BEGIN")
+        tables = {
+            row[0]
+            for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        if "direct_journal_meta" not in tables or "direct_journal_commands" not in tables:
+            raise DirectCommandJournalError("DATABASE_INVALID")
+        owner = db.execute(
+            "SELECT COUNT(*) FROM direct_journal_meta WHERE account=?", (account,)
+        ).fetchone()[0]
+        if owner != 1:
+            raise DirectCommandJournalError("ACCOUNT_MISMATCH")
+        counts: dict[str, int] = {}
+        for label, table, statuses in _RECONCILIATION_BLOCKING_STATUSES:
+            for status in statuses:
+                key = f"{label}_{status.lower()}"
+                if table not in tables:
+                    counts[key] = 0
+                    continue
+                counts[key] = int(
+                    db.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE account=? AND status=?",  # noqa: S608
+                        (account, status),
+                    ).fetchone()[0]
+                )
+        db.execute("COMMIT")
+        return counts
+    except sqlite3.Error as exc:
+        raise DirectCommandJournalError("DATABASE_UNAVAILABLE") from exc
+    finally:
+        db.close()
