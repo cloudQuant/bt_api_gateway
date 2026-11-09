@@ -33,6 +33,7 @@ def owned(tmp_path):
 
 def _drop_v4_for_v2(db):
     for name in (
+        "direct_execution_trade_dates",
         "direct_place_error_attribution",
         "direct_place_keys",
         "direct_place_preparations",
@@ -149,7 +150,7 @@ def test_v2_upgrade_is_explicit_guarded_atomic_and_preserves_records(owned):
     with sqlite3.connect(path) as db:
         assert db.execute(
             "SELECT schema_version, revision FROM direct_journal_meta"
-        ).fetchone() == (8, before + 1)
+        ).fetchone() == (9, before + 1)
     with pytest.raises(DirectCommandJournalError, match="SCHEMA_OR_CAPACITY_MISMATCH"):
         journal.get("s", "one", "p")
     assert begin(upgraded).newly_started

@@ -277,6 +277,7 @@ def test_v6_upgrade_preserves_legacy_event_and_cancel_bytes(setup):
     legacy = replace(make_fact(identity), schema_version=1, cancel_request_key=None)
     ledger.ingest(legacy)
     with sqlite3.connect(path) as db:
+        db.execute("DROP TABLE direct_execution_trade_dates")
         db.execute("DROP TABLE direct_place_error_attribution")
         db.execute("DROP TABLE direct_place_keys")
         db.execute("DROP TABLE direct_place_preparations")
@@ -311,7 +312,7 @@ def test_v6_upgrade_preserves_legacy_event_and_cancel_bytes(setup):
             for name, values in before.items()
         )
         assert db.execute("SELECT schema_version,revision FROM direct_journal_meta").fetchone() == (
-            8,
+            9,
             revision + 1,
         )
     (event,) = GatewayDirectExecutionLedger(upgraded, guard).read_events("s")
@@ -405,6 +406,7 @@ def test_v6_migration_failure_rolls_back_all_schema_changes(setup, monkeypatch):
     )
     cancel.begin_dispatch("s", "cancel", "p", row.version, prep)
     with sqlite3.connect(path) as db:
+        db.execute("DROP TABLE direct_execution_trade_dates")
         db.execute("DROP TABLE direct_place_error_attribution")
         db.execute("DROP TABLE direct_place_keys")
         db.execute("DROP TABLE direct_place_preparations")
@@ -484,6 +486,7 @@ def test_v6_upgrade_rejects_impossible_v2_fact_without_side(setup):
     ledger = GatewayDirectExecutionLedger(journal, guard)
     ingest(ledger, make_fact(identity), prep)
     with sqlite3.connect(path) as db:
+        db.execute("DROP TABLE direct_execution_trade_dates")
         db.execute("DROP TABLE direct_place_error_attribution")
         db.execute("DROP TABLE direct_place_keys")
         db.execute("DROP TABLE direct_place_preparations")

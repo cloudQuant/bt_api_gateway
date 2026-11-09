@@ -438,6 +438,7 @@ def test_v7_upgrade_preserves_cancel_fact_bytes_without_fabricating_place(setup)
     fact = cancel_fact(identity)
     cancel_ingest(ledger, fact, cancel_prep)
     with sqlite3.connect(path) as db:
+        db.execute("DROP TABLE direct_execution_trade_dates")
         db.execute("DROP TABLE direct_place_error_attribution")
         db.execute("DROP TABLE direct_place_keys")
         db.execute("DROP TABLE direct_place_preparations")
@@ -469,7 +470,7 @@ def test_v7_upgrade_preserves_cancel_fact_bytes_without_fabricating_place(setup)
             db.execute(f"SELECT * FROM {name}").fetchall() == rows for name, rows in before.items()
         )
         assert db.execute("SELECT schema_version,revision FROM direct_journal_meta").fetchone() == (
-            8,
+            9,
             rev + 1,
         )
     assert upgraded.get_prepared_place(order.reservation_id) is None
@@ -495,6 +496,7 @@ def test_v7_migration_fault_rolls_back_atomically(setup, monkeypatch):
         ("session-ref-a",),
     )
     with sqlite3.connect(path) as db:
+        db.execute("DROP TABLE direct_execution_trade_dates")
         db.execute("DROP TABLE direct_place_error_attribution")
         db.execute("DROP TABLE direct_place_keys")
         db.execute("DROP TABLE direct_place_preparations")

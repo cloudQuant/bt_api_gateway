@@ -171,6 +171,7 @@ def test_v5_upgrade_is_explicit_guarded_atomic_and_preserves_order(setup, monkey
     with journal._transaction() as db:
         before = journal._assert_anchor(db)
     with sqlite3.connect(path) as db:
+        db.execute("DROP TABLE direct_execution_trade_dates")
         db.execute("DROP TABLE direct_place_error_attribution")
         db.execute("DROP TABLE direct_place_keys")
         db.execute("DROP TABLE direct_place_preparations")
@@ -269,6 +270,7 @@ def test_crash_reopen_preserves_dispatching_and_no_new_marker(setup):
 def test_upgrade_v5_rejects_corrupt_consumer_without_schema_writes(setup):
     journal, cancel, guard, path = setup
     with sqlite3.connect(path) as db:
+        db.execute("DROP TABLE direct_execution_trade_dates")
         db.execute("DROP TABLE direct_place_error_attribution")
         db.execute("DROP TABLE direct_place_keys")
         db.execute("DROP TABLE direct_place_preparations")

@@ -48,6 +48,13 @@ _EXECUTION_DDL = {
 }
 
 
+_TRADE_DATE_DDL = "CREATE TABLE direct_execution_trade_dates (account TEXT NOT NULL, route TEXT NOT NULL, trade_key_json TEXT NOT NULL, trade_date TEXT NOT NULL, fact_digest TEXT NOT NULL, original_fact_digest TEXT NOT NULL, PRIMARY KEY(account, route, trade_key_json))"
+
+
+def _create_trade_date_table(db: sqlite3.Connection) -> None:
+    db.execute(_TRADE_DATE_DDL)
+
+
 _CANCEL_ERROR_DDL = "CREATE TABLE direct_cancel_error_attribution (account TEXT NOT NULL, fact_digest TEXT NOT NULL, attempt_id TEXT NOT NULL, prepared_digest TEXT NOT NULL, cancel_key TEXT NOT NULL, source_binding_json TEXT NOT NULL, PRIMARY KEY(account, fact_digest))"
 
 
@@ -132,6 +139,7 @@ class ExecutionEvent:
     command_principal: str
     cancel_attribution: GatewayCancelErrorAttribution | None = None
     place_attribution: GatewayPlaceErrorAttribution | None = None
+    trade_metadata_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -200,7 +208,7 @@ class GatewayDirectExecutionLedger:
         self._owned()
         with journal._transaction() as db:
             self._owned()
-            journal._verify_v2_upgrade_integrity(db, schema_version=8)
+            journal._verify_v2_upgrade_integrity(db, schema_version=9)
             journal._verify_v4_identity_integrity(db)
             _verify_execution_integrity(db, journal.account_scope, journal._execution_max_facts)
             _verify_consumer_integrity(db, journal.account_scope)
@@ -269,7 +277,7 @@ class GatewayDirectExecutionLedger:
             raise DirectCommandJournalError("INVALID_FACT") from exc
         if fact.account_scope != self._journal.account_scope:
             raise DirectCommandJournalError("ACCOUNT_MISMATCH")
-        if fact.schema_version != 1:
+        if fact.schema_version not in (1, 4):
             raise DirectCommandJournalError("INVALID_FACT")
         digest = fact.fact_digest()
         with self._write() as db:
@@ -281,7 +289,7 @@ class GatewayDirectExecutionLedger:
                 result = self._result(db, row, applied=False)
                 if fact.kind is DirectExecutionEventKind.TRADE and fact.trade_key is not None:
                     trade = db.execute(
-                        "SELECT conflict FROM direct_execution_trades WHERE account=? AND route=? AND trade_key_json=?",
+                        "SELECT conflict, applied FROM direct_execution_trades WHERE account=? AND route=? AND trade_key_json=?",
                         (self._journal.account_scope, fact.route, _json(list(fact.trade_key))),
                     ).fetchone()
                     if trade is not None and trade[0]:
@@ -292,6 +300,15 @@ class GatewayDirectExecutionLedger:
                             result.event_sequence,
                             False,
                             "TRADE_CONFLICT_RETAINED",
+                        )
+                    if trade is not None and trade[1] and row["disposition"] == "ATTRIBUTED":
+                        return ExecutionIngestResult(
+                            "ATTRIBUTED",
+                            digest,
+                            result.strategy_scope,
+                            None,
+                            False,
+                            "TRADE_DUPLICATE",
                         )
                 return result
             count = db.execute(
@@ -598,7 +615,7 @@ class GatewayDirectExecutionLedger:
                     row["applied"],
                 )
                 fact = GatewayReturnFact.from_mapping(json.loads(row["fact_json"]))
-                if fact.schema_version != 1:
+                if fact.schema_version not in (1, 4):
                     raise DirectCommandJournalError("INVALID_DATABASE")
                 self._process(db, row["fact_digest"], fact)
                 current = db.execute(
@@ -645,7 +662,7 @@ class GatewayDirectExecutionLedger:
         try:
             return db.execute(
                 """SELECT e.*, f.fact_json AS stored_fact_json,
-                          f.disposition AS fact_disposition,
+                          f.disposition AS fact_disposition, f.reason AS fact_reason, f.applied AS fact_applied,
                           f.event_sequence AS fact_event_sequence,
                           f.reservation_id AS fact_reservation_id,
                           c.reservation_id AS command_reservation_id,
@@ -712,6 +729,80 @@ class GatewayDirectExecutionLedger:
             place_attribution = _event_place_attribution(
                 db, self._journal, fact, row["fact_digest"], reservation, row["strategy"]
             )
+            metadata_only = False
+            if fact.kind is DirectExecutionEventKind.TRADE:
+                if fact.trade_key is None or row["fact_applied"] not in (0, 1):
+                    raise ValueError("invalid trade event")
+                trade_key = _json(list(fact.trade_key))
+                trade = db.execute(
+                    "SELECT * FROM direct_execution_trades WHERE account=? AND route=? AND trade_key_json=?",
+                    (row["account"], fact.route, trade_key),
+                ).fetchone()
+                if (
+                    trade is None
+                    or trade["applied"] != 1
+                    or trade["reservation_id"] != reservation
+                    or trade["content_digest"] != fact.trade_content_digest()
+                    or trade["quantity"] != fact.trade_quantity
+                ):
+                    raise ValueError("invalid trade event link")
+                if row["fact_applied"] == 1:
+                    if trade["fact_digest"] != row["fact_digest"] or row["fact_reason"] in {
+                        "TRADE_DATE_ENRICHED",
+                        "TRADE_DUPLICATE",
+                    }:
+                        raise ValueError("invalid applied trade event")
+                else:
+                    side = db.execute(
+                        "SELECT * FROM direct_execution_trade_dates WHERE account=? AND route=? AND trade_key_json=?",
+                        (row["account"], fact.route, trade_key),
+                    ).fetchone()
+                    if (
+                        fact.schema_version != 4
+                        or fact.trade_date is None
+                        or row["fact_reason"] != "TRADE_DATE_ENRICHED"
+                        or side is None
+                        or side["fact_digest"] != row["fact_digest"]
+                        or side["original_fact_digest"] != trade["fact_digest"]
+                        or side["original_fact_digest"] == side["fact_digest"]
+                        or side["trade_date"] != fact.trade_date
+                    ):
+                        raise ValueError("invalid trade date event")
+                    original = db.execute(
+                        "SELECT * FROM direct_execution_facts WHERE account=? AND fact_digest=?",
+                        (row["account"], side["original_fact_digest"]),
+                    ).fetchone()
+                    if original is None:
+                        raise ValueError("missing original trade fact")
+                    original_fact = GatewayReturnFact.from_mapping(
+                        json.loads(original["fact_json"])
+                    )
+                    original_event = db.execute(
+                        "SELECT * FROM direct_execution_events WHERE account=? AND sequence=?",
+                        (row["account"], original["event_sequence"]),
+                    ).fetchone()
+                    if (
+                        original["applied"] != 1
+                        or original["disposition"] != "ATTRIBUTED"
+                        or original["reservation_id"] != reservation
+                        or original_fact.fact_digest() != original["fact_digest"]
+                        or _json(original_fact.to_mapping()) != original["fact_json"]
+                        or original_fact.trade_content_digest() != trade["content_digest"]
+                        or (
+                            original_fact.schema_version == 4
+                            and original_fact.trade_date is not None
+                        )
+                        or original["event_sequence"] is None
+                        or original["event_sequence"] >= row["sequence"]
+                        or original_event is None
+                        or original_event["strategy"] != row["strategy"]
+                        or original_event["fact_digest"] != original["fact_digest"]
+                        or original_event["fact_json"] != original["fact_json"]
+                    ):
+                        raise ValueError("invalid original trade event link")
+                    metadata_only = True
+            elif row["fact_reason"] == "TRADE_DATE_ENRICHED":
+                raise ValueError("invalid trade date event kind")
             return ExecutionEvent(
                 row["sequence"],
                 row["strategy"],
@@ -723,6 +814,7 @@ class GatewayDirectExecutionLedger:
                 principal,
                 attribution,
                 place_attribution,
+                metadata_only,
             )
         except Exception as exc:
             raise DirectCommandJournalError("INVALID_DATABASE") from exc
@@ -1115,60 +1207,90 @@ class GatewayDirectExecutionLedger:
                 )
                 return
             if trade["applied"]:
-                self._fact_update(db, digest, "ATTRIBUTED", "TRADE_DUPLICATE", reservation)
-                return
-            instrument = _json(fact.instrument.to_dict())
-            row = db.execute(
-                "SELECT net_quantity FROM direct_execution_positions WHERE account=? AND strategy=? AND instrument_json=?",
-                (account, command["strategy"], instrument),
-            ).fetchone()
-            try:
-                with localcontext() as ctx:
-                    ctx.prec = 160
-                    quantity = Decimal(fact.trade_quantity)
-                    net = (Decimal(row[0]) if row is not None else Decimal(0)) + (
-                        quantity if fact.side == "buy" else -quantity
+                date_row = db.execute(
+                    "SELECT trade_date FROM direct_execution_trade_dates WHERE account=? AND route=? AND trade_key_json=?",
+                    (account, fact.route, trade_key),
+                ).fetchone()
+                trade_date = fact.trade_date if fact.schema_version == 4 else None
+                if date_row is not None and trade_date is not None and date_row[0] != trade_date:
+                    self._conflict_trade(
+                        db, fact, digest, trade_key, trade["content_digest"], "TRADE_DATE_CONFLICT"
                     )
-                    net_text = _canonical_quantity(net)
-                    previous = db.execute(
-                        "SELECT total_quantity FROM direct_execution_totals WHERE account=? AND reservation_id=?",
-                        (account, reservation),
-                    ).fetchone()
-                    total = (
-                        Decimal(previous[0]) if previous is not None else Decimal(0)
-                    ) + quantity
-                    total_text = _canonical_quantity(total, integer_limit=42)
-                    requested = payload.get("quantity")
-                    try:
-                        requested_value = Decimal(requested) if type(requested) is str else None
-                        if requested_value is not None and (
-                            not requested_value.is_finite() or requested_value <= 0
-                        ):
-                            requested_value = None
-                    except Exception:
-                        requested_value = None
-                    if requested_value is not None and total > requested_value:
-                        reason = (
-                            "NOT_SENT_OVERFILL" if command["status"] == "NOT_SENT" else "OVERFILL"
+                    return
+                if date_row is None and trade_date is not None:
+                    db.execute(
+                        "INSERT INTO direct_execution_trade_dates VALUES (?, ?, ?, ?, ?, ?)",
+                        (account, fact.route, trade_key, trade_date, digest, trade["fact_digest"]),
+                    )
+                    reason = "TRADE_DATE_ENRICHED"
+                else:
+                    self._fact_update(db, digest, "ATTRIBUTED", "TRADE_DUPLICATE", reservation)
+                    return
+            else:
+                instrument = _json(fact.instrument.to_dict())
+                row = db.execute(
+                    "SELECT net_quantity FROM direct_execution_positions WHERE account=? AND strategy=? AND instrument_json=?",
+                    (account, command["strategy"], instrument),
+                ).fetchone()
+                try:
+                    with localcontext() as ctx:
+                        ctx.prec = 160
+                        quantity = Decimal(fact.trade_quantity)
+                        net = (Decimal(row[0]) if row is not None else Decimal(0)) + (
+                            quantity if fact.side == "buy" else -quantity
                         )
-            except Exception:
-                self._conflict_trade(
-                    db, fact, digest, trade_key, trade["content_digest"], "POSITION_RANGE_CONFLICT"
+                        net_text = _canonical_quantity(net)
+                        previous = db.execute(
+                            "SELECT total_quantity FROM direct_execution_totals WHERE account=? AND reservation_id=?",
+                            (account, reservation),
+                        ).fetchone()
+                        total = (
+                            Decimal(previous[0]) if previous is not None else Decimal(0)
+                        ) + quantity
+                        total_text = _canonical_quantity(total, integer_limit=42)
+                        requested = payload.get("quantity")
+                        try:
+                            requested_value = Decimal(requested) if type(requested) is str else None
+                            if requested_value is not None and (
+                                not requested_value.is_finite() or requested_value <= 0
+                            ):
+                                requested_value = None
+                        except Exception:
+                            requested_value = None
+                        if requested_value is not None and total > requested_value:
+                            reason = (
+                                "NOT_SENT_OVERFILL"
+                                if command["status"] == "NOT_SENT"
+                                else "OVERFILL"
+                            )
+                except Exception:
+                    self._conflict_trade(
+                        db,
+                        fact,
+                        digest,
+                        trade_key,
+                        trade["content_digest"],
+                        "POSITION_RANGE_CONFLICT",
+                    )
+                    return
+                db.execute(
+                    "INSERT INTO direct_execution_positions VALUES (?, ?, ?, ?) ON CONFLICT(account,strategy,instrument_json) DO UPDATE SET net_quantity=excluded.net_quantity",
+                    (account, command["strategy"], instrument, net_text),
                 )
-                return
-            db.execute(
-                "INSERT INTO direct_execution_positions VALUES (?, ?, ?, ?) ON CONFLICT(account,strategy,instrument_json) DO UPDATE SET net_quantity=excluded.net_quantity",
-                (account, command["strategy"], instrument, net_text),
-            )
-            db.execute(
-                "INSERT INTO direct_execution_totals VALUES (?, ?, ?) ON CONFLICT(account,reservation_id) DO UPDATE SET total_quantity=excluded.total_quantity",
-                (account, reservation, total_text),
-            )
-            db.execute(
-                "UPDATE direct_execution_trades SET applied=1,reservation_id=?,fact_digest=?,quantity=? WHERE account=? AND route=? AND trade_key_json=?",
-                (reservation, digest, fact.trade_quantity, account, fact.route, trade_key),
-            )
-            applied = True
+                db.execute(
+                    "INSERT INTO direct_execution_totals VALUES (?, ?, ?) ON CONFLICT(account,reservation_id) DO UPDATE SET total_quantity=excluded.total_quantity",
+                    (account, reservation, total_text),
+                )
+                db.execute(
+                    "UPDATE direct_execution_trades SET applied=1,reservation_id=?,fact_digest=?,quantity=? WHERE account=? AND route=? AND trade_key_json=?",
+                    (reservation, digest, fact.trade_quantity, account, fact.route, trade_key),
+                )
+                applied = True
+                if fact.schema_version == 4 and fact.trade_date is not None:
+                    db.execute(
+                        "INSERT INTO direct_execution_trade_dates VALUES (?, ?, ?, ?, ?, ?)",
+                        (account, fact.route, trade_key, fact.trade_date, digest, digest),
+                    )
         sequence = db.execute(
             "SELECT COALESCE(MAX(sequence), 0)+1 FROM direct_execution_events"
         ).fetchone()[0]
@@ -1193,11 +1315,13 @@ _VALID_REASONS = {
         "NOT_SENT_CONTRADICTION",
         "CANCEL_NOT_SENT_CONTRADICTION",
         "TRADE_DUPLICATE",
+        "TRADE_DATE_ENRICHED",
         "OVERFILL",
         "NOT_SENT_OVERFILL",
     },
     "CONFLICT": {
         "TRADE_CONTENT_CONFLICT",
+        "TRADE_DATE_CONFLICT",
         "TRADE_CONFLICT_RETAINED",
         "IDENTITY_CONFLICT",
         "BINDING_CONFLICT",
@@ -1210,8 +1334,115 @@ _VALID_REASONS = {
 }
 
 
+def _verify_trade_dates(db, account, facts, trades, conflicts):
+    dates = {}
+    for row in db.execute("SELECT * FROM direct_execution_trade_dates"):
+        key = (row["route"], row["trade_key_json"])
+        trade = trades.get(key)
+        source = facts.get(row["fact_digest"])
+        original = facts.get(row["original_fact_digest"])
+        if (
+            row["account"] != account
+            or trade is None
+            or not trade["applied"]
+            or source is None
+            or original is None
+            or trade["fact_digest"] != row["original_fact_digest"]
+        ):
+            raise ValueError("trade date orphan")
+        source_row, fact = source
+        original_row, original_fact = original
+        if (
+            fact.schema_version != 4
+            or fact.trade_date is None
+            or fact.trade_date != row["trade_date"]
+            or fact.route != key[0]
+            or _json(list(fact.trade_key)) != key[1]
+            or fact.trade_content_digest() != trade["content_digest"]
+            or source_row["reservation_id"] != trade["reservation_id"]
+        ):
+            raise ValueError("trade date source")
+        if row["fact_digest"] == row["original_fact_digest"]:
+            if not source_row["applied"] or source_row["reason"] == "TRADE_DATE_ENRICHED":
+                raise ValueError("trade date original")
+        elif (
+            original_fact.schema_version == 4
+            and original_fact.trade_date is not None
+            or source_row["reason"] != "TRADE_DATE_ENRICHED"
+            or source_row["applied"]
+            or original_row["event_sequence"] is None
+            or source_row["event_sequence"] is None
+            or source_row["event_sequence"] <= original_row["event_sequence"]
+        ):
+            raise ValueError("trade date enrichment")
+        dates[key] = row
+    for key, trade in trades.items():
+        if trade["applied"]:
+            _, original = facts[trade["fact_digest"]]
+            if (
+                original.schema_version == 4
+                and original.trade_date is not None
+                and (key not in dates or dates[key]["fact_digest"] != trade["fact_digest"])
+            ):
+                raise ValueError("missing original date")
+    for digest, (row, fact) in facts.items():
+        if fact.kind is not DirectExecutionEventKind.TRADE or fact.trade_key is None:
+            continue
+        key = (fact.route, _json(list(fact.trade_key)))
+        date = fact.trade_date if fact.schema_version == 4 else None
+        date_row = dates.get(key)
+        if row["reason"] == "TRADE_DATE_ENRICHED" and (
+            date_row is None or date_row["fact_digest"] != digest
+        ):
+            raise ValueError("missing enrichment date")
+        if (
+            row["disposition"] == "ATTRIBUTED"
+            and date is not None
+            and (date_row is None or date != date_row["trade_date"])
+        ):
+            raise ValueError("attributed trade date mismatch")
+        if row["reason"] == "TRADE_DATE_CONFLICT":
+            if (
+                date_row is None
+                or date is None
+                or date == date_row["trade_date"]
+                or digest not in {c["fact_digest"] for c in conflicts.get(key, [])}
+                or fact.trade_content_digest() != trades[key]["content_digest"]
+            ):
+                raise ValueError("date conflict")
+            trade = trades[key]
+            command = db.execute(
+                "SELECT * FROM direct_journal_commands WHERE account=? AND reservation_id=?",
+                (account, trade["reservation_id"]),
+            ).fetchone()
+            if command is None:
+                raise ValueError("date conflict command")
+            original_keys = set(json.loads(command["strong_keys_json"]))
+            owners = [
+                item[0]
+                for identity_key in fact.identity_keys
+                for item in db.execute(
+                    "SELECT reservation_id FROM direct_journal_strong_keys WHERE account=? AND strong_key=?",
+                    (account, identity_key),
+                )
+            ]
+            payload = json.loads(command["payload_json"])
+            native = json.loads(command["native_identity_json"])
+            if (
+                len(owners) != len(fact.identity_keys)
+                or not owners
+                or set(owners) != {trade["reservation_id"]}
+                or not set(fact.binding_keys) <= original_keys
+                or native.get("exchange_name") != fact.route
+                or payload.get("symbol") != fact.instrument.native_symbol
+                or payload.get("side") != fact.side
+                or (payload.get("offset") is not None and payload.get("offset") != fact.offset)
+            ):
+                raise ValueError("date conflict binding")
+
+
 def _verify_execution_integrity(
-    db: sqlite3.Connection, account: str, capacity: int, *, max_fact_version: int = 3
+    db: sqlite3.Connection, account: str, capacity: int, *, max_fact_version: int = 4
 ) -> None:
     """Reconstruct persisted execution projections on open, without provider I/O."""
     try:
@@ -1242,6 +1473,13 @@ def _verify_execution_integrity(
             fact = GatewayReturnFact.from_mapping(raw)
             if fact.schema_version > max_fact_version:
                 raise ValueError("legacy fact version")
+            if row["reason"] in {"TRADE_DATE_ENRICHED", "TRADE_DATE_CONFLICT"} and (
+                max_fact_version < 4
+                or fact.schema_version != 4
+                or fact.kind is not DirectExecutionEventKind.TRADE
+                or fact.trade_date is None
+            ):
+                raise ValueError("trade date reason")
             if row["reason"] == "CANCEL_NOT_SENT_CONTRADICTION" and (
                 fact.schema_version != 2 or fact.kind is not DirectExecutionEventKind.CANCEL_ERROR
             ):
@@ -1378,6 +1616,7 @@ def _verify_execution_integrity(
                 fact.kind is not DirectExecutionEventKind.TRADE
                 or fact.trade_key is None
                 or fact_row["disposition"] != "CONFLICT"
+                or fact_row["reason"] == "TRADE_CONFLICT_RETAINED"
                 or fact.route != row["route"]
                 or _json(list(fact.trade_key)) != row["trade_key_json"]
                 or fact.trade_content_digest() != row["conflicting_content_digest"]
@@ -1456,12 +1695,19 @@ def _verify_execution_integrity(
                 and digest not in conflict_fact_ids
             ):
                 raise ValueError("unaudited content conflict")
+            if row["reason"] == "TRADE_CONFLICT_RETAINED" and (
+                not trade["conflict"]
+                or not conflicts.get((fact.route, _json(list(fact.trade_key))))
+            ):
+                raise ValueError("unsupported retained conflict")
             if row["reason"] == "TRADE_DUPLICATE" and (
                 not trade["applied"]
                 or trade["reservation_id"] != row["reservation_id"]
                 or trade["content_digest"] != fact.trade_content_digest()
             ):
                 raise ValueError("invalid duplicate trade")
+        if max_fact_version >= 4:
+            _verify_trade_dates(db, account, facts, trade_keys, conflicts)
         positions = {}
         for row in db.execute("SELECT * FROM direct_execution_positions"):
             if row["account"] != account:

@@ -522,3 +522,23 @@ These are registration-scoped in-memory market-resource records. They neither
 replace the durable trading journal nor attest provider/account readiness.
 Local synthetic and loopback results are separate from complete deployment,
 platform, native-account and whole-iteration acceptance.
+
+## Iteration 63 trade natural-date persistence (R30)
+
+New GatewayDirectCommandJournal databases use schema 9. Existing schema 8 files
+require explicit upgrade_from_v8 with the original account guard, journal ID and
+minimum revision; opening a file never upgrades it automatically. The migration
+audits existing command, execution, consumer, cancel and place associations before
+adding the trade-date side table. Older supported explicit upgrades also target
+v9. Previously persisted facts, digests, applied quantities and cursors are retained.
+
+A known natural date is bound to the original quantity-applied trade fact. When a
+later fact supplies a date for an already-applied undated trade, the same transaction
+stores that date and emits TRADE_DATE_ENRICHED with applied=False. ExecutionEvent
+marks it trade_metadata_only; original quantity, totals, position and applied fact
+pointer remain unchanged. Same-date or still-undated repeats emit no additional
+event. Conflicting known dates retain TRADE_DATE_CONFLICT and the original value.
+No date is inferred from the trading day. Read and reopen checks validate the date,
+original trade and event links; local integrity checks are not authentication of
+arbitrarily modified files or proof of venue facts. See the Iteration 63 R30 report
+for verification scope and the remaining production/account work.
