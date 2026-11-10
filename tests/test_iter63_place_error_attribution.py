@@ -600,3 +600,53 @@ def test_orphan_preparation_keys_fail_even_for_get(setup):
         journal.get_prepared_place(order.reservation_id)
     with pytest.raises(DirectCommandJournalError, match="INVALID_DATABASE"):
         journal.find_place_by_request_key("place-key-1")
+
+
+_UPGRADES = (
+    "enable_controls", "enable_strategy_ledger", "enable_account_extensions",
+    "enable_parent_authority", "enable_account_facts_financial", "enable_actor_stream",
+    "enable_strategy_origin", "enable_control_cancel", "enable_account_fact_recovery",
+    "enable_account_event_recovery",
+)
+
+
+def test_every_journal_upgrade_step_accepts_a_journal_that_has_placed_an_order(setup):
+    """I63-E129: v11 -> v12 and every later step refused any journal with a prepared place.
+
+    The steps passed the journal object where the place check takes the account
+    name, so the first prepared place made the check report a foreign row. A
+    journal that had sent one order could never be upgraded (account comparison,
+    DRAIN targets and everything after them).
+    """
+    journal, guard, path = setup
+    order, identity, prep = reserve(journal)
+    begin(journal, order, identity, prep)
+    for version, name in enumerate(_UPGRADES, start=10):
+        getattr(journal, name)(guard)
+        assert journal._schema_version == version, name
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT COUNT(*) FROM direct_place_preparations").fetchone()[0] == 1
+        assert db.execute("SELECT schema_version FROM direct_journal_meta").fetchone()[0] == 19
+    reopened = GatewayDirectCommandJournal(
+        path, "acct", generation=journal.generation, expected_journal_id=journal.journal_id,
+        minimum_revision=0, max_records=20, execution_max_facts=20,
+        controls_enabled=True, strategy_ledger_enabled=True, account_extensions_enabled=True,
+        parent_authority_enabled=True, account_facts_financial_enabled=True,
+        actor_stream_enabled=True, strategy_origin_enabled=True, control_cancel_enabled=True,
+        account_fact_recovery_enabled=True, account_event_recovery_enabled=True)
+    assert reopened.observe(order.strategy_scope, order.request_key, order.principal).record.status == "DISPATCHING"
+
+
+@pytest.mark.parametrize("step", range(2, len(_UPGRADES)))
+def test_journal_upgrade_steps_still_refuse_an_orphan_place_key(setup, step):
+    """The place check of each step keeps its meaning: a key without its preparation is refused."""
+    journal, guard, path = setup
+    order, identity, prep = reserve(journal)
+    begin(journal, order, identity, prep)
+    for name in _UPGRADES[:step]:
+        getattr(journal, name)(guard)
+    with sqlite3.connect(path) as db:
+        db.execute("INSERT INTO direct_place_keys VALUES ('acct', 'orphan-key', 'missing-reservation')")
+    with pytest.raises(DirectCommandJournalError, match="^INVALID_DATABASE$"):
+        getattr(journal, _UPGRADES[step])(guard)
+
