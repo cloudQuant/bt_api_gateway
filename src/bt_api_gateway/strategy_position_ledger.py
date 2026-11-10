@@ -129,11 +129,32 @@ class StrategyBaselineEvidence:
     external_positions: tuple[ExternalBaselinePosition, ...] = ()
     operator_ref: str | None = None
     operation_id: str | None = None
+    # schema_version 2 only (replayed baseline, I63-E111): the journal's own
+    # attributed trades, replayed from ``history_start_trading_day``, are
+    # declared to explain every row of ``account_positions`` at this cut.
+    history_start_trading_day: str | None = None
+    account_positions: tuple[ExternalBaselinePosition, ...] = ()
 
     def __post_init__(self):
         refs = (self.account_scope, self.journal_id, self.route, self.owner_generation, self.source_ref,
                 self.position_snapshot_ref, self.open_orders_snapshot_ref, self.cut_ref)
-        if (type(self.schema_version) is not int or self.schema_version != 1
+        if type(self.schema_version) is not int or self.schema_version not in (1, 2):
+            _error("STRATEGY_LEDGER_UNAVAILABLE")
+        if self.schema_version == 1:
+            if self.history_start_trading_day is not None or self.account_positions != ():
+                _error("STRATEGY_LEDGER_UNAVAILABLE")
+            holdings = self.external_positions
+        else:
+            holdings = self.account_positions
+            if (not _day(self.history_start_trading_day) or not _day(self.trading_day)
+                    or self.history_start_trading_day > self.trading_day
+                    or self.external_positions != () or self.operator_ref is not None
+                    or type(holdings) is not tuple or len(holdings) > 4096
+                    or any(type(item) is not ExternalBaselinePosition for item in holdings)
+                    or len({(_json(item.instrument.to_dict()), item.direction) for item in holdings})
+                       != len(holdings)):
+                _error("STRATEGY_LEDGER_UNAVAILABLE")
+        if (type(holdings) is not tuple
                 or any(not _text(item) or not item.isprintable() for item in refs)
                 or not _day(self.trading_day)
                 or type(self.session_generation) is not int or not 0 < self.session_generation < 2**63
@@ -147,7 +168,7 @@ class StrategyBaselineEvidence:
                 or type(self.positions_empty) is not bool or self.open_orders_empty is not True
                 or type(self.external_positions) is not tuple
                 or any(type(item) is not ExternalBaselinePosition for item in self.external_positions)
-                or (self.positions_empty != (not self.external_positions))
+                or (self.positions_empty != (not holdings))
                 or ((self.operator_ref is None) != (self.operation_id is None))
                 or (self.operator_ref is not None and (not _text(self.operator_ref)
                     or not self.operator_ref.isprintable() or not _text(self.operation_id)
@@ -161,7 +182,19 @@ class StrategyBaselineEvidence:
         except DirectCommandJournalError as exc:
             raise DirectCommandJournalError("STRATEGY_LEDGER_UNAVAILABLE") from exc
 
+    @property
+    def initial_trading_day(self) -> str:
+        """The day the ledger replay starts from (the observation day for v1)."""
+        return self.trading_day if self.schema_version == 1 else self.history_start_trading_day
+
     def to_mapping(self) -> dict:
+        mapping = self._v1_mapping()
+        if self.schema_version == 2:
+            mapping["history_start_trading_day"] = self.history_start_trading_day
+            mapping["account_positions"] = [position.to_mapping() for position in self.account_positions]
+        return mapping
+
+    def _v1_mapping(self) -> dict:
         return {
             "schema_version": self.schema_version,
             "account_scope": self.account_scope,
@@ -192,17 +225,27 @@ class StrategyBaselineEvidence:
 
     @classmethod
     def from_mapping(cls, mapping: object) -> "StrategyBaselineEvidence":
-        if type(mapping) is not dict or set(mapping) != {
+        fields = {
             "schema_version", "account_scope", "journal_id", "trading_day", "route", "owner_generation",
             "session_generation", "source_ref", "position_snapshot_ref", "open_orders_snapshot_ref",
             "cut_ref", "coverage_refs", "observed_at_ns", "valid_until_ns", "positions_complete",
             "open_orders_complete", "positions_empty", "open_orders_empty", "external_positions",
             "operator_ref", "operation_id",
-        } or type(mapping.get("coverage_refs")) is not list or type(mapping.get("external_positions")) is not list:
+        }
+        replayed = type(mapping) is dict and mapping.get("schema_version") == 2
+        if replayed:
+            fields |= {"history_start_trading_day", "account_positions"}
+        if (type(mapping) is not dict or set(mapping) != fields
+                or type(mapping.get("coverage_refs")) is not list
+                or type(mapping.get("external_positions")) is not list
+                or (replayed and type(mapping.get("account_positions")) is not list)):
             _error("STRATEGY_LEDGER_UNAVAILABLE")
         data = dict(mapping)
         data["coverage_refs"] = tuple(data["coverage_refs"])
         data["external_positions"] = tuple(ExternalBaselinePosition.from_mapping(row) for row in data["external_positions"])
+        if replayed:
+            data["account_positions"] = tuple(
+                ExternalBaselinePosition.from_mapping(row) for row in data["account_positions"])
         return cls(**data)
 
 
@@ -227,7 +270,7 @@ def _verify_strategy_ledger_integrity(db: sqlite3.Connection, account: str) -> N
             journal = db.execute("SELECT journal_id FROM direct_journal_meta WHERE account=?", (account,)).fetchone()
             if (journal is None or row[0] != account or evidence.account_scope != account
                     or evidence.journal_id != journal[0]
-                    or evidence.trading_day != row[1] or _json(raw) != row[3]
+                    or evidence.initial_trading_day != row[1] or _json(raw) != row[3]
                     or not _digest(row[2]) or evidence.digest != row[2]):
                 _error("INVALID_DATABASE")
             expected = {
@@ -257,6 +300,7 @@ def initialize_empty_strategy_baseline(
     a callback chosen by a client nor this persisted digest is a proof.
     """
     if (not db.in_transaction or type(evidence) is not StrategyBaselineEvidence
+            or evidence.schema_version != 1
             or not evidence.positions_empty or not callable(verify_current_empty)):
         _error("STRATEGY_LEDGER_UNAVAILABLE")
     account = evidence.account_scope
@@ -295,6 +339,7 @@ def initialize_external_strategy_baseline(
     the rows nor the operator name supplied by a caller constitute that proof.
     """
     if (not db.in_transaction or type(evidence) is not StrategyBaselineEvidence
+            or evidence.schema_version != 1
             or evidence.positions_empty or not callable(verify_authorized_snapshot)):
         _error("STRATEGY_LEDGER_UNAVAILABLE")
     account = evidence.account_scope
@@ -317,6 +362,223 @@ def initialize_external_strategy_baseline(
             db.execute("INSERT INTO strategy_external_baseline VALUES (?, ?, ?, ?, ?, ?)",
                        (account, _json(position.instrument.to_dict()), position.direction,
                         position.today_quantity, position.yesterday_quantity, digest))
+        _verify_strategy_ledger_integrity(db, account)
+    except DirectCommandJournalError:
+        raise
+    except Exception as exc:
+        raise DirectCommandJournalError("STRATEGY_LEDGER_UNAVAILABLE") from exc
+
+
+_NEVER_AT_VENUE = frozenset(("RESERVED", "RELEASED", "EXPIRED", "NOT_SENT"))
+_POSSIBLY_AT_VENUE = frozenset(("DISPATCHING", "SENT", "UNKNOWN"))
+
+
+def _command_settled(db: sqlite3.Connection, account: str, reservation_id: str, status: str,
+                     quantity: Decimal) -> bool:
+    """Whether the journal alone proves nothing more can trade on this command.
+
+    A command that never reached the venue must have no order or trade fact.
+    A command that may have reached it needs a newest attributed ORDER fact in
+    a terminal state whose cumulative fill equals the applied trades.
+    """
+    facts = db.execute(
+        "SELECT fact_json,disposition,event_sequence FROM direct_execution_facts "
+        "WHERE account=? AND reservation_id=? LIMIT ?", (account, reservation_id, _MAX_ROWS + 1),
+    ).fetchall()
+    if len(facts) > _MAX_ROWS:
+        _error("STRATEGY_LEDGER_UNAVAILABLE")
+    if status in _NEVER_AT_VENUE:
+        return not any(_decode_fact(raw).kind in (DirectExecutionEventKind.ORDER, DirectExecutionEventKind.TRADE)
+                       for raw, _, _ in facts)
+    if status not in _POSSIBLY_AT_VENUE:
+        _error("STRATEGY_LEDGER_UNAVAILABLE")
+    row = db.execute(
+        "SELECT total_quantity FROM direct_execution_totals WHERE account=? AND reservation_id=?",
+        (account, reservation_id),
+    ).fetchone()
+    filled = Decimal(0) if row is None else _quantity(row[0], allow_zero=True)
+    if filled > quantity:
+        _error("STRATEGY_LEDGER_UNAVAILABLE")
+    ordered = sorted((item for item in facts if item[1] == "ATTRIBUTED" and item[2] is not None),
+                     key=lambda item: item[2], reverse=True)
+    for raw, _, _ in ordered:
+        fact = _decode_fact(raw)
+        if fact.kind is not DirectExecutionEventKind.ORDER:
+            continue
+        # The newest ORDER supersedes older terminal observations.
+        return (fact.status in {DirectOrderStatus.CANCELLED, DirectOrderStatus.FILLED, DirectOrderStatus.REJECTED}
+                and fact.filled_quantity is not None
+                and _quantity(fact.filled_quantity, allow_zero=True) == filled
+                and (fact.status is not DirectOrderStatus.FILLED or filled == quantity)
+                and (fact.status is not DirectOrderStatus.REJECTED or filled == 0))
+    return False
+
+
+def _native_trading_day(raw: object) -> str | None:
+    """The trading day of a command's native identity, or None when unknown."""
+    try:
+        identity = json.loads(raw) if type(raw) is str else None
+        if type(identity) is not dict:
+            return None
+        fields = identity.get("fields_json")
+        fields = json.loads(fields) if type(fields) is str else identity.get("fields")
+        day = fields.get("trading_day") if type(fields) is dict else None
+    except Exception:
+        return None
+    return day if _day(day) else None
+
+
+def prior_day_commands_settled(db: sqlite3.Connection, account: str, binding: "StrategyInstrumentBinding",
+                               trading_day: str) -> bool:
+    """No command of an earlier trading day on this instrument can still trade.
+
+    A venue query only covers the current trading day, so an order that may
+    have reached the venue on an earlier day and has no settled terminal
+    evidence in the journal can never be completed by a later query: its fills
+    are unknowable and the ledger is not continuous for the instrument. The
+    caller holds the owner fence and one SQLite transaction. Commands of the
+    current day are not examined; their completeness is the return source's.
+    """
+    if (not db.in_transaction or not _text(account) or type(binding) is not StrategyInstrumentBinding
+            or not _day(trading_day)):
+        _error("STRATEGY_LEDGER_UNAVAILABLE")
+    try:
+        rows = db.execute(
+            "SELECT reservation_id,status,payload_json,native_identity_json FROM direct_journal_commands "
+            "WHERE account=? AND status IN ('DISPATCHING','SENT','UNKNOWN') LIMIT ?",
+            (account, _MAX_ROWS + 1),
+        ).fetchall()
+        if len(rows) > _MAX_ROWS:
+            return False
+        for reservation_id, status, raw_payload, raw_identity in rows:
+            payload = _decoded_payload(raw_payload)
+            if payload.get("symbol") != binding.instrument.native_symbol:
+                continue
+            if payload.get("exchange_id") not in (None, binding.instrument.venue):
+                continue
+            if _native_trading_day(raw_identity) == trading_day:
+                continue
+            if not _command_settled(db, account, reservation_id, status, _quantity(payload.get("quantity"))):
+                return False
+        return True
+    except DirectCommandJournalError:
+        return False
+    except (sqlite3.Error, KeyError, TypeError, ValueError, ArithmeticError):
+        return False
+
+
+def initialize_replayed_strategy_baseline(
+    db: sqlite3.Connection,
+    evidence: StrategyBaselineEvidence,
+    *,
+    resolve_binding: Callable,
+    verify_day_transition: Callable[[str, str], bool],
+    verify_current_continuity: Callable,
+    verify_current_snapshot: Callable[[StrategyBaselineEvidence], bool],
+) -> None:
+    """Adopt a journal that already has history as the ledger's origin (I63-E111).
+
+    For an account that traded through this journal before its ledger had a
+    baseline. Nothing is assigned from the snapshot: the baseline is accepted
+    only when the journal's own strongly attributed trades, replayed from
+    ``history_start_trading_day`` as if the account had started flat, yield
+    exactly the provider's complete position snapshot, every command is
+    settled, no fact is unattributed and no order is open. Any residual
+    (external or pre-existing holdings, an unresolved order) refuses the
+    baseline instead of being booked to a strategy or to external.
+
+    ``verify_current_snapshot`` is trusted installed owner code: it attests
+    that ``evidence.account_positions`` and the empty open-order set are the
+    provider's complete facts at one comparable cut that is still current, and
+    it keeps that fence through commit. The other ports are the owner's
+    installed ledger ports.
+    """
+    if (not db.in_transaction or type(evidence) is not StrategyBaselineEvidence
+            or evidence.schema_version != 2
+            or not all(callable(port) for port in (resolve_binding, verify_day_transition,
+                                                   verify_current_continuity, verify_current_snapshot))):
+        _error("STRATEGY_LEDGER_UNAVAILABLE")
+    account = evidence.account_scope
+    _verify_strategy_ledger_integrity(db, account)
+    encoded, digest = _json(evidence.to_mapping()), evidence.digest
+    row = db.execute("SELECT initial_trading_day,evidence_digest,evidence_json FROM strategy_position_baseline WHERE account=?", (account,)).fetchone()
+    if row is not None:
+        if tuple(row) != (evidence.history_start_trading_day, digest, encoded):
+            _error("STRATEGY_BASELINE_CONFLICT")
+        return
+    try:
+        commands = db.execute(
+            "SELECT reservation_id,strategy,status,payload_json FROM direct_journal_commands WHERE account=? LIMIT ?",
+            (account, _MAX_ROWS + 1),
+        ).fetchall()
+        facts = db.execute(
+            "SELECT fact_json,disposition,applied,reservation_id FROM direct_execution_facts WHERE account=? LIMIT ?",
+            (account, _MAX_ROWS + 1),
+        ).fetchall()
+        if len(commands) > _MAX_ROWS or len(facts) > _MAX_ROWS:
+            _error("STRATEGY_LEDGER_UNAVAILABLE")
+        if not commands and not facts:
+            # A journal without history takes the empty or the external baseline.
+            _error("STRATEGY_LEDGER_UNAVAILABLE")
+        known = {item[0] for item in commands}
+        instruments: dict[str, MarketInstrumentKey] = {}
+        for raw, disposition, applied, reservation_id in facts:
+            if disposition != "ATTRIBUTED" or reservation_id not in known:
+                _error("STRATEGY_BASELINE_HISTORY_UNRESOLVED")
+            fact = _decode_fact(raw)
+            if applied and fact.kind is DirectExecutionEventKind.TRADE:
+                instruments[_json(fact.instrument.to_dict())] = fact.instrument
+        for reservation_id, _, status, raw_payload in commands:
+            quantity = _quantity(_decoded_payload(raw_payload).get("quantity"))
+            if not _command_settled(db, account, reservation_id, status, quantity):
+                _error("STRATEGY_BASELINE_HISTORY_UNRESOLVED")
+        if verify_current_snapshot(evidence) is not True:
+            _error("STRATEGY_LEDGER_UNAVAILABLE")
+        db.execute("INSERT INTO strategy_position_baseline VALUES (?, ?, ?, ?)",
+                   (account, evidence.history_start_trading_day, digest, encoded))
+        names = ("long_today", "long_yesterday", "short_today", "short_yesterday")
+        observed: dict[str, dict[str, Decimal]] = {}
+        for item in evidence.account_positions:
+            key = _json(item.instrument.to_dict())
+            instruments[key] = item.instrument
+            legs = observed.setdefault(key, {name: Decimal(0) for name in names})
+            legs[item.direction + "_today"] = _quantity(item.today_quantity, allow_zero=True)
+            legs[item.direction + "_yesterday"] = _quantity(item.yesterday_quantity, allow_zero=True)
+        strategies = sorted({item[1] for item in commands})
+        if any(not _text(strategy) for strategy in strategies):
+            _error("STRATEGY_LEDGER_UNAVAILABLE")
+        with localcontext() as context:
+            context.prec = 160
+            for key in sorted(instruments):
+                instrument = instruments[key]
+                try:
+                    binding = resolve_binding({"symbol": instrument.native_symbol, "exchange_id": instrument.venue})
+                except Exception as exc:
+                    raise DirectCommandJournalError("STRATEGY_BASELINE_MISMATCH") from exc
+                if (type(binding) is not StrategyInstrumentBinding or binding.instrument != instrument
+                        or binding.route != evidence.route):
+                    _error("STRATEGY_BASELINE_MISMATCH")
+                replayed = {name: Decimal(0) for name in names}
+                for strategy in strategies:
+                    position = strategy_position(
+                        db, account, strategy, binding, trading_day=evidence.trading_day,
+                        resolve_binding=resolve_binding, verify_day_transition=verify_day_transition,
+                        verify_current_continuity=verify_current_continuity)
+                    for name in names:
+                        replayed[name] += getattr(position, name)
+                expected = observed.get(key, {name: Decimal(0) for name in names})
+                if binding.split_close_required:
+                    matches = all(replayed[name] == expected[name] for name in names)
+                else:
+                    # The venue chooses the bucket of an ordinary close.
+                    matches = all(
+                        replayed[side + "_today"] + replayed[side + "_yesterday"]
+                        == expected[side + "_today"] + expected[side + "_yesterday"]
+                        for side in ("long", "short"))
+                if not matches:
+                    _error("STRATEGY_BASELINE_MISMATCH")
+        if verify_current_snapshot(evidence) is not True:
+            _error("STRATEGY_LEDGER_UNAVAILABLE")
         _verify_strategy_ledger_integrity(db, account)
     except DirectCommandJournalError:
         raise

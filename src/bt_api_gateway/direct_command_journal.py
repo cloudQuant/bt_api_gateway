@@ -2090,6 +2090,65 @@ class GatewayDirectCommandJournal:
                 self._bump(db)
             self._assert_account_guard(guard)
 
+    def initialize_replayed_strategy_ledger(
+        self, evidence: object, *, guard: LocalAccountSessionGuard,
+        baseline_fence: Callable[[], ContextManager[None]], verify_current_snapshot: Callable,
+    ) -> None:
+        """Adopt this journal's own settled history as the ledger origin (I63-E111).
+
+        Requires the installed ledger ports. The trusted verifier attests the
+        provider's complete position and empty open-order snapshot at one
+        comparable cut, held until transaction commit; the replay comparison
+        itself is done by the ledger on this transaction.
+        """
+        if (self._schema_version < 11 or not callable(baseline_fence)
+                or self._strategy_ledger_ports is None or guard is not self._strategy_ledger_guard):
+            raise DirectCommandJournalError("STRATEGY_LEDGER_UNAVAILABLE")
+        self._assert_account_guard(guard)
+        from .strategy_position_ledger import StrategyBaselineEvidence, initialize_replayed_strategy_baseline
+        if (type(evidence) is not StrategyBaselineEvidence or evidence.account_scope != self._account
+                or evidence.journal_id != self._journal_id or evidence.owner_generation != self._generation):
+            raise DirectCommandJournalError("STRATEGY_LEDGER_UNAVAILABLE")
+        resolve_binding, _, verify_transition, verify_continuity = self._strategy_ledger_ports
+        with ExitStack() as fence_stack, self._transaction() as db:
+            manager = baseline_fence()
+            enter, exit_ = type(manager).__enter__, type(manager).__exit__
+            enter(manager)
+            fence_stack.push(lambda *exc: (exit_(manager, *exc), False)[1])
+            before = db.execute("SELECT 1 FROM strategy_position_baseline WHERE account=?", (self._account,)).fetchone()
+            initialize_replayed_strategy_baseline(
+                db, evidence, resolve_binding=resolve_binding, verify_day_transition=verify_transition,
+                verify_current_continuity=verify_continuity, verify_current_snapshot=verify_current_snapshot)
+            if before is None:
+                self._bump(db)
+            self._assert_account_guard(guard)
+
+    def read_strategy_ledger_state(self, *, guard: LocalAccountSessionGuard) -> dict:
+        """Report whether a baseline exists and whether the journal has history.
+
+        Owner-local and read-only; the result is a description, not a proof.
+        ``earliest_trade_day`` is the first trading day of an applied trade.
+        """
+        if self._schema_version < 11:
+            raise DirectCommandJournalError("STRATEGY_LEDGER_UNAVAILABLE")
+        self._assert_account_guard(guard)
+        from .strategy_position_ledger import _decode_fact
+        with self._transaction() as db:
+            baseline = db.execute(
+                "SELECT evidence_json FROM strategy_position_baseline WHERE account=?", (self._account,)).fetchone()
+            history = any(
+                db.execute(f"SELECT 1 FROM {table} WHERE account=? LIMIT 1", (self._account,)).fetchone() is not None
+                for table in ("direct_journal_commands", "direct_execution_facts"))
+            earliest = None
+            if baseline is None and history:
+                for raw, in db.execute(
+                        "SELECT fact_json FROM direct_execution_facts WHERE account=? AND applied=1", (self._account,)):
+                    day = _decode_fact(raw).trading_day
+                    if earliest is None or day < earliest:
+                        earliest = day
+            return {"baseline": None if baseline is None else json.loads(baseline[0]),
+                    "history_present": history, "earliest_trade_day": earliest}
+
     def install_unknown_close_capacity(self, *, guard: LocalAccountSessionGuard, source_fence: Callable,
                                        verify_other_close_capacity: Callable):
         """Install owner-only same-cut proof; an absent proof conservatively blocks."""
