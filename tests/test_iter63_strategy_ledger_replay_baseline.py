@@ -208,7 +208,7 @@ def test_unresolved_history_refuses_the_baseline(db, case):
 def test_snapshot_must_be_current_before_and_after_the_comparison(db):
     filled_order(db, "open", spec())
     item = evidence(position(RB, "long", "0", "1"))
-    with pytest.raises(DirectCommandJournalError, match="STRATEGY_LEDGER_UNAVAILABLE"):
+    with pytest.raises(DirectCommandJournalError, match="STRATEGY_BASELINE_SNAPSHOT_NOT_CURRENT"):
         replay(db, item, verify=lambda _: False)
     calls = []
 
@@ -216,7 +216,7 @@ def test_snapshot_must_be_current_before_and_after_the_comparison(db):
         calls.append(actual)
         return len(calls) == 1
 
-    with pytest.raises(DirectCommandJournalError, match="STRATEGY_LEDGER_UNAVAILABLE"):
+    with pytest.raises(DirectCommandJournalError, match="STRATEGY_BASELINE_SNAPSHOT_NOT_CURRENT"):
         replay(db, item, verify=once)
     assert calls == [item, item]
 
@@ -228,8 +228,18 @@ def test_journal_without_history_is_not_a_replayed_baseline(db):
 
 def test_earlier_trade_than_the_declared_start_is_refused(db):
     filled_order(db, "open", spec())
-    with pytest.raises(DirectCommandJournalError, match="STRATEGY_LEDGER_UNAVAILABLE"):
+    with pytest.raises(DirectCommandJournalError, match="STRATEGY_BASELINE_REPLAY_UNAVAILABLE"):
         replay(db, evidence(position(RB, "long", "1", "0"), start=D1))
+
+
+@pytest.mark.parametrize("port", ["verify_current_continuity", "verify_day_transition"])
+def test_history_that_cannot_be_replayed_to_the_observation_day_names_that(db, port):
+    # The owner cannot vouch for continuity, or for the day change.
+    filled_order(db, "open", spec())
+    item = evidence(position(RB, "long", "0", "1"))
+    ports = dict(PORTS, **{port: lambda *_: False})
+    with pytest.raises(DirectCommandJournalError, match="STRATEGY_BASELINE_REPLAY_UNAVAILABLE"):
+        initialize_replayed_strategy_baseline(db, item, verify_current_snapshot=lambda _: True, **ports)
 
 
 def test_evidence_versions_do_not_mix(db):

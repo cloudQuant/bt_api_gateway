@@ -533,7 +533,7 @@ def initialize_replayed_strategy_baseline(
             if not _command_settled(db, account, reservation_id, status, quantity):
                 _error("STRATEGY_BASELINE_HISTORY_UNRESOLVED")
         if verify_current_snapshot(evidence) is not True:
-            _error("STRATEGY_LEDGER_UNAVAILABLE")
+            _error("STRATEGY_BASELINE_SNAPSHOT_NOT_CURRENT")
         db.execute("INSERT INTO strategy_position_baseline VALUES (?, ?, ?, ?)",
                    (account, evidence.history_start_trading_day, digest, encoded))
         names = ("long_today", "long_yesterday", "short_today", "short_yesterday")
@@ -560,10 +560,17 @@ def initialize_replayed_strategy_baseline(
                     _error("STRATEGY_BASELINE_MISMATCH")
                 replayed = {name: Decimal(0) for name in names}
                 for strategy in strategies:
-                    position = strategy_position(
-                        db, account, strategy, binding, trading_day=evidence.trading_day,
-                        resolve_binding=resolve_binding, verify_day_transition=verify_day_transition,
-                        verify_current_continuity=verify_current_continuity)
+                    try:
+                        position = strategy_position(
+                            db, account, strategy, binding, trading_day=evidence.trading_day,
+                            resolve_binding=resolve_binding, verify_day_transition=verify_day_transition,
+                            verify_current_continuity=verify_current_continuity)
+                    except DirectCommandJournalError as exc:
+                        if exc.code != "STRATEGY_LEDGER_UNAVAILABLE":
+                            raise
+                        # The history cannot be replayed to this day under the
+                        # owner's ports (continuity, day transition, binding).
+                        raise DirectCommandJournalError("STRATEGY_BASELINE_REPLAY_UNAVAILABLE") from exc
                     for name in names:
                         replayed[name] += getattr(position, name)
                 expected = observed.get(key, {name: Decimal(0) for name in names})
@@ -578,7 +585,7 @@ def initialize_replayed_strategy_baseline(
                 if not matches:
                     _error("STRATEGY_BASELINE_MISMATCH")
         if verify_current_snapshot(evidence) is not True:
-            _error("STRATEGY_LEDGER_UNAVAILABLE")
+            _error("STRATEGY_BASELINE_SNAPSHOT_NOT_CURRENT")
         _verify_strategy_ledger_integrity(db, account)
     except DirectCommandJournalError:
         raise
