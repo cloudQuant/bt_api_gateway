@@ -509,7 +509,10 @@ class _CommitPort:
         with ExitStack() as stack:
             recheck = stack.enter_context(_request_scope(self._request_fence, self._record))
             if self._market_gate is not None:
-                stack.enter_context(self._market_gate.dispatch_fence(self._market_permit, self._record))
+                # After the decision-B claim an unfinished market change no
+                # longer stops this in-flight command (the claim decides).
+                stack.enter_context(self._market_gate.dispatch_fence(
+                    self._market_permit, self._record, claimed=self._claim is not None))
             self._owner._owned()
             if (
                 record.operation is not WriteOperation.PLACE
@@ -548,7 +551,8 @@ class _CommitPort:
                 if recheck is not None:
                     recheck()
                 if self._market_gate is not None:
-                    self._market_gate.recheck(self._market_permit, current)
+                    self._market_gate.recheck(self._market_permit, current,
+                                              claimed=self._claim is not None)
 
             def before_commit() -> None:
                 before_dispatch()
