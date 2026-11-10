@@ -706,3 +706,55 @@ def test_refresh_without_descriptor_request_does_not_probe_or_invent_one():
     assert reply["status"] == "active"
     assert "source_descriptor" not in reply["items"][0]["subscription"]
     assert hub.registration_active(key, "a")
+
+
+
+def test_unsubscribe_answers_for_the_callers_reference_while_the_upstream_release_is_pending():
+    # A provider that releases off-thread (the Gateway's owner bridge) cannot
+    # confirm the release inside the unsubscribe call. The caller's reference
+    # is gone all the same; only the upstream release is still the Hub's work.
+    key = _key()
+    hub, provider, service = setup(keys=(key,), principals=("a", "b"))
+    provider.ready = provider.descriptor_ready = True
+    assert begin(service, "1" * 32, (key,))["status"] == "pending"
+    assert advance(service, "1" * 32)["status"] == "active"
+    assert begin(service, "2" * 32, (key,), "b")["status"] == "pending"
+    assert advance(service, "2" * 32, "b")["status"] == "active"
+
+    # Not the last user: an ordinary reply, the upstream stays.
+    reply = call(service, "unsubscribe", "b", key=key.to_dict())
+    assert reply["upstream_released"] is False and len(provider.unsubscribed) == 0
+    assert hub.ready and hub.registration_active(key, "a")
+
+    provider.release_ready = False
+    reply = call(service, "unsubscribe", key=key.to_dict())  # the last user leaves
+    assert dict(reply) == {"stream_id": key.stream_id, "epoch": hub.head(key)["epoch"],
+                           "head": hub.head(key)["head"], "upstream_released": False}
+    assert not hub.registration_active(key, "a")
+    assert not hub.ready and hub.readiness["pending_releases"] == 1  # the Hub still owes the release
+    # Asking again is idempotent and still truthful.
+    assert call(service, "unsubscribe", key=key.to_dict())["upstream_released"] is False
+    # The Hub's own interface keeps reporting the unconfirmed release.
+    with pytest.raises(GatewayMarketHubError, match="PROVIDER_UNSUBSCRIBE_FAILED"):
+        hub.unsubscribe("a", key, "a")
+
+    provider.release_ready = True
+    hub.maintain(())
+    assert hub.ready and len(provider.unsubscribed) == 1
+    assert call(service, "unsubscribe", key=key.to_dict())["upstream_released"] is True
+
+
+def test_unsubscribe_still_fails_while_the_callers_reference_cannot_be_dropped():
+    key = _key()
+    hub, provider, service = setup(keys=(key,))
+    calls = []
+
+    def fail_start(key, *, generation):
+        calls.append(key)
+        raise RuntimeError("outcome unknown")
+
+    provider.begin_subscribe = fail_start
+    begin(service, "1" * 32, (key,))
+    advance(service, "1" * 32, limit=5)
+    with pytest.raises(GatewayMarketHubError, match="PROVIDER_SUBSCRIBE_OUTCOME_UNKNOWN"):
+        call(service, "unsubscribe", key=key.to_dict())

@@ -2260,7 +2260,23 @@ class GatewayMarketService:
             except GatewayMarketHubError as exc:
                 raise GatewayMarketServiceError(exc.code, retryable=exc.retryable) from None
         if operation == "market.unsubscribe":
-            return self._hub.unsubscribe(principal_ref, key, registration_id)
+            try:
+                return self._hub.unsubscribe(principal_ref, key, registration_id)
+            except GatewayMarketHubError as exc:
+                if (exc.code != "PROVIDER_UNSUBSCRIBE_FAILED"
+                        or self._hub.registration_active(key, registration_id)):
+                    raise
+                # The caller asked to drop its own reference, and that is done.
+                # What is not confirmed yet is the provider's release of the
+                # upstream nobody uses any more; the Hub retries that itself
+                # (maintain, close) and stays not ready until it succeeds. A
+                # provider that releases off-thread never confirms within this
+                # call, so answering with a failure made every strategy that
+                # was the last user of an instrument report its normal stop as
+                # incomplete (SimNow 2026-11-10: 40 of 50 stops).
+                head = self._hub.head(key)
+                return MappingProxyType({"stream_id": head["stream_id"], "epoch": head["epoch"],
+                                         "head": head["head"], "upstream_released": False})
         if not self._hub.registration_active(key, registration_id):
             raise GatewayMarketServiceError("MARKET_SUBSCRIPTION_REQUIRED")
         if operation == MARKET_CLOCK_OPERATION:
