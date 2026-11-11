@@ -135,6 +135,8 @@ class GatewayAccountReadModel:
         self._required_coverage, self._view_policies = tuple(required_coverage), policies
         self._require_open_orders = require_open_orders
         self._assert_generation = assert_current_generation
+        # The last error the owner's authority callback raised (compared by identity only).
+        self._authority_error = None
         self._clock, self._monotonic_clock = clock, monotonic_clock
         self._wall_clock_regression_budget = 2.0 * (wall_res + mono_res)
         self._refresh_interval = _positive_seconds(refresh_interval_seconds)
@@ -224,7 +226,17 @@ class GatewayAccountReadModel:
     def _check_authority(self, generation):
         if self._generation != generation:
             raise GatewayAccountSessionWorkerError("PROVIDER_RESULT_GENERATION_STALE")
-        if self._assert_generation(generation) is not None:
+        try:
+            verdict = self._assert_generation(generation)
+        except Exception as error:
+            # The owner's own check failed: its session changed or its link dropped. That is
+            # the owner's finding in the owner's terms and is handed back as it is.
+            # finish_refresh used to rename it to a failure of the observation or of the
+            # state write, so an owner could not tell a link transition from a broken read
+            # model and stopped for good (I63-E148).
+            self._authority_error = error
+            raise
+        if verdict is not None:
             raise GatewayAccountSessionWorkerError("SESSION_OWNERSHIP_UNAVAILABLE")
         if self._generation != generation:
             raise GatewayAccountSessionWorkerError("PROVIDER_RESULT_GENERATION_STALE")
@@ -511,6 +523,10 @@ class GatewayAccountReadModel:
             if self._generation == generation:
                 self._record_refresh_failure()
             if isinstance(exc, Exception):
+                if exc is self._authority_error:
+                    # Not a fault of the observation or of the state write: see _check_authority.
+                    self._authority_error = None
+                    raise
                 code = "STATE_WRITE_FAILED" if phase == "journal_replace" else "OBSERVATION_INVALID"
                 raise GatewayAccountSessionWorkerError(code) from None
             raise

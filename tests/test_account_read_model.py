@@ -154,6 +154,88 @@ def test_incomplete_or_stale_observation_and_lost_authority_never_publish_curren
     assert model.read_status()["ready"] is True
 
 
+class _OwnerLinkError(Exception):
+    """Stands for an owner's own finding, such as a session that became unavailable."""
+
+
+@pytest.mark.parametrize("when", ["before_the_state_write", "after_the_state_write"])
+def test_the_owners_own_authority_error_is_handed_back_unrenamed(tmp_path, monkeypatch, when):
+    """I63-E148: the owner's authority callback can fail because its link dropped. The refresh
+    used to rename that to OBSERVATION_INVALID or STATE_WRITE_FAILED, which an owner cannot tell
+    from a broken read model."""
+    clocks = Clocks()
+    journal = GatewayEventJournal(tmp_path / "readmodel.db", clock=clocks.utc)
+    state = {"error": None}
+
+    def check(_generation):
+        if state["error"] is not None:
+            raise state["error"]
+
+    model = GatewayAccountReadModel(
+        journal, account_key=_identity(), journal_account_scope="account:shared",
+        state_scope="strategy:account-facts", required_coverage=(_resource(),),
+        assert_current_generation=check, clock=clocks.utc, monotonic_clock=clocks.mono)
+    model.start_generation("gen-1")
+    observation = _observation(clocks, observation_id="obs-1")
+    dropped = _OwnerLinkError("the link dropped")
+    token = model.begin_refresh()
+    if when == "before_the_state_write":
+        state["error"] = dropped
+    else:
+        original_replace = journal.replace_state_snapshot
+
+        def drop_after_write(*args, **kwargs):
+            result = original_replace(*args, **kwargs)
+            state["error"] = dropped
+            return result
+        monkeypatch.setattr(journal, "replace_state_snapshot", drop_after_write)
+    with pytest.raises(_OwnerLinkError) as caught:
+        model.finish_refresh(token, observation)
+    assert caught.value is dropped                              # the very error, not a renamed one
+    assert model.read_status()["ready"] is False                # and nothing is offered as current
+    # Once the owner's check passes again a new read makes the model ready.
+    state["error"] = None
+    if when == "after_the_state_write":
+        monkeypatch.setattr(journal, "replace_state_snapshot", original_replace)
+    model.finish_refresh(model.begin_refresh(), replace(observation, observation_id="obs-2"))
+    assert model.read_status()["ready"] is True
+
+
+def test_an_authority_callback_that_answers_instead_of_passing_is_refused(tmp_path):
+    clocks = Clocks()
+    journal = GatewayEventJournal(tmp_path / "readmodel.db", clock=clocks.utc)
+    answers = [None]
+    model = GatewayAccountReadModel(
+        journal, account_key=_identity(), journal_account_scope="account:shared",
+        state_scope="strategy:account-facts", required_coverage=(_resource(),),
+        assert_current_generation=lambda _generation: answers[0], clock=clocks.utc, monotonic_clock=clocks.mono)
+    model.start_generation("gen-1")
+    token = model.begin_refresh()
+    answers[0] = False                                           # anything but None is not a pass
+    with pytest.raises(GatewayAccountSessionWorkerError, match="^SESSION_OWNERSHIP_UNAVAILABLE$"):
+        model.finish_refresh(token, _observation(clocks, observation_id="obs-1"))
+    assert model.read_status()["ready"] is False
+
+
+def test_other_failures_of_a_refresh_keep_their_finite_codes(tmp_path, monkeypatch):
+    model, journal, clocks, _, _ = _setup(tmp_path)
+    observation = _observation(clocks, observation_id="obs-1")
+
+    def broken_write(*_args, **_kwargs):
+        raise _OwnerLinkError("not raised by the authority callback")
+    monkeypatch.setattr(journal, "replace_state_snapshot", broken_write)
+    with pytest.raises(GatewayAccountSessionWorkerError, match="^STATE_WRITE_FAILED$") as caught:
+        model.finish_refresh(model.begin_refresh(), observation)
+    assert caught.value.__cause__ is None and caught.value.__suppress_context__ is True
+    monkeypatch.undo()
+
+    def broken_validation(*_args, **_kwargs):
+        raise _OwnerLinkError("not raised by the authority callback either")
+    monkeypatch.setattr(model, "_validate_observation", broken_validation)
+    with pytest.raises(GatewayAccountSessionWorkerError, match="^OBSERVATION_INVALID$"):
+        model.finish_refresh(model.begin_refresh(), observation)
+
+
 def test_fork_rejects_before_inherited_read_lock(tmp_path):
     model, _, _, _, _ = _setup(tmp_path)
     ready, release = threading.Event(), threading.Event()
