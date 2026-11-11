@@ -26,7 +26,7 @@ run_local(app, origin=origin)
 
 宿主应从受保护密钥源注入至少 32 字节的随机 `receipt_key`，并为每次密钥轮换设置不同 `receipt_key_id`；不应把密钥写入浏览器、日志或公开配置。同一密钥和版本可跨 Web 重启验证旧凭据；换密钥或版本后旧凭据保持 UNKNOWN、须人工核查。未注入密钥时使用临时进程密钥，Web 重启后旧凭据不可验证，界面会显示提示，这种模式不构成完整生产交付。
 
-账户与行情快照目前明确返回 `SOURCE_PROVENANCE_UNAVAILABLE`：现有 `read_snapshot(session, scope)` 回调未提供可验证的同服务、同 journal 来源绑定，因此即使传入回调也不会调用或展示其数据。待账户与控制视图之间有可信来源合同后才能启用；不能将账户总额冒充策略资金。此代码不包含真实账户视图或生产凭据源，集成和实盘能力需单独验收。
+账户快照（2026-11-11 更新）：账户范围的操作员若另有一条账户读取登记（`application.account`，仅 `account.snapshot.typed`），快照路由通过这条登记读取 Gateway 账户读模型**已经持有**的账户视图，不向柜台发查询。只有在以下各项都成立时才展示：账户读取登记与控制登记属于同一个 Gateway 服务（同一服务 epoch、同一已认证对端和服务端公钥）；读取结果里的来源说明所写的 journal 与 `direct.control.identity` 返回的一致、账户一致；数据属于来源说明所写的 owner 代；读模型已就绪且未过期。否则返回 `UNAVAILABLE` 及原因（`SOURCE_PROVENANCE_UNAVAILABLE`、`SOURCE_PROVENANCE_MISMATCH`、`ACCOUNT_VIEW_NOT_READY`、`ACCOUNT_VIEW_UNAVAILABLE`），Gateway 拒绝时返回 `REQUEST_REJECTED` 及 Gateway 的代码。展示的是账户视图（`view: "account"`），缺失的金额为 `null`，不补 0；不能将账户总额冒充策略资金。策略范围的操作员没有策略视图，返回 `STRATEGY_VIEW_UNAVAILABLE`。`read_snapshot(session, scope)` 回调参数仅为兼容保留，不会被调用。本页面（`Dashboard.vue`）尚未展示这份账户视图，页面归迭代 69。以上只有本机合成数据的测试证据，没有实盘证据，集成和实盘能力需单独验收。完整合同见 `docs/gateway-web-api-v1.md` 第 6.2 节。
 
 HTTP入口默认只接受本机客户端和明确的 Host；写操作要求精确 Origin 和会话 CSRF token。生产运行使用同一 loopback origin 托管静态页面和API；`run_local` 只监听 loopback，不启用代理头。若开发时通过 Vite 代理，须在受信本机宿主中单独配置浏览器 origin 与本地后端监听，不能向公网暴露。未来宿主可经 `window.gatewayHost` 指定 API base URL/认证准备回调；修改 URL 不授予权限。
 
@@ -50,7 +50,7 @@ HTTP入口默认只接受本机客户端和明确的 Host；写操作要求精�
 | HTTP | Gateway操作/语义 |
 | --- | --- |
 | `GET /api/v1/session` | 当前会话可见范围、CSRF token及本机请求命名空间；不返回Gateway密钥。 |
-| `GET /api/v1/scopes/{scope_id}/snapshot` | 检查账户读取授权后返回来源不可证明的 `UNAVAILABLE`，不展示快照。 |
+| `GET /api/v1/scopes/{scope_id}/snapshot` | 账户范围：经操作员自己的账户读取登记读 `account.snapshot.typed`，来源与控制视图一致时返回账户视图，否则返回 `UNAVAILABLE` 及原因；策略范围返回 `STRATEGY_VIEW_UNAVAILABLE`。 |
 | `GET /api/v1/scopes/{scope_id}/causes?after=&limit=100` | `direct.control.list`，当前精确范围有界分页；范围和每个原因附签名视图凭据。 |
 | `POST /api/v1/scopes/{scope_id}/requests/prepare` | 验证认证 peer、journal 和权限并签发原内容凭据，不触发控制写入。 |
 | `POST /api/v1/scopes/{scope_id}/targets/prepare` | 验证同一服务和 journal 的 PENDING 撤单目标并签发凭据，不触发撤单。 |

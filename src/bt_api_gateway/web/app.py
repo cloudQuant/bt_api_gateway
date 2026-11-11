@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import math
 import re
 import secrets
 from collections.abc import Callable, Mapping
@@ -25,6 +26,59 @@ from pydantic import BaseModel, ConfigDict, StrictInt, StrictStr
 _REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _MODES = frozenset({"STOP_NEW", "FREEZE", "DRAIN"})
 _SECRET_KEYS = ("password", "secret", "token", "credential", "apikey", "privatekey", "authorization", "cookie")
+_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+# Registry refusals of the operations this adapter calls (``direct.control.*`` and the
+# account read). The Registry returns them before the operation's handler runs, or, for a
+# read, instead of the read's result: the refused call changed nothing. Only such a code
+# in the Gateway's own reply to the call counts; a timeout, a lost reply, a local error
+# of the runtime and every other code stay UNKNOWN.
+_GATEWAY_REFUSAL_CODES = frozenset({"CAPABILITY_UNAVAILABLE", "CLOSED", "DENIED", "NOT_REGISTERED",
+                                    "POLICY_REQUIREMENT_UNMET", "SCOPE_DENIED", "STALE_EPOCH"})
+
+
+class _GatewayRefusalError(Exception):
+    """The Gateway refused this call in its own reply; the call changed nothing."""
+
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
+class _UnavailableError(Exception):
+    """The account view cannot be shown, for a finite reason."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+_PROVENANCE_FIELDS = frozenset({"schema_version", "account_scope", "journal_id", "owner_generation"})
+
+
+def _of_generation(read_generation: object, owner_generation: str) -> bool:
+    # The read model's generation is the owner generation, or begins with it after a change of
+    # the venue link (the CTP composition uses "<owner generation>:native:<n>:attempt:<k>").
+    return type(read_generation) is str and (
+        read_generation == owner_generation or read_generation.startswith(owner_generation + ":"))
+
+
+def _service_refusal(error: BaseException) -> str | None:
+    # The runtime sets ``service_reply_code`` only on the error built from the Gateway's
+    # own correlated reply to the request it sent (bt_api_py.service_runtime).
+    code = getattr(error, "service_reply_code", None)
+    if (isinstance(error, RuntimeError) and type(code) is str and code in _GATEWAY_REFUSAL_CODES
+            and getattr(error, "code", None) == code):
+        return code
+    return None
+
+
+def _rejection(result: object) -> str | None:
+    """The finite code of a handler's ``{"status": "REQUEST_REJECTED", "code": ...}`` reply."""
+    if (isinstance(result, Mapping) and set(result) == {"status", "code"}
+            and result["status"] == "REQUEST_REJECTED" and type(result["code"]) is str
+            and _CODE.fullmatch(result["code"]) is not None):
+        return result["code"]
+    return None
 
 
 def _ref(value: object) -> bool:
@@ -171,8 +225,9 @@ def create_app(*, origin: str, authenticate: Callable[[Request], AuthenticatedWe
     ``authenticate`` must revalidate the browser session on every request;
     ``resolve_runtime`` must return that exact principal's already running SDK
     runtime, with account/strategy grants rather than a shared privileged actor.
-    ``read_snapshot`` is reserved for a future provenance-bound reader and is
-    not invoked until a same-journal account-view contract is available.
+    ``read_snapshot`` is accepted for compatibility and never invoked: the account
+    view is read through the operator's own account read registration and shown
+    only with a source provenance that matches the control identity.
     """
     origin, authority = _local_origin(origin)
     if not callable(authenticate) or not callable(resolve_runtime):
@@ -293,11 +348,32 @@ def create_app(*, origin: str, authenticate: Callable[[Request], AuthenticatedWe
             raise ValueError('PEER_UNAVAILABLE')
         return (b.registration_id, b.service_epoch, peer.principal_ref, peer.actor_ref, b.server_key_fingerprint)
 
+    def gateway_call(runtime, mount, operation, args, scope, still_bound):
+        """One Gateway call; only the Gateway's own refusal of it becomes ``_GatewayRefusalError``."""
+        try:
+            return runtime.call(mount, operation, args, account_ref=scope.account_ref,
+                                scope_ref=scope.scope_ref, timeout_seconds=timeout_seconds)
+        except Exception as error:
+            code = _service_refusal(error)
+            if code is None:
+                raise
+            if not still_bound():
+                raise ValueError('BINDING_CHANGED') from None
+            raise _GatewayRefusalError(code) from None
+
     def proof(runtime, session, scope, operation):
         before = binding_proof(runtime, session, scope, operation)
-        result = runtime.call('application.direct_write', 'direct.control.identity', {},
-                              account_ref=scope.account_ref, scope_ref=scope.scope_ref,
-                              timeout_seconds=timeout_seconds)
+
+        def still_bound():
+            return binding_proof(runtime, session, scope, operation) == before
+
+        result = gateway_call(runtime, 'application.direct_write', 'direct.control.identity', {}, scope,
+                              still_bound)
+        refused = _rejection(result)
+        if refused is not None and still_bound():
+            # The Gateway's control handler refused this operator (another account, a scope or
+            # an operation it does not grant): an identity read, nothing changed.
+            raise _GatewayRefusalError(refused)
         if (binding_proof(runtime, session, scope, operation) != before or not isinstance(result, Mapping)
                 or result.get('status') != 'OBSERVED' or result.get('schema_version') != 1
                 or result.get('account_scope') != scope.account_ref or not _gateway_ref(result.get('journal_id'))):
@@ -341,8 +417,14 @@ def create_app(*, origin: str, authenticate: Callable[[Request], AuthenticatedWe
     def read_bound(session, scope_id, operation, args):
         scope, runtime = route_for(session, scope_id, operation)
         before, stable = proof(runtime, session, scope, operation)
-        result = runtime.call('application.direct_write', operation, args, account_ref=scope.account_ref,
-                              scope_ref=scope.scope_ref, timeout_seconds=timeout_seconds)
+
+        def still_bound():
+            return binding_proof(runtime, session, scope, operation) == before
+
+        result = gateway_call(runtime, 'application.direct_write', operation, args, scope, still_bound)
+        refused = _rejection(result)
+        if refused is not None and still_bound():
+            raise _GatewayRefusalError(refused)  # a read: nothing changed
         after, stable_after = proof(runtime, session, scope, operation)
         if before != after or stable != stable_after or resolve_runtime(session, scope) is not runtime:
             raise ValueError('BINDING_CHANGED')
@@ -352,9 +434,23 @@ def create_app(*, origin: str, authenticate: Callable[[Request], AuthenticatedWe
         value, scope, runtime, binding, stable = receipt_context(session, scope_id, receipt, operation)
         if write:
             args = {**args, 'expected_journal_id': stable['journal_id']}
-        result = runtime.call('application.direct_write', operation, args, account_ref=scope.account_ref,
-                              scope_ref=scope.scope_ref, timeout_seconds=timeout_seconds)
-        current, stable_after = proof(runtime, session, scope, operation)
+
+        def still_bound():
+            return binding_proof(runtime, session, scope, operation) == binding
+
+        # A refusal of this very call (also of a write) means it changed nothing.
+        result = gateway_call(runtime, 'application.direct_write', operation, args, scope, still_bound)
+        refused = _rejection(result)
+        if not write and refused is not None and still_bound():
+            raise _GatewayRefusalError(refused)  # a read: nothing changed
+        try:
+            current, stable_after = proof(runtime, session, scope, operation)
+        except _GatewayRefusalError:
+            if write:
+                # The write was answered or may have been applied: a later refusal of the
+                # identity read says nothing about it.
+                raise ValueError('BINDING_UNVERIFIED') from None
+            raise
         if current != binding or stable_after != stable or resolve_runtime(session, scope) is not runtime:
             raise ValueError('BINDING_CHANGED')
         return _copy_safe(result)
@@ -400,10 +496,15 @@ def create_app(*, origin: str, authenticate: Callable[[Request], AuthenticatedWe
     def own_record(session, scope_id, command, result):
         """Whether an observed record is this request: same id and same content as the Gateway keeps it."""
         if command['mode'] == 'RESUME':
+            # ``releaser`` is present only when the journal stores who released the cause
+            # (release audit): then a release recorded for another operator, or made by the
+            # Gateway itself, is not this request even under the same id.
+            own = _operator_origin(session.principal_ref, session.actor_ref)
             return (result.get('cause_id') == command['cause_id']
                     and result.get('operation_id') == command['request_id']
                     and result.get('version') == command['expected_version'] + 1
-                    and result.get('active') is False)
+                    and result.get('active') is False
+                    and result.get('releaser', own) == own)
         scope, = [s for s in session.scopes if s.scope_id == scope_id]
         cause = result.get('cause')
         expected = {'cause_id': command['request_id'], 'mode': command['mode'],
@@ -435,6 +536,8 @@ def create_app(*, origin: str, authenticate: Callable[[Request], AuthenticatedWe
                      'scope_id': scope_id, 'route': _route_fingerprint(scope), 'gateway': stable,
                      'command': command.model_dump(exclude={'view_receipt'})}
             return {'status': 'PREPARED', 'receipt': encode_receipt(value)}
+        except _GatewayRefusalError as refusal:
+            return {'status': 'REQUEST_REJECTED', 'code': refusal.code}
         except Exception:
             return {'status': 'UNKNOWN', 'code': 'IDENTITY_UNAVAILABLE'}
 
@@ -464,6 +567,8 @@ def create_app(*, origin: str, authenticate: Callable[[Request], AuthenticatedWe
                     or row.get('operation_id') != target.operation_id or row.get('state') != 'PENDING'):
                 return {'status': 'UNKNOWN', 'code': 'TARGET_UNAVAILABLE'}
             return {'status': 'PREPARED', 'receipt': token}
+        except _GatewayRefusalError as refusal:
+            return {'status': 'REQUEST_REJECTED', 'code': refusal.code}
         except Exception:
             return {'status': 'UNKNOWN', 'code': 'IDENTITY_UNAVAILABLE'}
 
@@ -474,6 +579,8 @@ def create_app(*, origin: str, authenticate: Callable[[Request], AuthenticatedWe
         try:
             value = decode_receipt(receipt.receipt)
             return command_status(session, scope_id, receipt.receipt, value['command'])
+        except _GatewayRefusalError as refusal:
+            return {'status': 'REQUEST_REJECTED', 'code': refusal.code}
         except Exception:
             return {'status': 'UNKNOWN', 'code': 'IDENTITY_UNAVAILABLE'}
 
@@ -504,19 +611,124 @@ def create_app(*, origin: str, authenticate: Callable[[Request], AuthenticatedWe
                 args = {'cause_id': command['request_id'], 'mode': command['mode']}
             result = receipt_call(session, scope_id, receipt.receipt, operation, args, write=True)
             return result if type(result) is dict else {'status': 'UNKNOWN'}
+        except _GatewayRefusalError as refusal:
+            return {'status': 'REQUEST_REJECTED', 'code': refusal.code}
         except Exception:
             return {'status': 'UNKNOWN', 'code': 'IDENTITY_UNAVAILABLE'}
+
+    def account_proof(runtime, session, scope):
+        """The operator's own account read registration for this account and the peer it proved."""
+        from bt_api_base.service_protocol import WireIdentity, WireRole
+
+        state = runtime.status()
+        if (state.state != 'running' or not state.thread_alive or not state.healthy
+                or state.identity is None or state.identity.role != WireRole.APPLICATION_CLIENT
+                or state.identity.principal_ref != session.principal_ref
+                or state.identity.actor_ref != session.actor_ref or state.identity.delegate_ref is not None):
+            raise ValueError('RUNTIME_UNAVAILABLE')
+        bindings = [b for b in state.bindings if b.active and b.mount == 'application.account'
+                    and b.scope_ref == scope.scope_ref and b.scope is not None
+                    and b.scope.account_ref == scope.account_ref and b.scope.strategy_ref is None
+                    and b.operations is not None and 'account.snapshot.typed' in b.operations]
+        if len(bindings) != 1:
+            raise ValueError('BINDING_UNAVAILABLE')
+        b = bindings[0]
+        peer = b.authenticated_peer
+        if (type(peer) is not WireIdentity or peer.role != WireRole.SERVICE or peer.delegate_ref is not None
+                or type(b.server_key_fingerprint) is not str
+                or re.fullmatch(r'[0-9a-f]{64}', b.server_key_fingerprint) is None
+                or not _gateway_ref(b.registration_id) or not _gateway_ref(b.service_epoch)):
+            raise ValueError('PEER_UNAVAILABLE')
+        return (b.registration_id, b.service_epoch, peer.principal_ref, peer.actor_ref, b.server_key_fingerprint)
+
+    def account_view(session, scope, runtime):
+        """The account read model's current view, shown only when it proves the control view's source.
+
+        Same Gateway service: the account read registration and the control registration
+        are served under the same service epoch by the same CURVE-authenticated peer and
+        key. Same journal and owner generation: the read names the control journal id the
+        control identity returns, and its data belongs to the owner generation it names.
+        The read returns what the read model already holds; it never queries the venue.
+        """
+        control_before, stable = proof(runtime, session, scope, 'direct.control.identity')
+        read_before = account_proof(runtime, session, scope)
+        if read_before[1:] != control_before[1:]:
+            raise _UnavailableError('SOURCE_PROVENANCE_MISMATCH')
+
+        def still_bound():
+            return account_proof(runtime, session, scope) == read_before
+
+        reply = gateway_call(runtime, 'application.account', 'account.snapshot.typed',
+                             {'limit': 1, 'with_source_provenance': True}, scope, still_bound)
+        control_after, stable_after = proof(runtime, session, scope, 'direct.control.identity')
+        if (control_after != control_before or stable_after != stable or not still_bound()
+                or resolve_runtime(session, scope) is not runtime):
+            raise ValueError('BINDING_CHANGED')
+        if not isinstance(reply, Mapping) or set(reply) != {'state_status', 'source_provenance', 'snapshot'}:
+            raise ValueError('INVALID_RESULT')
+        provenance = reply['source_provenance']
+        if provenance is None:
+            raise _UnavailableError('SOURCE_PROVENANCE_UNAVAILABLE')
+        if (not isinstance(provenance, Mapping) or set(provenance) != _PROVENANCE_FIELDS
+                or provenance['schema_version'] != 1 or type(provenance['schema_version']) is not int
+                or not all(_gateway_ref(provenance[name])
+                           for name in ('account_scope', 'journal_id', 'owner_generation'))):
+            raise ValueError('INVALID_PROVENANCE')
+        if provenance['journal_id'] != stable['journal_id'] or provenance['account_scope'] != scope.account_ref:
+            raise _UnavailableError('SOURCE_PROVENANCE_MISMATCH')
+        status = reply['state_status']
+        if (not isinstance(status, Mapping) or set(status) != {'session_generation', 'ready', 'fresh_for_seconds'}
+                or type(status['ready']) is not bool or type(status['fresh_for_seconds']) not in (int, float)
+                or not math.isfinite(status['fresh_for_seconds']) or status['fresh_for_seconds'] < 0):
+            raise ValueError('INVALID_STATE_STATUS')
+        read_generation = status['session_generation']
+        if read_generation is not None and not _of_generation(read_generation, provenance['owner_generation']):
+            raise _UnavailableError('SOURCE_PROVENANCE_MISMATCH')
+        if status['ready'] is not True or status['fresh_for_seconds'] <= 0 or reply['snapshot'] is None:
+            raise _UnavailableError('ACCOUNT_VIEW_NOT_READY')
+        snapshot = reply['snapshot']
+        payload = snapshot.get('payload') if isinstance(snapshot, Mapping) else None
+        if (read_generation is None or not isinstance(payload, Mapping)
+                or snapshot.get('account_scope') != scope.account_ref
+                or payload.get('schema_id') != 'sdk.account.state.typed' or payload.get('schema_version') != 1
+                or payload.get('session_generation') != read_generation
+                or not _gateway_ref(snapshot.get('snapshot_id')) or type(snapshot.get('cursor')) is not int
+                or type(snapshot.get('captured_at')) not in (int, float)
+                or not math.isfinite(snapshot['captured_at'])):
+            raise ValueError('INVALID_SNAPSHOT')
+        from bt_api_base.wire_codec_v1 import account_observation_from_typed_map
+
+        account = account_observation_from_typed_map(payload['observation']).to_dict()
+        account.pop('account_key')  # the scope names the account; the venue login id is not shown
+        return {'status': 'OBSERVED', 'view': 'account', 'account_ref': scope.account_ref,
+                'fresh_for_seconds': float(status['fresh_for_seconds']),
+                'source': {'journal_id': provenance['journal_id'],
+                           'owner_generation': provenance['owner_generation'],
+                           'read_generation': read_generation, 'snapshot_id': snapshot['snapshot_id'],
+                           'cursor': snapshot['cursor'], 'captured_at': snapshot['captured_at']},
+                'account': _copy_safe(account)}
 
     @app.get("/api/v1/scopes/{scope_id}/snapshot")
     def snapshot(request: Request, scope_id: str):
         session = session_for(request)
         try:
-            route_for(session, scope_id, "account.snapshot.typed", mount="application.account")
+            scope, runtime = route_for(session, scope_id, "account.snapshot.typed", mount="application.account")
         except HTTPException:
             route_for(session, scope_id, "account.snapshot", mount="application.account")
-        # Account callbacks currently have no verifiable source/journal binding
-        # to the control view. Never present their output as the same Gateway.
-        return {"status": "UNAVAILABLE", "reason": "SOURCE_PROVENANCE_UNAVAILABLE"}
+            # The plain snapshot read names no source; it is never shown.
+            return {"status": "UNAVAILABLE", "reason": "SOURCE_PROVENANCE_UNAVAILABLE"}
+        if scope.strategy_ref is not None:
+            # No read of one strategy's own positions and funds is offered to an operator, and
+            # the account view is never shown as a strategy's.
+            return {"status": "UNAVAILABLE", "reason": "STRATEGY_VIEW_UNAVAILABLE"}
+        try:
+            return account_view(session, scope, runtime)
+        except _GatewayRefusalError as refusal:
+            return {'status': 'REQUEST_REJECTED', 'code': refusal.code}
+        except _UnavailableError as unavailable:
+            return {'status': 'UNAVAILABLE', 'reason': unavailable.reason}
+        except Exception:
+            return {'status': 'UNAVAILABLE', 'reason': 'ACCOUNT_VIEW_UNAVAILABLE'}
 
     @app.get("/api/v1/scopes/{scope_id}/causes")
     def list_causes(request: Request, scope_id: str, after: str = "", limit: int = 100):
@@ -539,6 +751,8 @@ def create_app(*, origin: str, authenticate: Callable[[Request], AuthenticatedWe
             return {**result, 'scope_receipt': scope_receipt}
         except HTTPException:
             raise
+        except _GatewayRefusalError as refusal:
+            return {'status': 'REQUEST_REJECTED', 'code': refusal.code}
         except Exception:
             return {'status': 'UNKNOWN', 'code': 'IDENTITY_UNAVAILABLE'}
 
@@ -565,6 +779,8 @@ def create_app(*, origin: str, authenticate: Callable[[Request], AuthenticatedWe
                     {'kind': 'target', 'cause_id': row['cause_id'], 'reservation_id': row['reservation_id'],
                      'operation_id': row['operation_id'], 'state': row['state']}))
             return result
+        except _GatewayRefusalError as refusal:
+            return {'status': 'REQUEST_REJECTED', 'code': refusal.code}
         except Exception:
             return {'status': 'UNKNOWN', 'code': 'IDENTITY_UNAVAILABLE'}
 

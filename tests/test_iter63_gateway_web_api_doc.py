@@ -52,11 +52,25 @@ def test_every_status_and_code_the_adapter_returns_is_documented():
     for pattern in (r"HTTPException\(\s*\d{3},\s*['\"]([A-Z][A-Z_]+)['\"]",
                     r"['\"]error['\"]:\s*['\"]([A-Z][A-Z_]+)['\"]",
                     r"['\"]code['\"]:\s*['\"]([A-Z][A-Z_]+)['\"]",
-                    r"['\"]reason['\"]:\s*['\"]([A-Z][A-Z_]+)['\"]"):
+                    r"['\"]reason['\"]:\s*['\"]([A-Z][A-Z_]+)['\"]",
+                    r"_UnavailableError\(\s*['\"]([A-Z][A-Z_]+)['\"]"):
         codes |= set(re.findall(pattern, source))
     statuses = set(re.findall(r"['\"]status['\"]:\s*['\"]([A-Z][A-Z_]+)['\"]", source))
     assert {'IDENTITY_UNAVAILABLE', 'REQUEST_ID_CONFLICT', 'ROUTE_CHANGED', 'LOCAL_ACCESS_REQUIRED'} <= codes
-    assert {'PREPARED', 'UNKNOWN', 'REQUEST_REJECTED', 'UNAVAILABLE'} <= statuses
+    assert {'SOURCE_PROVENANCE_MISMATCH', 'ACCOUNT_VIEW_NOT_READY', 'STRATEGY_VIEW_UNAVAILABLE',
+            'ACCOUNT_VIEW_UNAVAILABLE', 'SOURCE_PROVENANCE_UNAVAILABLE'} <= codes
+    assert {'PREPARED', 'UNKNOWN', 'REQUEST_REJECTED', 'UNAVAILABLE', 'OBSERVED'} <= statuses
     table = section('7. Status values and codes')
     missing = sorted(name for name in codes | statuses if f'`{name}`' not in table)
     assert missing == []
+
+
+def test_gateway_refusal_codes_are_exactly_the_documented_ones():
+    # The codes the adapter passes on as a refusal (they come from the Gateway at run time,
+    # so they are not literals in the routes) are exactly the rows of section 7.1.
+    text = section('7. Status values and codes')
+    start = text.index('\n### 7.1 Refusals by the Gateway\n')
+    end = text.index('\nNever a refusal:', start)
+    documented = set(re.findall(r'^\| `([A-Z][A-Z_]+)` \|', text[start:end], re.M))
+    assert documented == set(module._GATEWAY_REFUSAL_CODES)
+    assert {'DENIED', 'NOT_REGISTERED', 'SCOPE_DENIED'} <= documented

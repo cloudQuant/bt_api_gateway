@@ -11,6 +11,7 @@ import queue
 import socket
 import threading
 import time
+from datetime import UTC, datetime
 
 import pytest
 
@@ -18,6 +19,12 @@ zmq = pytest.importorskip('zmq')
 pytest.importorskip('bt_api_py')
 
 import httpx  # noqa: E402
+from bt_api_base.account_protocol import (  # noqa: E402
+    AccountBalance,
+    AccountKey,
+    AccountObservation,
+    AccountResourceKey,
+)
 from bt_api_base.service_protocol import WireIdentity, WireRole, WireScope  # noqa: E402
 from bt_api_py.gateway_direct_owner import (  # noqa: E402
     GatewayDirectOwner,
@@ -39,8 +46,15 @@ from bt_api_py.service_runtime import (  # noqa: E402
 )
 from bt_api_py.service_runtime_thread import ThreadedServiceClientRuntime  # noqa: E402
 
+from bt_api_gateway.account_read_model import GatewayAccountReadModel  # noqa: E402
 from bt_api_gateway.direct_command_journal import GatewayDirectCommandJournal  # noqa: E402
 from bt_api_gateway.direct_dispatch import GatewayDirectDispatcher  # noqa: E402
+from bt_api_gateway.event_journal import GatewayEventJournal  # noqa: E402
+from bt_api_gateway.router import GatewayCommandKind, GatewayPrincipal  # noqa: E402
+from bt_api_gateway.service_component import (  # noqa: E402
+    GatewayReadService,
+    GatewayServiceAccountScope,
+)
 from bt_api_gateway.session_guard import LocalAccountSessionGuard  # noqa: E402
 from bt_api_gateway.web.app import AuthenticatedWebSession, WebScope, create_app  # noqa: E402
 
@@ -69,27 +83,46 @@ VIEW_OPS = frozenset({'direct.control.identity', 'direct.control.list', 'direct.
 GRANTED = {'viewer': VIEW_OPS}
 
 
+MAIN = AccountResourceKey('future', 'main')
+
+
+def observation(account_key, available='90'):
+    """One complete synthetic account read, observed now."""
+    now = datetime.now(UTC).isoformat(timespec='seconds').replace('+00:00', 'Z')
+    return AccountObservation(
+        account_key=account_key, observation_id='synthetic-' + available, coverage=(MAIN,),
+        balances=(AccountBalance(MAIN, 'CNY', '100', available, None, now),), positions=(), valuation=None,
+        started_at_utc=now, completed_at_utc=now, consistency='multi_query', balances_complete=True,
+        positions_complete=True, open_orders=None, open_orders_complete=False)
+
+
 def operator_origin(principal, actor):
     """The control-cause origin the Gateway records for an operator's own apply."""
     return 'operator:' + hashlib.sha256(json.dumps([principal, actor], separators=(',', ':')).encode()).hexdigest()
 
 
 class Gateway:
-    """One synthetic trading-owner Gateway serving on a loopback CURVE endpoint."""
+    """One synthetic trading-owner Gateway serving on a loopback CURVE endpoint.
 
-    def __init__(self, tmp_path, operators=OPERATORS):
+    ``account_reads`` (operator name -> operations) also binds the account read port with
+    its own read journal and account read model, as the trading composition does; only the
+    named operators get a registry resource on it.
+    """
+
+    def __init__(self, tmp_path, operators=OPERATORS, account_reads=None):
         with socket.socket() as probe:
             probe.bind(('127.0.0.1', 0))
             self.endpoint = f'tcp://127.0.0.1:{probe.getsockname()[1]}'
         self.server_keys = zmq.curve_keypair()
         self.operators = operators
+        self.account_reads = dict(account_reads or {})
         self.keys = {name: zmq.curve_keypair() for name in operators}
         self.tmp_path = tmp_path
         self.commands = queue.Queue()
         self.ready = queue.Queue()
         self.stop = threading.Event()
         self.runtimes = []
-        self.owner = self.journal = self.control = None
+        self.owner = self.journal = self.control = self.read_model = self.read_service = None
         self.thread = threading.Thread(target=self._serve, daemon=True)
 
     def identity(self, name):
@@ -108,7 +141,7 @@ class Gateway:
                 'scope_ref': 'scope-a', 'transport_ref': 'server', 'registration_policy_ref': 'policy',
                 'service_requirements_ref': 'requirements',
                 'components': {'gateway': {'config_schema_version': 2, 'settings': {'instance_id': 'gateway-a',
-                    'bind_ports': ['service.direct_write'],
+                    'bind_ports': ['service.direct_write'] + (['service.account_read'] if self.account_reads else []),
                     'options': {'role': 'trading_owner', 'dispatch_enabled': True, 'control_enabled': True}}}},
                 'communication': {'config_schema_version': 1, 'profiles': {'server': {'backend': 'zmq',
                     'config_schema_version': 1, 'endpoints': {'rpc_bind': self.endpoint},
@@ -120,8 +153,11 @@ class Gateway:
             for name, (principal, actor, _, _, account_allowed, strategies) in self.operators.items():
                 ops = GRANTED.get(name, OPS)
                 principals[self.keys[name][0]] = principal
-                grants[principal] = (PrincipalGrant(self.identity(name), (ResourceGrant(
-                    'gateway-a', 'service.direct_write', 'scope-a', self.scope(name), ops),)),)
+                resources = (ResourceGrant('gateway-a', 'service.direct_write', 'scope-a', self.scope(name), ops),)
+                if name in self.account_reads:
+                    resources += (ResourceGrant('gateway-a', 'service.account_read', 'scope-a', self.scope(name),
+                                                frozenset(self.account_reads[name])),)
+                grants[principal] = (PrincipalGrant(self.identity(name), resources),)
                 control_grants[principal] = GatewayControlGrant(actor, account_allowed, strategies, ops)
             authority = TrustedServiceAuthority(identity=SERVICE, scope=WireScope(DOMAIN), scope_ref='scope-a',
                 scope_version='v1', security_ref='key-a', security_version='v1', registration_policy_ref='policy',
@@ -147,8 +183,11 @@ class Gateway:
             binding = GatewayDirectServiceBinding(
                 journal, {'strategy-p': GatewayDirectGrant('strategy-a', frozenset({'rb'}))},
                 owner=owner, control=control, control_grants=control_grants)
+            values = {'binding': binding}
+            if self.account_reads:
+                values['read_service'] = self._read_service(journal.generation)
             host = ServiceHost(config, authority, self.tmp_path / 'registry.sqlite',
-                               lambda *_: ComponentResources.borrowed({'binding': binding}, ready=lambda: True))
+                               lambda *_: ComponentResources.borrowed(values, ready=lambda: True))
             host.start()
             self.owner, self.journal, self.control = owner, journal, control
             self.ready.put(('ready',))
@@ -196,6 +235,39 @@ class Gateway:
     def on_owner(self, callback):
         return self.owner.submit_service_call(callback).result(timeout_seconds=5)
 
+    def _read_service(self, owner_generation):
+        """Account read port pieces, built on the serve thread (the read model's owner thread)."""
+        journal = GatewayEventJournal(self.tmp_path / 'account-read.sqlite')
+        model = GatewayAccountReadModel(
+            journal, account_key=AccountKey('synthetic', 'venue', 'test', ACCOUNT),
+            journal_account_scope=ACCOUNT, state_scope='state-a', required_coverage=(MAIN,),
+            assert_current_generation=lambda _: None, max_staleness_seconds=30)
+        model.start_generation(owner_generation)
+        strategies = frozenset(self.operators[name][3] for name in self.account_reads
+                               if self.operators[name][3] is not None)
+        account = GatewayServiceAccountScope(
+            account_ref=ACCOUNT, execution_domain_ref=DOMAIN, journal_account_scope=ACCOUNT,
+            account_read_strategy_scope='state-a', shared_account_facts_scope='state-a' if strategies else None,
+            shared_fact_strategy_refs=strategies)
+        principals = {self.operators[name][0]: GatewayPrincipal(
+            self.operators[name][0], frozenset({ACCOUNT}), frozenset({'state-a'}),
+            frozenset({GatewayCommandKind.READ})) for name in self.account_reads}
+        self.read_model = model
+        self.read_service = GatewayReadService(journal, accounts={ACCOUNT: account}, principals=principals,
+                                               state_worker=model)
+        return self.read_service
+
+    def publish(self, available='90'):
+        """The owner's account read completes: one current observation enters the read model."""
+        def run(_host):
+            model = self.read_model
+            model.finish_refresh(model.begin_refresh(), observation(model.account_key, available))
+        self.on_host(run)
+
+    def read_generation(self, generation):
+        """The read model starts another generation (for example after a change of the venue link)."""
+        self.on_host(lambda _host: self.read_model.start_generation(generation))
+
     def cause(self, cause_id):
         return self.on_owner(lambda: self.control.get(cause_id))
 
@@ -207,12 +279,16 @@ class Gateway:
 
     def runtime(self, name):
         account = self.operators[name][2]
+        binding = {'mount': 'application.direct_write', 'service_id': SERVICE.actor_ref, 'instance_id': 'gateway-a',
+                   'scope_ref': 'scope-a', 'account_ref': account, 'transport_ref': 'client'}
+        bindings = [binding] + ([{**binding, 'mount': 'application.account'}] if name in self.account_reads else [])
+        requested = {'application.direct_write': GRANTED.get(name, OPS)}
+        if name in self.account_reads:
+            requested['application.account'] = frozenset(self.account_reads[name])
         client_config = parse_client_config({
             'client_config_schema_version': 1, 'process_role': 'application_client',
             'registration': {'application_ref': self.identity(name).actor_ref},
-            'clients': {'gateway': {'config_schema_version': 1, 'settings': {'bindings': [{
-                'mount': 'application.direct_write', 'service_id': SERVICE.actor_ref, 'instance_id': 'gateway-a',
-                'scope_ref': 'scope-a', 'account_ref': account, 'transport_ref': 'client'}],
+            'clients': {'gateway': {'config_schema_version': 1, 'settings': {'bindings': bindings,
                 'options': {'request_timeout_ms': 2000}}}},
             'communication': {'config_schema_version': 1, 'profiles': {'client': {'backend': 'zmq',
                 'config_schema_version': 1, 'endpoints': {'rpc_connect': self.endpoint},
@@ -223,7 +299,7 @@ class Gateway:
         runtime = ThreadedServiceClientRuntime(lambda: ServiceClientRuntime(
             client_config, identity=identity, scope_resolver=lambda _: scope, peer_resolver=lambda _: SERVICE,
             transport_factory=ZmqTransportFactory({'key-a': keys}),
-            requested_operations={'application.direct_write': GRANTED.get(name, OPS)}))
+            requested_operations=requested))
         self.runtimes.append(runtime)
         assert runtime.start(timeout_seconds=10).healthy
         return runtime

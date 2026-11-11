@@ -10,8 +10,9 @@ not delivered with it.
 
 - An optional, local-only adapter between a browser or another local HTTP client
   and an already running Gateway. It lists control causes, applies `STOP_NEW`,
-  `FREEZE` or `DRAIN`, releases one cause at a time (`RESUME`), and cancels one
-  frozen order of a `DRAIN` cause on request.
+  `FREEZE` or `DRAIN`, releases one cause at a time (`RESUME`), cancels one
+  frozen order of a `DRAIN` cause on request, and shows the Gateway's account view
+  when its source is proved to be the control view's (section 6.2).
 - It has no authority of its own. Every Gateway call is made with the operator's
   own authenticated CURVE registration (`application_client` role, the operator's
   principal and actor, no delegate). The Gateway's Registry and its control grants
@@ -63,9 +64,17 @@ framing.
   the whole account sees the account's causes and the contract causes; it does
   not see strategy causes. A caller registered for another account is refused.
   A revoked principal or an expired registration is refused. When the Gateway
-  refuses after the adapter's own checks passed, the adapter cannot prove the
-  Gateway's identity and answers `{"status": "UNKNOWN", "code":
-  "IDENTITY_UNAVAILABLE"}` (HTTP 200); nothing is shown and nothing is applied.
+  refuses a call in its own reply to that call, the adapter answers
+  `{"status": "REQUEST_REJECTED", "code": "<code>"}` (HTTP 200) with the
+  Gateway's finite code (section 7.1): for example `DENIED` for a revoked
+  principal, `NOT_REGISTERED` for an expired registration, `SCOPE_DENIED` for
+  another account or an operation the Gateway does not grant. The refused call
+  changed nothing; the answer is about this call only (section 9, rule 6).
+  Without such a reply (no reply, a timeout, a lost reply, a transport failure,
+  the operator's runtime refusing before it sends, any other reply) the answer
+  stays `{"status": "UNKNOWN", "code": "IDENTITY_UNAVAILABLE"}`. A refusal that
+  arrives after a write was answered (the identity check that follows the write)
+  is also `UNKNOWN`: the write may have been applied.
 - Malformed input can be answered before authentication: 422 (body schema, with
   FastAPI's `detail` list), 400 `INVALID_PAGE`. These answers carry no account data.
 
@@ -79,7 +88,7 @@ the operator should do; a missing read grant is never replaced by a write grant)
 | prepare/status/run of `RESUME` | `direct.control.identity`, `direct.control.resume_status`, `direct.control.resume` |
 | `targets/query` | `direct.control.identity`, `direct.control.targets` |
 | `targets/prepare` and its status/run | `direct.control.identity`, `direct.control.target_status`, `direct.control.drain_target` |
-| `GET /snapshot` | `account.snapshot.typed` or `account.snapshot` on the `application.account` mount (checked, never read; see 6.2) |
+| `GET /snapshot` | `account.snapshot.typed` on the `application.account` mount (a second registration of the operator, on the Gateway's account read port), and `direct.control.identity` on `application.direct_write` (see 6.2) |
 
 ## 4. Route index
 
@@ -95,7 +104,7 @@ Paths are relative to the configured origin. `{scope_id}` is one of the session'
 | `POST` | `/api/v1/scopes/{scope_id}/requests/run` | Look up, and send only if the journal has no record |
 | `POST` | `/api/v1/scopes/{scope_id}/targets/query` | One page of frozen orders of a `DRAIN` cause |
 | `POST` | `/api/v1/scopes/{scope_id}/targets/prepare` | Sign a cancel request for one frozen order; sends nothing |
-| `GET` | `/api/v1/scopes/{scope_id}/snapshot` | Always `UNAVAILABLE` (section 6.2) |
+| `GET` | `/api/v1/scopes/{scope_id}/snapshot` | The account view, only with a matching source provenance (section 6.2) |
 
 When the host passes `static_dir`, files of that directory are served under `/`
 after the API routes. No other route exists.
@@ -134,13 +143,70 @@ apart. `strategy_ref` is `null` for an account-scope route.
 
 ### 6.2 `GET /api/v1/scopes/{scope_id}/snapshot`
 
-Checks that the operator holds an account read grant on the `application.account`
-mount, then always answers `{"status": "UNAVAILABLE", "reason":
-"SOURCE_PROVENANCE_UNAVAILABLE"}`. No account data is read or shown: the account
-read service answers from its own event journal and nothing in its reply proves
-that it is the same Gateway and journal as the control view. Without the grant
-(this includes the built-in host, which registers only the control mount): 403
-`GATEWAY_SCOPE_OR_GRANT_UNAVAILABLE`.
+The account view the Gateway's account read model holds, shown only when its
+source is proved to be the Gateway, control journal and owner generation of the
+control view. The route reads what the read model already holds; it never makes
+the Gateway query the venue.
+
+The operator needs its own registration on the Gateway's account read port (mount
+`application.account`, operation `account.snapshot.typed`, account-wide) next to
+its control registration with `direct.control.identity`. Without the account read
+registration the answer is 403 `GATEWAY_SCOPE_OR_GRANT_UNAVAILABLE`, as before;
+with only `account.snapshot` (which names no source) it is `UNAVAILABLE` /
+`SOURCE_PROVENANCE_UNAVAILABLE`.
+
+**Provenance contract (schema 1).** The adapter reads `account.snapshot.typed`
+with `{"limit": 1, "with_source_provenance": true}`. The Gateway answers
+`{"state_status", "source_provenance", "snapshot"}`, where `source_provenance` is
+`{"schema_version": 1, "account_scope", "journal_id", "owner_generation"}`, bound
+once by the Gateway's own composition from the journal of the binding that
+answers `direct.control.identity` (never configured), or `null` when nothing is
+bound. The account data is returned only when a provenance is bound and the read
+model is ready; otherwise `snapshot` is `null`. The adapter shows the view only
+when all of these hold:
+
+1. Same Gateway service: the account read registration and the control
+   registration have the same service epoch, the same CURVE-authenticated service
+   identity and the same server key, before and after the read.
+2. Same journal: `source_provenance.journal_id` equals the `journal_id` of
+   `direct.control.identity`, read before and after, and `account_scope` equals
+   the route's account.
+3. Same owner generation: the read model's generation
+   (`state_status.session_generation` and the snapshot's `session_generation`) is
+   `owner_generation`, or begins with `owner_generation` followed by `:` (a later
+   read generation after a change of the venue link). The control identity does
+   not itself return the owner generation; the generation is tied to the control
+   journal by the Gateway composition that binds both from one journal object.
+4. Current: `state_status.ready` is true and `fresh_for_seconds` is above 0.
+
+Response:
+
+```json
+{"status": "OBSERVED", "view": "account", "account_ref": "<account>", "fresh_for_seconds": 4.2,
+ "source": {"journal_id": "<control journal id>", "owner_generation": "<owner generation>",
+            "read_generation": "<read model generation>", "snapshot_id": "<id>", "cursor": 7,
+            "captured_at": 1794408145.99},
+ "account": {"observation_id": "...", "coverage": [...], "balances": [...], "positions": [...],
+             "valuation": null, "open_orders": null, "open_orders_complete": false,
+             "balances_complete": true, "positions_complete": true, "consistency": "multi_query",
+             "started_at_utc": "...", "completed_at_utc": "..."}}
+```
+
+`account` is the Gateway's account observation without its venue account key.
+Amounts are decimal strings as the Gateway holds them; a value the Gateway does
+not have is `null`, never `0`. These are account totals: they are never a
+strategy's funds.
+
+Other answers:
+
+| Answer | Meaning |
+| --- | --- |
+| `{"status": "UNAVAILABLE", "reason": "ACCOUNT_VIEW_NOT_READY"}` | The read model is not ready or its data is not current (a read failed, the link changed, the data is older than allowed). An older view is not shown. |
+| `{"status": "UNAVAILABLE", "reason": "SOURCE_PROVENANCE_UNAVAILABLE"}` | The Gateway's account read names no source (none bound in its composition), or only `account.snapshot` is granted. |
+| `{"status": "UNAVAILABLE", "reason": "SOURCE_PROVENANCE_MISMATCH"}` | Another service epoch, service identity or key, another journal or account, or a read generation that does not belong to the owner generation. |
+| `{"status": "UNAVAILABLE", "reason": "STRATEGY_VIEW_UNAVAILABLE"}` | A strategy-scope route whose operator holds an account read registration (without one: 403 as above). No read of one strategy's own positions and funds is offered to an operator, and the account view is never shown in its place. |
+| `{"status": "UNAVAILABLE", "reason": "ACCOUNT_VIEW_UNAVAILABLE"}` | No verified answer: no or lost reply, timeout, a malformed reply, or the control identity or a registration changed during the read. |
+| `{"status": "REQUEST_REJECTED", "code": "<code>"}` | The Gateway refused the read or the identity check (section 7.1). |
 
 ### 6.3 `GET /api/v1/scopes/{scope_id}/causes?after=&limit=100`
 
@@ -158,14 +224,20 @@ Response:
 - Rows are the Gateway's cause records, ordered by `cause_id`. `active` is 1 or
   0; `version` is 1 while active and 2 after its release. `scope_kind` is
   `account`, `strategy` or `instrument`.
+- A released row carries `releaser` only when the Gateway journal stores who
+  released a cause (the release audit, section 10) and the release was made
+  after that was installed: `"operator:<hash>"`, built like `origin`, or
+  `"system:<mechanism>"` for a release by the Gateway itself. Without the audit,
+  and for an older release, the field is absent: unknown, never a default.
 - A contract cause (`scope_kind: "instrument"`, `scope_value: "<venue>:<symbol>"`,
   always `FREEZE`) is applied by the Gateway when a return on that contract
   belongs to none of its orders. It appears only for an account-scope caller,
   in the same pages as the account's causes.
 - A page shorter than `limit` is the last page; otherwise ask again with `after`
   set to the last `cause_id`.
-- On any failure after the authorisation checks: `{"status": "UNKNOWN", "code":
-  "IDENTITY_UNAVAILABLE"}`.
+- When the Gateway refuses the identity check or the list: `{"status":
+  "REQUEST_REJECTED", "code": "<code>"}` (section 7.1). On any other failure after
+  the authorisation checks: `{"status": "UNKNOWN", "code": "IDENTITY_UNAVAILABLE"}`.
 
 ### 6.4 `POST /api/v1/scopes/{scope_id}/requests/prepare`
 
@@ -180,11 +252,13 @@ Body (all fields; no other field is accepted):
 | `view_receipt` | The page's `scope_receipt` | That cause's `view_receipt`; the view must show it active |
 
 Response: `{"status": "PREPARED", "receipt": "<request receipt>"}`. Nothing is sent
-to the Gateway's journal. Other answers: 400 `INVALID_COMMAND`, or `{"status":
-"UNKNOWN", "code": "IDENTITY_UNAVAILABLE"}` when the operation is not granted to
-the operator's registration, or the view, the route or the Gateway identity
-cannot be verified (for example a view of another operator, of another scope or
-of an earlier Gateway journal).
+to the Gateway's journal. Other answers: 400 `INVALID_COMMAND`; `{"status":
+"REQUEST_REJECTED", "code": "<code>"}` when the Gateway refuses the identity check
+(section 7.1; nothing is prepared); or `{"status": "UNKNOWN", "code":
+"IDENTITY_UNAVAILABLE"}` when the operation is not granted to the operator's
+registration, or the view, the route or the Gateway identity cannot be verified
+(for example a view of another operator, of another scope or of an earlier Gateway
+journal).
 
 ### 6.5 `POST /api/v1/scopes/{scope_id}/requests/status`
 
@@ -194,9 +268,10 @@ Body `{"receipt": "<request receipt>"}`. Looks the request up; never sends it.
 | --- | --- |
 | `{"status": "NOT_FOUND", "cause_id": "<request_id>"}` (apply) or `{"status": "NOT_FOUND", "operation_id": "<request_id>"}` (release) | The current journal has no record of this request id. This does not prove that an earlier attempt never reached the Gateway of another journal. |
 | `{"status": "OBSERVED", "cause": {<cause row>}}` (apply) | The cause with this id is this operator's cause with this mode and scope. Its current `active` value is shown. |
-| `{"status": "OBSERVED", "cause_id", "operation_id", "version": 2, "active": false}` (release) | This release of this cause is recorded. |
-| `{"status": "REQUEST_REJECTED", "code": "REQUEST_ID_CONFLICT"}` | The id is already used by another command: a cause of another operator, mode or scope (a contract cause included), or a release of another cause. This request was not applied and will not be sent under that id. |
-| `{"status": "UNKNOWN", "code": "IDENTITY_UNAVAILABLE"}` | No verified answer (Gateway refused, unreachable, identity or journal changed, receipt invalid). |
+| `{"status": "OBSERVED", "cause_id", "operation_id", "version": 2, "active": false}` (release) | This release of this cause is recorded. With the release audit (section 10) the answer also carries `releaser`, and it is this operator. |
+| `{"status": "REQUEST_REJECTED", "code": "REQUEST_ID_CONFLICT"}` | The id is already used by another command: a cause of another operator, mode or scope (a contract cause included), a release of another cause, or, with the release audit, the same release recorded for another operator or for the Gateway itself. This request was not applied and will not be sent under that id. |
+| `{"status": "REQUEST_REJECTED", "code": "<Gateway code>"}` | The Gateway refused this lookup (section 7.1). It says nothing about the request itself: a request whose `run` answered `UNKNOWN` stays unresolved. |
+| `{"status": "UNKNOWN", "code": "IDENTITY_UNAVAILABLE"}` | No verified answer (Gateway unreachable, no or lost reply, identity or journal changed, receipt invalid). |
 
 For a cancel receipt (from `targets/prepare`) the answers are those of 6.8.
 
@@ -213,8 +288,8 @@ Answers after sending:
 | --- | --- |
 | `{"status": "OBSERVED", "cause_id", "version": 1, "active": true}` | Cause applied (or it already existed with the same content). |
 | `{"status": "OBSERVED", "cause_id", "version": 2, "active": false}` | Cause released. Only this cause; others may still block (read the list). |
-| `{"status": "REQUEST_REJECTED", "code": "<code>"}` | The Gateway refused; nothing was changed by this call. Codes in section 7. |
-| `{"status": "UNKNOWN", ...}` | The outcome is not known. The Gateway may or may not have applied it. |
+| `{"status": "REQUEST_REJECTED", "code": "<code>"}` | The Gateway refused: the lookup or identity check before sending (then nothing was sent), or the request itself. Nothing was changed by this call. Codes in section 7. |
+| `{"status": "UNKNOWN", ...}` | The outcome is not known. The Gateway may or may not have applied it. This includes a refusal that arrives after the request was answered. |
 
 ### 6.7 `POST /api/v1/scopes/{scope_id}/targets/query`
 
@@ -222,9 +297,10 @@ Body `{"view_receipt": "<view receipt of a DRAIN cause>", "after": "", "limit": 
 Response `{"status": "OBSERVED", "targets": [...]}`; each row has `cause_id`,
 `strategy`, `request_key`, `reservation_id`, `operation_id`, `state` (`PENDING`,
 `UNKNOWN`, `CANCELLED` or `OBSERVED_TERMINAL`), `terminal_fact_digest`,
-`terminal_sequence`, `account` and its own `view_receipt`. On failure
-`{"status": "UNKNOWN", "code": "IDENTITY_UNAVAILABLE"}`; a bad page is 400
-`INVALID_PAGE`.
+`terminal_sequence`, `account` and its own `view_receipt`. A refusal by the
+Gateway is `{"status": "REQUEST_REJECTED", "code": "<code>"}` (section 7.1); any
+other failure `{"status": "UNKNOWN", "code": "IDENTITY_UNAVAILABLE"}`; a bad page
+is 400 `INVALID_PAGE`.
 
 ### 6.8 `POST /api/v1/scopes/{scope_id}/targets/prepare`
 
@@ -232,7 +308,8 @@ Body `{"cause_id", "reservation_id", "operation_id", "view_receipt"}` from one
 `PENDING` target row. Checks with the Gateway that the target is still `PENDING`
 and answers `{"status": "PREPARED", "receipt": ...}`; sends no cancel. Other
 answers: 400 `INVALID_TARGET`, `{"status": "UNKNOWN", "code": "TARGET_UNAVAILABLE"}`
-(not pending any more), `{"status": "UNKNOWN", "code": "IDENTITY_UNAVAILABLE"}`.
+(not pending any more), `{"status": "REQUEST_REJECTED", "code": "<code>"}` (the
+Gateway refused, section 7.1), `{"status": "UNKNOWN", "code": "IDENTITY_UNAVAILABLE"}`.
 
 Running the receipt cancels the order once: the target is claimed before the
 cancel is sent. `status` answers `{"status": "OBSERVED", "target": {...}}` while
@@ -264,10 +341,41 @@ Codes set by the adapter:
 | `IDENTITY_UNAVAILABLE` | `UNKNOWN` | No verified Gateway identity, journal or answer |
 | `TARGET_UNAVAILABLE` | `UNKNOWN` | The frozen order is not pending any more |
 | `REQUEST_ID_CONFLICT` | `REQUEST_REJECTED` | The request id belongs to another command |
-| `SOURCE_PROVENANCE_UNAVAILABLE` | `UNAVAILABLE` `reason` | Snapshot not offered (6.2) |
+| `SOURCE_PROVENANCE_UNAVAILABLE` | `UNAVAILABLE` `reason` | The account read names no source (6.2) |
+| `SOURCE_PROVENANCE_MISMATCH` | `UNAVAILABLE` `reason` | The account read's source is not the control view's (6.2) |
+| `ACCOUNT_VIEW_NOT_READY` | `UNAVAILABLE` `reason` | The read model is not ready or not current (6.2) |
+| `ACCOUNT_VIEW_UNAVAILABLE` | `UNAVAILABLE` `reason` | No verified account read (6.2) |
+| `STRATEGY_VIEW_UNAVAILABLE` | `UNAVAILABLE` `reason` | Strategy-scope route; no strategy view is offered (6.2) |
 
-Codes passed through from the Gateway with `REQUEST_REJECTED` (not exhaustive;
-the Gateway may add codes and a client must treat any other code as a refusal):
+The snapshot's `OBSERVED` answer is described in 6.2.
+
+### 7.1 Refusals by the Gateway
+
+A Gateway refusal is answered `{"status": "REQUEST_REJECTED", "code": "<code>"}`
+only when the Gateway's own reply to the call carries one of these codes (the
+Registry returns them before the operation runs, or instead of a read's result),
+or when the Gateway's control handler answers the call with exactly
+`{"status": "REQUEST_REJECTED", "code": "<code>"}`. The refused call changed
+nothing.
+
+| Code | Meaning |
+| --- | --- |
+| `DENIED` | The principal is not trusted any more (revoked) or the identity does not match its registration. |
+| `NOT_REGISTERED` | The operator's registration is not active any more (expired or removed). |
+| `SCOPE_DENIED` | The Registry no longer grants this operation or scope to the operator. The control handler uses the same code for another account, a scope or an operation its control grant does not cover. |
+| `STALE_EPOCH` | The registration belongs to an earlier start of the Gateway. |
+| `CAPABILITY_UNAVAILABLE` | The Gateway does not offer the operation. |
+| `POLICY_REQUIREMENT_UNMET` | The Gateway is not ready or its access policy changed. |
+| `CLOSED` | The Gateway's Registry is closed. |
+
+Never a refusal: no reply, a timeout, a lost reply, a transport failure, a
+refusal by the operator's own runtime before it sends, any other Registry code,
+and any refusal that arrives after a write was answered. These stay `UNKNOWN`
+(`UNAVAILABLE` for the snapshot).
+
+Codes passed through from the Gateway's control handler with `REQUEST_REJECTED`
+(not exhaustive; the Gateway may add codes and a client must treat any other code
+as a refusal):
 `SCOPE_DENIED`, `INVALID_REQUEST`, `ADMISSION_DENIED`, `JOURNAL_ID_MISMATCH`,
 `CONTROL_UNAVAILABLE`, `CANCEL_UNAVAILABLE`, `CONTROL_CANCEL_PROOF_REQUIRED`,
 `RECOVERY_REQUIRED` (a lease DRAIN cause whose recovery conditions are not met),
@@ -296,6 +404,16 @@ detected change of the host's protected configuration file ends every session
 until the host is restarted. Revoking an operator in the Web host is not a
 Gateway revocation: revoke the principal or its grant in the Gateway's Registry.
 
+An account-scope operator entry of the host's configuration may add
+`"account_operations": ["account.snapshot.typed"]`. The host then also registers
+that operator on the Gateway's account read port (mount `application.account`,
+same service, endpoint and keys), which the snapshot route (6.2) needs. The
+Gateway must grant it: in the CTP trading bundle, an entry of
+`account_observation.operator_reads` names the operator. Without the key, or when
+the Gateway does not grant the registration, the host starts with the control
+registration only and the snapshot route answers 403. A strategy-scope operator
+cannot have the key.
+
 ## 9. Sequence and client rules
 
 1. `GET /api/v1/session`; keep `csrf_token` and the scope's `route_fingerprint`.
@@ -315,7 +433,12 @@ Gateway revocation: revoke the principal or its grant in the Gateway's Registry.
      checked by hand in the Gateway journal, for example with the operator's own
      SDK client.
 6. Never prepare a new `request_id` to retry an unresolved request, and never
-   treat `UNKNOWN` as success or as "not applied".
+   treat `UNKNOWN` as success or as "not applied". `REQUEST_REJECTED` with a code
+   of section 7.1 says that the Gateway refused this call and that this call
+   changed nothing. It does not resolve an earlier `UNKNOWN` of the same receipt:
+   after a refused `status` or `run` (for example `DENIED` or `NOT_REGISTERED`),
+   restore the operator's access in the Gateway, then call `status` with the same
+   receipt again.
 7. `REQUEST_ID_CONFLICT`: the id is taken by another command; read the list
    again and prepare a new request with a new id if still wanted.
 8. A double click or several tabs running the same receipt at the same time
@@ -330,8 +453,16 @@ Gateway revocation: revoke the principal or its grant in the Gateway's Registry.
   Gateway from the authenticated registration. A cause applied through the Web
   therefore carries the Web operator's own identity, the same way as a cause
   applied by that operator's SDK client. The Web host adds no identity of its own.
-- A release stores the request id as the cause's `resume_id`. The journal does
-  not store who released a cause, for the Web and for the CLI alike.
+- A release stores the request id as the cause's `resume_id`. Who released a
+  cause is stored only by a journal with the release audit, an explicit one-way
+  upgrade the operator of the Gateway installs (`controls.release_audit` in the
+  local resource bundle). There each release stores its `releaser` in the same
+  transaction: the operator, named exactly like `origin` above, or
+  `"system:<mechanism>"` when the Gateway released the cause itself. A repeat of
+  the same release keeps the first releaser. A journal without the audit stores
+  no releaser, and a cause released before the audit was installed has none:
+  for those the only record of who released a cause is the Gateway's log line
+  for each operator release. This holds for the Web and for the CLI alike.
 - A cancel of a frozen order stores the requesting principal and actor, the
   registration id and the service epoch with the cancel.
 - Browser storage and Web host memory are not an audit record.
@@ -342,7 +473,9 @@ Gateway revocation: revoke the principal or its grant in the Gateway's Registry.
   balance or ledger.
 - It never clears an `UNKNOWN` order or command, never releases a cause by
   itself, and never retries a request under a new id.
-- It never shows account or strategy money or positions (6.2).
+- It never shows strategy money or positions, never shows account money or
+  positions without a matching source provenance (6.2), and never presents
+  account totals as a strategy's funds.
 - It never accepts an identity, account or strategy from a request body or URL,
   never uses a shared or more privileged Gateway identity, and never grants a
   Gateway operation.

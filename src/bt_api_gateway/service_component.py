@@ -341,6 +341,39 @@ class GatewayReadService:
         else:
             self._view_policies = MappingProxyType({})
         self._state_worker = state_worker
+        self._source_provenance: Mapping[str, object] | None = None
+
+    def bind_source_provenance(
+        self, *, account_scope: str, journal_id: str, owner_generation: str
+    ) -> None:
+        """Name the control journal and owner generation this account view belongs to.
+
+        Called once by the trusted composition that holds both, from the journal that
+        serves the Gateway's control identity; never from configuration or the wire. A
+        typed snapshot read asking for it (``with_source_provenance``) returns it, so a
+        client can compare it with that control identity. It grants nothing.
+        """
+        state_worker = self._state_worker
+        values = (account_scope, journal_id, owner_generation)
+        if (
+            type(state_worker) is not GatewayAccountReadModel
+            or any(type(value) is not str or not value for value in values)
+            or any(not value.isprintable() or value != value.strip() for value in values)
+            or any(len(value.encode("utf-8")) > 256 for value in values)
+            or account_scope != state_worker.journal_account_scope
+        ):
+            raise GatewayServiceError("SOURCE_PROVENANCE_INVALID")
+        provenance = MappingProxyType(
+            {
+                "schema_version": 1,
+                "account_scope": account_scope,
+                "journal_id": journal_id,
+                "owner_generation": owner_generation,
+            }
+        )
+        if self._source_provenance is not None and dict(self._source_provenance) != dict(provenance):
+            raise GatewayServiceError("SOURCE_PROVENANCE_ALREADY_BOUND")
+        self._source_provenance = provenance
 
     @property
     def state_source(self) -> GatewayAccountSessionWorker | GatewayAccountReadModel | None:
@@ -683,7 +716,14 @@ class GatewayReadService:
             return MappingProxyType({"consumer_progress": _consumer_progress_result(progress)})
 
         if operation in {"account.snapshot", "account.snapshot.typed"}:
-            _reject_unknown_arguments(arguments, frozenset({"limit"}))
+            typed = operation == "account.snapshot.typed"
+            _reject_unknown_arguments(
+                arguments,
+                frozenset({"limit", "with_source_provenance"}) if typed else frozenset({"limit"}),
+            )
+            with_provenance = "with_source_provenance" in arguments
+            if with_provenance and arguments["with_source_provenance"] is not True:
+                raise GatewayServiceError("INVALID_ARGUMENTS")
             limit = arguments.get("limit", _DEFAULT_READ_LIMIT)
             _validate_read_arguments(None, limit, cursor_allowed=False)
             if operation == "account.snapshot.typed" and (
@@ -716,6 +756,8 @@ class GatewayReadService:
             )
             if operation == "account.snapshot":
                 return result
+            if with_provenance:
+                return _provenance_snapshot_result(result, self._source_provenance)
             return _typed_account_snapshot_result(result)
 
         _reject_unknown_arguments(arguments, frozenset())
@@ -1194,6 +1236,33 @@ def _typed_account_snapshot_result(result: Mapping[str, object]) -> Mapping[str,
     copied = dict(result)
     copied["snapshot"] = copied_snapshot
     return MappingProxyType(copied)
+
+
+def _provenance_snapshot_result(
+    result: Mapping[str, object], provenance: Mapping[str, object] | None
+) -> Mapping[str, object]:
+    """The typed account view with the control journal and owner generation it belongs to.
+
+    Carries no account data when no provenance is bound or the state is not ready:
+    an unready or older observation is never returned in this form.
+    """
+    status = result.get("state_status")
+    if provenance is None or not isinstance(status, Mapping) or status.get("ready") is not True:
+        return MappingProxyType(
+            {
+                "state_status": dict(status) if isinstance(status, Mapping) else None,
+                "source_provenance": None if provenance is None else dict(provenance),
+                "snapshot": None,
+            }
+        )
+    typed = _typed_account_snapshot_result(result)
+    return MappingProxyType(
+        {
+            "state_status": dict(status),
+            "source_provenance": dict(provenance),
+            "snapshot": typed["snapshot"],
+        }
+    )
 
 
 def _state_result_matches_worker(

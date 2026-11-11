@@ -106,6 +106,23 @@ def test_observed_release_must_be_this_release(field, value):
     assert writes == []
 
 
+@pytest.mark.parametrize('releaser, own', [
+    pytest.param(_origin('operator-a', 'actor-a'), True, id='this-operator'),
+    pytest.param(_origin('operator-b', 'actor-a'), False, id='other-principal'),
+    pytest.param(_origin('operator-a', 'actor-b'), False, id='other-actor'),
+    pytest.param('system:lease-drain', False, id='gateway-mechanism'),
+])
+def test_a_release_recorded_for_someone_else_is_not_this_release(releaser, own):
+    # A journal with the release audit names who released the cause (I63-E144). The same
+    # cause, version and operation id released by another operator is not this request.
+    reply = {**OWN_RELEASE, 'releaser': releaser}
+    app, writes = _app(None, reply)
+    status, run = _status_and_run(app, 'RESUME')
+    expected = reply if own else CONFLICT
+    assert status == expected and run == expected
+    assert writes == []
+
+
 def test_observed_cause_without_its_record_is_a_conflict():
     app, writes = _app(None, {'status': 'OBSERVED', 'cause_id': 'request-1'})
     assert _status_and_run(app, 'FREEZE') == (CONFLICT, CONFLICT)
