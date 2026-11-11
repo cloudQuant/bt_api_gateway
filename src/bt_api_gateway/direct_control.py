@@ -129,6 +129,41 @@ def verify_controls(db, account, capacity):
                 raise DirectCommandJournalError('CONTROL_INVALID_DATABASE') from None
 
 
+def _terminal_observation(db, account, command):
+    """The command's latest order return when it is an attributed, consistent terminal one.
+
+    Returns ``(fact_digest, event_sequence)`` or ``None``. It is an observation,
+    not proof of a complete provider snapshot: a later order return that is not
+    terminal takes it back.
+    """
+    from decimal import Decimal, InvalidOperation
+
+    from bt_api_base.direct_write_protocol import DirectExecutionEventKind, DirectOrderStatus
+    from bt_api_base.gateway_execution_protocol import GatewayReturnFact
+
+    rows = db.execute("SELECT f.* FROM direct_execution_facts f WHERE f.account=? AND f.reservation_id=? "
+                      "AND f.event_sequence IS NOT NULL ORDER BY f.event_sequence DESC",
+                      (account, command['reservation_id'])).fetchall()
+    for row in rows:
+        fact = GatewayReturnFact.from_mapping(json.loads(row['fact_json']))
+        if fact.kind is not DirectExecutionEventKind.ORDER:
+            continue
+        try:
+            native, payload = json.loads(command['native_identity_json']), json.loads(command['payload_json'])
+            total, filled = Decimal(fact.order_quantity), Decimal(fact.filled_quantity)
+            valid = (row['disposition'] == 'ATTRIBUTED' and row['reason'] == 'MATCHED'
+                and fact.fact_digest() == row['fact_digest'] and fact.account_scope == account
+                and fact.route == native['exchange_name'] and fact.instrument.native_symbol == payload['symbol']
+                and total.is_finite() and filled.is_finite() and total == Decimal(payload['quantity']) and 0 <= filled <= total
+                and fact.status in (DirectOrderStatus.CANCELLED, DirectOrderStatus.FILLED, DirectOrderStatus.REJECTED)
+                and (fact.status is not DirectOrderStatus.FILLED or filled == total)
+                and (fact.status is not DirectOrderStatus.REJECTED or filled == 0))
+        except (ValueError, TypeError, KeyError, InvalidOperation):
+            valid = False
+        return (row['fact_digest'], row['event_sequence']) if valid else None
+    return None
+
+
 def check_controls(db, account, strategy, payload, *, allow_verified_close=None):
     """Check the same write transaction used for reserve/begin_dispatch.
 
@@ -222,13 +257,18 @@ class GatewayDirectControl:
             for pending_row in pending:
                 db.execute('INSERT INTO direct_control_blocked VALUES (?, ?, ?)', (j.account_scope, cause_id, pending_row['reservation_id']))
             if mode == 'DRAIN':
-                query = ('SELECT strategy,request_key,reservation_id FROM direct_journal_commands '
-                         'WHERE account=? AND status IN (?, ?, ?)')
+                query = ('SELECT strategy,request_key,reservation_id,native_identity_json,payload_json '
+                         'FROM direct_journal_commands WHERE account=? AND status IN (?, ?, ?)')
                 args = [j.account_scope, 'DISPATCHING', 'SENT', 'UNKNOWN']
                 if scope_kind == 'strategy':
                     query += ' AND strategy=?'
                     args.append(scope_value)
-                targets = db.execute(query, args).fetchall()
+                # An order the journal already saw end (cancelled, filled or rejected) needs no
+                # cancel and is not frozen as a target. Freezing every order ever sent made each
+                # DRAIN add one row per historical order: the table has a fixed capacity, and a
+                # DRAIN that no longer fits is refused exactly when it is needed (I63-E131).
+                targets = [row for row in db.execute(query, args).fetchall()
+                           if _terminal_observation(db, j.account_scope, row) is None]
                 prior = db.execute('SELECT count(*) FROM direct_control_targets WHERE account=?', (j.account_scope,)).fetchone()[0]
                 if len(targets) + prior > j._max_records:
                     raise DirectCommandJournalError('CONTROL_CAPACITY_EXCEEDED')
@@ -350,9 +390,6 @@ class GatewayDirectControl:
         The observation is not proof of a complete provider snapshot; later
         contradictory order facts cause the next reconciliation to return UNKNOWN.
         """
-        from decimal import Decimal, InvalidOperation
-        from bt_api_base.gateway_execution_protocol import GatewayReturnFact
-        from bt_api_base.direct_write_protocol import DirectExecutionEventKind, DirectOrderStatus
         self._owned()
         cause_id = _text(cause_id)
         j = self._journal
@@ -364,30 +401,9 @@ class GatewayDirectControl:
             targets = db.execute("SELECT * FROM direct_control_targets WHERE account=? AND cause_id=? AND state!='CANCELLED'", (j.account_scope, cause_id)).fetchall()
             for target in targets:
                 command = db.execute('SELECT * FROM direct_journal_commands WHERE account=? AND reservation_id=?', (j.account_scope, target['reservation_id'])).fetchone()
-                rows = db.execute("SELECT f.* FROM direct_execution_facts f WHERE f.account=? AND f.reservation_id=? AND f.event_sequence IS NOT NULL ORDER BY f.event_sequence DESC", (j.account_scope, target['reservation_id'])).fetchall()
-                selected = None
-                for row in rows:
-                    fact = GatewayReturnFact.from_mapping(json.loads(row['fact_json']))
-                    if fact.kind is DirectExecutionEventKind.ORDER:
-                        selected = (row, fact)
-                        break
-                valid = False
-                if selected is not None:
-                    row, fact = selected
-                    try:
-                        native, payload = json.loads(command['native_identity_json']), json.loads(command['payload_json'])
-                        total, filled = Decimal(fact.order_quantity), Decimal(fact.filled_quantity)
-                        valid = (row['disposition'] == 'ATTRIBUTED' and row['reason'] == 'MATCHED'
-                            and fact.fact_digest() == row['fact_digest'] and fact.account_scope == j.account_scope
-                            and fact.route == native['exchange_name'] and fact.instrument.native_symbol == payload['symbol']
-                            and total.is_finite() and filled.is_finite() and total == Decimal(payload['quantity']) and 0 <= filled <= total
-                            and fact.status in (DirectOrderStatus.CANCELLED, DirectOrderStatus.FILLED, DirectOrderStatus.REJECTED)
-                            and (fact.status is not DirectOrderStatus.FILLED or filled == total)
-                            and (fact.status is not DirectOrderStatus.REJECTED or filled == 0))
-                    except (ValueError, TypeError, KeyError, InvalidOperation):
-                        valid = False
-                if valid:
-                    state, digest, seq = 'OBSERVED_TERMINAL', row['fact_digest'], row['event_sequence']
+                observed = _terminal_observation(db, j.account_scope, command)
+                if observed is not None:
+                    state, (digest, seq) = 'OBSERVED_TERMINAL', observed
                 elif target['state'] == 'OBSERVED_TERMINAL':
                     state, digest, seq = 'UNKNOWN', None, None
                 else:
