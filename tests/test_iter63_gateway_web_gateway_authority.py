@@ -106,16 +106,18 @@ class Gateway:
 
     ``account_reads`` (operator name -> operations) also binds the account read port with
     its own read journal and account read model, as the trading composition does; only the
-    named operators get a registry resource on it.
+    named operators get a registry resource on it. ``release_audit`` installs the journal's
+    release audit (who released each cause is stored with the release).
     """
 
-    def __init__(self, tmp_path, operators=OPERATORS, account_reads=None):
+    def __init__(self, tmp_path, operators=OPERATORS, account_reads=None, release_audit=False):
         with socket.socket() as probe:
             probe.bind(('127.0.0.1', 0))
             self.endpoint = f'tcp://127.0.0.1:{probe.getsockname()[1]}'
         self.server_keys = zmq.curve_keypair()
         self.operators = operators
         self.account_reads = dict(account_reads or {})
+        self.release_audit = release_audit
         self.keys = {name: zmq.curve_keypair() for name in operators}
         self.tmp_path = tmp_path
         self.commands = queue.Queue()
@@ -180,6 +182,9 @@ class Gateway:
             assert owner.start(10)
             journal, guard = owned[0]
             control = owner.submit_service_call(lambda: journal.enable_controls(guard)).result(timeout_seconds=5)
+            if self.release_audit:
+                owner.submit_service_call(
+                    lambda: journal.enable_control_release_audit(guard)).result(timeout_seconds=5)
             binding = GatewayDirectServiceBinding(
                 journal, {'strategy-p': GatewayDirectGrant('strategy-a', frozenset({'rb'}))},
                 owner=owner, control=control, control_grants=control_grants)
