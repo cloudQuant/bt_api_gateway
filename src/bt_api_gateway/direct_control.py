@@ -267,6 +267,11 @@ class GatewayDirectControl:
                 # cancel and is not frozen as a target. Freezing every order ever sent made each
                 # DRAIN add one row per historical order: the table has a fixed capacity, and a
                 # DRAIN that no longer fits is refused exactly when it is needed (I63-E131).
+                # Limit: the choice is made once, here. An order left out because it had ended
+                # is not looked at again by this cause; should a non-terminal return for it be
+                # stored later (a stale query answer, for instance), this DRAIN does not turn
+                # UNKNOWN for it as it would for a target. The account comparison and the
+                # return ledger are the checks for that case.
                 targets = [row for row in db.execute(query, args).fetchall()
                            if _terminal_observation(db, j.account_scope, row) is None]
                 prior = db.execute('SELECT count(*) FROM direct_control_targets WHERE account=?', (j.account_scope,)).fetchone()[0]
