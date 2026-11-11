@@ -63,6 +63,46 @@ def _rejected():
     raise GatewayDelegationDenied("DELEGATION_DENIED")
 
 
+def _claims_match(ctx, grant, cmd, operation) -> bool:
+    """Compare the envelope with the authenticated context and the installed grant only."""
+    identity, scope = ctx.identity, ctx.scope
+    return not (type(grant) is not GatewayDelegateGrant or type(cmd) is not GatewayDelegatedCommand
+                or type(identity) is not WireIdentity or type(scope) is not WireScope
+                or identity != grant.identity or ctx.principal_ref != identity.principal_ref
+                or type(ctx.registration_id) is not str or not ctx.registration_id
+                or identity.principal_ref != cmd.actor_principal or identity.actor_ref != cmd.actor_ref
+                or scope.execution_domain_ref != cmd.execution_domain_ref
+                or scope.account_ref != cmd.account_scope or scope.strategy_ref != cmd.strategy_scope
+                or scope.run_id != cmd.run_id or scope.account_refs or scope.manual_book_ref is not None
+                or scope.portfolio_ref is not None or scope.group_id is not None or scope.leg_id is not None
+                or grant.account_scope != cmd.account_scope or grant.strategy_scope != cmd.strategy_scope
+                or grant.execution_domain_ref != cmd.execution_domain_ref
+                or grant.actor_kind != cmd.actor_kind or grant.revision != cmd.grant_revision
+                or cmd.instrument not in grant.instruments or operation not in grant.operations)
+
+
+def _payload_matches(cmd, payload) -> bool:
+    return (type(payload) is dict and payload.get("idempotency_key") == cmd.request_key
+            and payload.get("symbol") == cmd.instrument.native_symbol
+            and (payload.get("exchange_id") is None or payload["exchange_id"] == cmd.instrument.venue))
+
+
+def delegated_request_matches(context, grant, command, operation: str, payload) -> bool:
+    """Static check of one request against the authenticated context and installed grant.
+
+    It reads no journal or Registry state and never authorizes anything: the
+    owner still rechecks the Registry, the grant and the instrument under its
+    transaction fence. ``False`` is a definite refusal of this request (another
+    strategy or account, another actor, an instrument outside the grant, an
+    operation the grant lacks, or a payload naming another instrument); it says
+    nothing about any earlier command.
+    """
+    try:
+        return _payload_matches(command, payload) and _claims_match(context, grant, command, operation)
+    except Exception:
+        return False
+
+
 class GatewayDelegationPermit:
     """Recheckable owner-local binding; it does not replace Registry admission."""
 
@@ -92,19 +132,7 @@ class GatewayDelegationPermit:
     def _check(self, db, *, verify_parent):
         cmd, grant, ctx = self._command, self._grant, self._context
         try:
-            identity, scope = ctx.identity, ctx.scope
-            if (type(identity) is not WireIdentity or type(scope) is not WireScope
-                    or identity != grant.identity or ctx.principal_ref != identity.principal_ref
-                    or type(ctx.registration_id) is not str or not ctx.registration_id
-                    or identity.principal_ref != cmd.actor_principal or identity.actor_ref != cmd.actor_ref
-                    or scope.execution_domain_ref != cmd.execution_domain_ref
-                    or scope.account_ref != cmd.account_scope or scope.strategy_ref != cmd.strategy_scope
-                    or scope.run_id != cmd.run_id or scope.account_refs or scope.manual_book_ref is not None
-                    or scope.portfolio_ref is not None or scope.group_id is not None or scope.leg_id is not None
-                    or grant.account_scope != cmd.account_scope or grant.strategy_scope != cmd.strategy_scope
-                    or grant.execution_domain_ref != cmd.execution_domain_ref
-                    or grant.actor_kind != cmd.actor_kind or grant.revision != cmd.grant_revision
-                    or cmd.instrument not in grant.instruments or self._operation not in grant.operations
+            if (not _claims_match(ctx, grant, cmd, self._operation)
                     or self._payload_digest != cmd.payload_digest
                     or self._current_grant() != grant or self._registry_recheck(ctx) is not True
                     or self._instrument_recheck(cmd.instrument) is not True):
@@ -132,11 +160,7 @@ def authorize_delegated_command(context, grant: GatewayDelegateGrant, command: G
     """
     try:
         if (type(grant) is not GatewayDelegateGrant or type(command) is not GatewayDelegatedCommand
-                or operation not in _OPERATIONS or type(payload) is not dict
-                or payload.get("idempotency_key") != command.request_key
-                or payload.get("symbol") != command.instrument.native_symbol
-                or (payload.get("exchange_id") is not None
-                    and payload["exchange_id"] != command.instrument.venue)
+                or operation not in _OPERATIONS or not _payload_matches(command, payload)
                 or not all(callable(fn) for fn in (registry_recheck, current_grant, instrument_recheck))
                 or (parent_recheck is not None and not callable(parent_recheck))):
             _rejected()
