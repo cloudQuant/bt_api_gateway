@@ -19,6 +19,26 @@ _CONTROL_DDL = {
     'direct_control_blocked': 'CREATE TABLE direct_control_blocked (account TEXT NOT NULL, cause_id TEXT NOT NULL, reservation_id TEXT NOT NULL, PRIMARY KEY(account, cause_id, reservation_id))',
 }
 
+# Release audit, an optional extension installed by an explicit one-way upgrade
+# (GatewayDirectCommandJournal.enable_control_release_audit) at any schema from 10
+# on. Once installed, every released cause has exactly one row, written in the
+# transaction that released it. ``releaser`` is NULL only for a cause released
+# before the upgrade: who released it then was not stored and is not invented.
+_CONTROL_RELEASE_DDL = {
+    'direct_control_releases': 'CREATE TABLE direct_control_releases (account TEXT NOT NULL, cause_id TEXT NOT NULL, resume_id TEXT NOT NULL, releaser TEXT, PRIMARY KEY(account, cause_id))',
+}
+
+# Who released a cause: an operator, named exactly as the origin of an operator's
+# own cause is named ("operator:" and the SHA-256 of [principal, actor]), or a
+# mechanism of the Gateway itself ("system:" and the mechanism's name).
+_RELEASER = re.compile(r'(?:operator:[0-9a-f]{64}|system:[a-z][a-z0-9-]{0,62}[a-z0-9])\Z')
+
+
+def _releaser(value):
+    if type(value) is not str or _RELEASER.fullmatch(value) is None:
+        raise DirectCommandJournalError('CONTROL_INVALID_INPUT')
+    return value
+
 
 # An instrument scope names one contract of the account: "<venue>:<native symbol>".
 # Its causes are always FREEZE: every new order on that contract is refused for
@@ -91,6 +111,23 @@ def verify_controls(db, account, capacity):
             indexed[row['cause_id']] = row
         except (ValueError, TypeError, DirectCommandJournalError):
             raise DirectCommandJournalError('CONTROL_INVALID_DATABASE') from None
+    # Whether the release audit is installed is pinned before this point: every caller
+    # checks the exact DDL against the journal's installed option in the same transaction.
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='direct_control_releases'").fetchone():
+        releases = db.execute('SELECT * FROM direct_control_releases').fetchall()
+        if len(releases) > capacity:
+            raise DirectCommandJournalError('CONTROL_INVALID_DATABASE')
+        for row in releases:
+            cause = indexed.get(row['cause_id'])
+            if (row['account'] != account or cause is None or cause['active'] != 0
+                    or row['resume_id'] != cause['resume_id']
+                    or (row['releaser'] is not None and (type(row['releaser']) is not str
+                                                         or _RELEASER.fullmatch(row['releaser']) is None))):
+                raise DirectCommandJournalError('CONTROL_INVALID_DATABASE')
+        # Exactly one record per released cause: a missing one is not taken for an old release.
+        if ({row['cause_id'] for row in releases}
+                != {cause_id for cause_id, cause in indexed.items() if cause['active'] == 0}):
+            raise DirectCommandJournalError('CONTROL_INVALID_DATABASE')
     for row in blocked:
         cause = indexed.get(row['cause_id'])
         if (row['account'] != account or cause is None or row['original_strategy'] is None
@@ -286,13 +323,40 @@ class GatewayDirectControl:
             j._bump(db)
             return dict(db.execute('SELECT * FROM direct_control_causes WHERE account=? AND cause_id=?', (j.account_scope, cause_id)).fetchone())
 
-    def resume(self, cause_id, *, expected_version, operation_id, before_commit=None, before_commit_db=None):
+    def _record(self, db, row):
+        """A cause as stored, with ``releaser`` when the journal holds who released it.
+
+        Absent for an active cause, on a journal without the release audit, and for
+        a cause released before the audit was installed.
+        """
+        record = dict(row)
+        if record['active'] == 0 and self._journal._control_release_audit:
+            stored = db.execute('SELECT releaser FROM direct_control_releases WHERE account=? AND cause_id=?',
+                                (record['account'], record['cause_id'])).fetchone()
+            if stored is not None and stored[0] is not None:
+                record['releaser'] = stored[0]
+        return record
+
+    def resume(self, cause_id, *, expected_version, operation_id, releaser=None, before_commit=None,
+               before_commit_db=None):
+        """Release one cause at its expected version under one operation id.
+
+        ``releaser`` names who releases it (see ``_RELEASER``). A journal with the
+        release audit requires it and stores it with the release, in the same
+        transaction; a journal without it ignores it, as before. A replay of the
+        same release returns the stored record: the stored releaser is kept, whoever
+        replays it.
+        """
         self._owned()
         cause_id, operation_id = _text(cause_id), _text(operation_id)
         if (type(expected_version) is not int or expected_version < 1
                 or (before_commit_db is not None and not callable(before_commit_db))):
             raise DirectCommandJournalError('CONTROL_INVALID_INPUT')
+        if releaser is not None:
+            releaser = _releaser(releaser)
         j = self._journal
+        if releaser is None and j._control_release_audit:
+            raise DirectCommandJournalError('CONTROL_RELEASER_REQUIRED')
         with j._transaction() as db:
             row = db.execute('SELECT * FROM direct_control_causes WHERE account=? AND cause_id=?', (j.account_scope, cause_id)).fetchone()
             if row is None:
@@ -303,20 +367,23 @@ class GatewayDirectControl:
                         raise DirectCommandJournalError('CONTROL_RECOVERY_UNVERIFIED')
                     if before_commit is not None:
                         before_commit()
-                    return dict(row)
+                    return self._record(db, row)
                 raise DirectCommandJournalError('CONTROL_VERSION_CONFLICT')
             if row['version'] != expected_version:
                 raise DirectCommandJournalError('CONTROL_VERSION_CONFLICT')
             if db.execute('SELECT 1 FROM direct_control_causes WHERE account=? AND resume_id=?', (j.account_scope, operation_id)).fetchone():
                 raise DirectCommandJournalError('CONTROL_OPERATION_CONFLICT')
             db.execute('UPDATE direct_control_causes SET active=0,version=version+1,resume_id=? WHERE account=? AND cause_id=?', (operation_id, j.account_scope, cause_id))
+            if j._control_release_audit:
+                db.execute('INSERT INTO direct_control_releases VALUES (?, ?, ?, ?)',
+                           (j.account_scope, cause_id, operation_id, releaser))
             db.execute("UPDATE direct_control_targets SET state='CANCELLED' WHERE account=? AND cause_id=? AND state='PENDING'", (j.account_scope, cause_id))
             if before_commit_db is not None and before_commit_db(db) is not True:
                 raise DirectCommandJournalError('CONTROL_RECOVERY_UNVERIFIED')
             if before_commit is not None:
                 before_commit()
             j._bump(db)
-            return dict(db.execute('SELECT * FROM direct_control_causes WHERE account=? AND cause_id=?', (j.account_scope, cause_id)).fetchone())
+            return self._record(db, db.execute('SELECT * FROM direct_control_causes WHERE account=? AND cause_id=?', (j.account_scope, cause_id)).fetchone())
 
     def get(self, cause_id):
         self._owned()
@@ -324,7 +391,7 @@ class GatewayDirectControl:
             row = db.execute('SELECT * FROM direct_control_causes WHERE account=? AND cause_id=?', (self._journal.account_scope, _text(cause_id))).fetchone()
             if row is None:
                 raise DirectCommandJournalError('CONTROL_NOT_FOUND')
-            return dict(row)
+            return self._record(db, row)
 
     def active_system_causes(self, origin):
         """Owner-only lookup; callers must supply their installed system origin."""
@@ -359,18 +426,18 @@ class GatewayDirectControl:
             if scope_value == '':
                 # Every contract of the account, for a caller authorised for the whole account.
                 with self._journal._transaction() as db:
-                    return tuple(dict(row) for row in db.execute(
+                    return tuple(self._record(db, row) for row in db.execute(
                         "SELECT * FROM direct_control_causes WHERE account=? AND scope_kind='instrument' "
                         'AND cause_id>? ORDER BY cause_id LIMIT ?',
-                        (self._journal.account_scope, after, limit)))
+                        (self._journal.account_scope, after, limit)).fetchall())
             scope_value = _instrument_scope(scope_value)
         else:
             scope_value = _text(scope_value)
         with self._journal._transaction() as db:
-            return tuple(dict(row) for row in db.execute(
+            return tuple(self._record(db, row) for row in db.execute(
                 'SELECT * FROM direct_control_causes WHERE account=? AND scope_kind=? AND scope_value=? '
                 'AND cause_id>? ORDER BY cause_id LIMIT ?',
-                (self._journal.account_scope, scope_kind, scope_value, after, limit)))
+                (self._journal.account_scope, scope_kind, scope_value, after, limit)).fetchall())
 
     def resume_status(self, operation_id, *, scope_kind, scope_value=''):
         self._owned()
@@ -387,11 +454,11 @@ class GatewayDirectControl:
                 # Any contract of the account, for a caller authorised for the whole account.
                 row = db.execute("SELECT * FROM direct_control_causes WHERE account=? AND scope_kind='instrument' "
                                  'AND resume_id=?', (self._journal.account_scope, operation_id)).fetchone()
-                return None if row is None else dict(row)
+                return None if row is None else self._record(db, row)
             row = db.execute('SELECT * FROM direct_control_causes WHERE account=? AND scope_kind=? '
                              'AND scope_value=? AND resume_id=?',
                              (self._journal.account_scope, scope_kind, scope_value, operation_id)).fetchone()
-            return None if row is None else dict(row)
+            return None if row is None else self._record(db, row)
 
     def target_status(self, cause_id, operation_id):
         self._owned()

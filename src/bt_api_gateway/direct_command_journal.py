@@ -177,6 +177,7 @@ class GatewayDirectCommandJournal:
         control_cancel_enabled: bool = False,
         account_fact_recovery_enabled: bool = False,
         account_event_recovery_enabled: bool = False,
+        control_release_audit_enabled: bool = False,
     ) -> None:
         self._configure(
             database_path,
@@ -203,9 +204,13 @@ class GatewayDirectCommandJournal:
                 or (strategy_origin_enabled and not actor_stream_enabled)
                 or (control_cancel_enabled and not strategy_origin_enabled)
                 or (account_fact_recovery_enabled and not control_cancel_enabled)
-                or (account_event_recovery_enabled and not account_fact_recovery_enabled)):
+                or (account_event_recovery_enabled and not account_fact_recovery_enabled)
+                or type(control_release_audit_enabled) is not bool
+                or (control_release_audit_enabled and not controls_enabled)):
             raise DirectCommandJournalError("INVALID_INPUT")
         self._schema_version = 19 if account_event_recovery_enabled else 18 if account_fact_recovery_enabled else 17 if control_cancel_enabled else 16 if strategy_origin_enabled else 15 if actor_stream_enabled else 14 if account_facts_financial_enabled else 13 if parent_authority_enabled else 12 if account_extensions_enabled else 11 if strategy_ledger_enabled else 10 if controls_enabled else 9
+        # Independent of the schema version (see enable_control_release_audit).
+        self._control_release_audit = control_release_audit_enabled
         self._journal_id = _text(expected_journal_id)
         if type(minimum_revision) is not int or minimum_revision < 0:
             raise DirectCommandJournalError("INVALID_REVISION")
@@ -215,6 +220,8 @@ class GatewayDirectCommandJournal:
                 if controls_enabled:
                     # Distinguish an anchored v9 candidate before exact v10 DDL verification.
                     self._assert_anchor(db)
+                    # Likewise a journal whose release audit is not what the owner installed.
+                    self._assert_release_audit(db)
                 self._verify_schema(db, schema_version=self._schema_version)
                 self._assert_anchor(db)
                 self._verify_v2_upgrade_integrity(db, schema_version=self._schema_version)
@@ -379,6 +386,7 @@ class GatewayDirectCommandJournal:
             raise DirectCommandJournalError("INVALID_INPUT")
         self._max_records = max_records
         self._schema_version = 9
+        self._control_release_audit = False
         self._execution_max_facts = execution_max_facts
         self._clock = clock
         self._timeout = timeout_seconds
@@ -754,7 +762,7 @@ class GatewayDirectCommandJournal:
         return self
 
     @staticmethod
-    def _verify_exact_ddl(db: sqlite3.Connection, schema_version: int) -> None:
+    def _verify_exact_ddl(db: sqlite3.Connection, schema_version: int, release_audit: bool = False) -> None:
         expected = {
             "direct_journal_meta": "CREATE TABLE direct_journal_meta (account TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, max_records INTEGER NOT NULL, journal_id TEXT NOT NULL, revision INTEGER NOT NULL)",
             "direct_journal_commands": "CREATE TABLE direct_journal_commands (account TEXT NOT NULL, strategy TEXT NOT NULL, request_key TEXT NOT NULL, reservation_id TEXT NOT NULL UNIQUE, principal TEXT NOT NULL, digest TEXT NOT NULL, payload_json TEXT NOT NULL, generation TEXT NOT NULL, expires_at REAL NOT NULL, status TEXT NOT NULL, version INTEGER NOT NULL, native_identity_json TEXT, strong_keys_json TEXT, PRIMARY KEY(account, strategy, request_key))",
@@ -890,6 +898,12 @@ class GatewayDirectCommandJournal:
             from .account_event_consumer_ownership import ACCOUNT_EVENT_OWNER_DDL
             expected.update(ACCOUNT_EVENT_OWNER_DDL)
             automatic.add('sqlite_autoindex_account_event_consumer_owners_1')
+        if release_audit:
+            if schema_version < 10:
+                raise DirectCommandJournalError("INVALID_DATABASE")
+            from .direct_control import _CONTROL_RELEASE_DDL
+            expected.update(_CONTROL_RELEASE_DDL)
+            automatic.add('sqlite_autoindex_direct_control_releases_1')
         actual = {row[0] for row in db.execute("SELECT name FROM sqlite_master")}
         if actual != set(expected) | automatic:
             raise DirectCommandJournalError("INVALID_DATABASE")
@@ -906,7 +920,7 @@ class GatewayDirectCommandJournal:
         self, db: sqlite3.Connection, *, schema_version: int = 2
     ) -> None:
         """Reject altered legacy DDL and inconsistent records before migration."""
-        self._verify_exact_ddl(db, schema_version)
+        self._verify_exact_ddl(db, schema_version, self._control_release_audit)
         if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             raise DirectCommandJournalError("INVALID_DATABASE")
         rows = db.execute("SELECT * FROM direct_journal_commands").fetchall()
@@ -1207,7 +1221,7 @@ class GatewayDirectCommandJournal:
             if tuple(row[2] for row in db.execute(f"PRAGMA index_info({index})")) != index_columns:
                 raise DirectCommandJournalError("INVALID_DATABASE")
         if schema_version >= 4:
-            self._verify_exact_ddl(db, schema_version)
+            self._verify_exact_ddl(db, schema_version, self._control_release_audit)
             from .direct_execution_journal import _verify_execution_schema
 
             _verify_execution_schema(db, self._account, self._execution_max_facts)
@@ -1235,6 +1249,14 @@ class GatewayDirectCommandJournal:
             if len(row) != 1 or tuple(row[0]) != (self._account, self._execution_max_facts):
                 raise DirectCommandJournalError("EXECUTION_CAPACITY_MISMATCH")
         return revision
+
+    def _assert_release_audit(self, db: sqlite3.Connection) -> None:
+        """Name a release audit that differs from the owner's installed option before DDL checks."""
+        present = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                             "AND name='direct_control_releases'").fetchone() is not None
+        if present != self._control_release_audit:
+            raise DirectCommandJournalError("CONTROL_RELEASE_AUDIT_UPGRADE_REQUIRED" if self._control_release_audit
+                                            else "CONTROL_RELEASE_AUDIT_MISMATCH")
 
     def _bump(self, db: sqlite3.Connection) -> None:
         db.execute(
@@ -1978,6 +2000,52 @@ class GatewayDirectCommandJournal:
             db.execute('UPDATE direct_journal_meta SET schema_version=19,revision=revision+1 WHERE account=?', (self._account,))
             self._assert_account_guard(guard)
         self._schema_version = 19
+
+    def enable_control_release_audit(self, guard: LocalAccountSessionGuard) -> None:
+        """Explicit one-way upgrade: store who releases each control cause (schema 10 or later).
+
+        The audit does not depend on the features of the schemas after 10, so it
+        does not move the schema version and turns none of them on: a journal at
+        any version from 10 on takes it as it is. Opening the journal afterwards
+        requires ``control_release_audit_enabled=True``; it cannot be removed.
+
+        A cause released before this upgrade gets its release record without a
+        releaser: who released it was not stored then and is not invented now.
+        The whole journal is verified inside the upgrade transaction first.
+        """
+        if self._schema_version < 10:
+            raise DirectCommandJournalError("CONTROL_UPGRADE_REQUIRED")
+        if self._control_release_audit:
+            raise DirectCommandJournalError("CONTROL_RELEASE_AUDIT_ALREADY_ENABLED")
+        self._assert_account_guard(guard)
+        with self._transaction() as db:
+            self._verify_v2_upgrade_integrity(db, schema_version=self._schema_version)
+            self._verify_v4_identity_integrity(db)
+            from .direct_cancel_journal import _verify_cancel_integrity
+            from .direct_control import _CONTROL_RELEASE_DDL, verify_controls
+            from .direct_execution_journal import (
+                _verify_cancel_error_integrity,
+                _verify_consumer_integrity,
+                _verify_execution_integrity,
+                _verify_place_error_integrity,
+            )
+            from .direct_place_journal import _verify_place_integrity
+            _verify_execution_integrity(db, self._account, self._execution_max_facts)
+            _verify_consumer_integrity(db, self._account)
+            _verify_cancel_integrity(db, self._account, self._max_records)
+            _verify_cancel_error_integrity(db, self._account, self._execution_max_facts)
+            _verify_place_integrity(db, self._account, self._max_records)
+            _verify_place_error_integrity(db, self, self._execution_max_facts)
+            self._verify_history(db)
+            self._assert_account_guard(guard)
+            for ddl in _CONTROL_RELEASE_DDL.values():
+                db.execute(ddl)
+            db.execute("INSERT INTO direct_control_releases SELECT account,cause_id,resume_id,NULL "
+                       "FROM direct_control_causes WHERE account=? AND active=0", (self._account,))
+            verify_controls(db, self._account, self._max_records)
+            self._bump(db)
+            self._assert_account_guard(guard)
+        self._control_release_audit = True
 
     def install_monitor_gate(self, gate: Callable[[], bool], *, guard: LocalAccountSessionGuard) -> None:
         """Install the required-monitor owner's local, nonblocking write gate.
@@ -3238,7 +3306,7 @@ class GatewayDirectCommandJournal:
         with self._connection() as db, self._transaction_on(db):
             self._assert_anchor(db)
             if self._schema_version >= 4:
-                self._verify_exact_ddl(db, self._schema_version)
+                self._verify_exact_ddl(db, self._schema_version, self._control_release_audit)
             self._verify_history_if_due(db)
             yield db
 
