@@ -2464,6 +2464,46 @@ class GatewayDirectCommandJournal:
         except Exception:
             return unavailable
 
+    def read_external_net(self, instrument: object):
+        """The ``external`` book of one instrument at a provable current cut (G64-06).
+
+        Returns ``(trading_day, cut, net quantity)`` read with the installed account
+        comparison ports, as ``read_account_net_comparison`` reads it, or raises
+        ``STRATEGY_LEDGER_UNAVAILABLE``. A service must separately authorize this
+        account-wide view; this method grants no ACL.
+        """
+        from bt_api_base.market_protocol import MarketInstrumentKey
+
+        from .external_position_ledger import external_net
+        from .strategy_position_ledger import StrategyInstrumentBinding
+
+        if (type(instrument) is not MarketInstrumentKey or self._schema_version < 12
+                or self._strategy_ledger_ports is None or self._account_comparison_ports is None):
+            raise DirectCommandJournalError("STRATEGY_LEDGER_UNAVAILABLE")
+        fence, read_cut, _, _, verify_external_cut = self._account_comparison_ports
+        try:
+            self._assert_account_guard(self._account_comparison_guard)
+            with ExitStack() as stack:
+                manager = fence()
+                enter, exit_ = type(manager).__enter__, type(manager).__exit__
+                enter(manager)
+                stack.push(lambda *exc: (exit_(manager, *exc), False)[1])
+                db = stack.enter_context(self._transaction())
+                current = read_cut(db, self._account, instrument)
+                if type(current) is not tuple or len(current) != 4:
+                    raise ValueError("CUT_UNAVAILABLE")
+                binding, day, cut, _ = current
+                if type(binding) is not StrategyInstrumentBinding or binding.instrument != instrument:
+                    raise ValueError("CUT_UNAVAILABLE")
+                quantity = external_net(db, self._account, instrument, trading_day=day, cut=cut,
+                                        verify_current=verify_external_cut)
+                if read_cut(db, self._account, instrument) != current:
+                    raise ValueError("CUT_CHANGED")
+                self._assert_account_guard(self._account_comparison_guard)
+                return day, cut, quantity
+        except Exception as exc:
+            raise DirectCommandJournalError("STRATEGY_LEDGER_UNAVAILABLE") from exc
+
     def read_strategy_position(self, strategy: str, payload: dict, *, expected_instrument: object):
         """Read an owner-resolved strategy position; this method grants no ACL.
 
