@@ -118,7 +118,7 @@ def test_an_operator_release_admits_the_contract_again_and_is_recorded(setup):
 
 
 @pytest.mark.parametrize('mode, value', [
-    ('STOP_NEW', SCOPE), ('DRAIN', SCOPE),                                 # a contract block is always FREEZE
+    ('PAUSE', SCOPE), ('RESUME', SCOPE),             # not a mode (STOP_NEW and DRAIN are allowed since G64-01)
     ('FREEZE', ''), ('FREEZE', 'rb2701'), ('FREEZE', 'SHFE:'), ('FREEZE', ':rb2701'), ('FREEZE', 'SHFE:rb 2701'),
     ('FREEZE', 'SHFE:rb2701:x'), ('FREEZE', 7),
 ])
@@ -143,7 +143,7 @@ def test_scope_value_of_a_contract():
 
 
 @pytest.mark.parametrize('statement', [
-    "UPDATE direct_control_causes SET mode='STOP_NEW' WHERE cause_id='unresolved-rb'",
+    "UPDATE direct_control_causes SET mode='PAUSE' WHERE cause_id='unresolved-rb'",
     "UPDATE direct_control_causes SET scope_value='rb2701' WHERE cause_id='unresolved-rb'",
     "UPDATE direct_control_blocked SET reservation_id=(SELECT reservation_id FROM direct_journal_commands "
     "WHERE request_key='old-hc') WHERE cause_id='unresolved-rb'",

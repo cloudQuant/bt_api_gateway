@@ -1541,6 +1541,10 @@ class GatewayDirectCommandJournal:
         it must not perform native or network I/O. Existing keys bypass it.
         The optional owner-provided admission recheck runs inside the same
         transaction after a new insert, and exceptions roll back that insert.
+        ``origin_trading_fence`` is the owner's trading fence of a new reservation,
+        for the strategy's own (with ``strategy_origin_permit``) or a delegate's
+        on its behalf (with ``delegation_permit``); it is entered inside the
+        transaction, after an existing key was ruled out.
         """
         strategy, request_key, principal = map(_text, (strategy, request_key, principal))
         if (
@@ -1577,7 +1581,11 @@ class GatewayDirectCommandJournal:
                     or origin.generation != self._generation or origin.strategy != strategy
                     or origin.request_key != request_key or origin.principal != principal or origin.payload_digest != digest):
                 raise DirectCommandJournalError('STRATEGY_ORIGIN_MISMATCH')
-        if origin_trading_fence is not None and (strategy_origin_permit is None or not callable(origin_trading_fence)):
+        # The trading fence of a new reservation: the strategy's own (with its origin permit)
+        # or a delegate's on its behalf (G64-09), entered at the same point for both.
+        if origin_trading_fence is not None and (
+                (strategy_origin_permit is None and delegation_permit is None)
+                or not callable(origin_trading_fence)):
             raise DirectCommandJournalError('STRATEGY_ORIGIN_UNAVAILABLE')
         if delegated is not None and reservation_fence is None:
             # The Registry-issued admission must remain held through commit,

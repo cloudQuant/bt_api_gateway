@@ -10,6 +10,7 @@ import json
 from dataclasses import dataclass
 
 from .direct_command_journal import DirectCommandJournalError, _json, _text
+from .direct_control import _TARGET_MODES, _instrument_scope, _names_instrument
 
 _CONTROL_CANCEL_DDL = {
     'direct_control_cancel_proofs': 'CREATE TABLE direct_control_cancel_proofs (account TEXT NOT NULL, strategy TEXT NOT NULL, operation_id TEXT NOT NULL, attempt_id TEXT NOT NULL UNIQUE, proof_json TEXT NOT NULL, proof_digest TEXT NOT NULL, PRIMARY KEY(account, strategy, operation_id))',
@@ -36,10 +37,12 @@ def _snapshot(db, account, journal_id, generation, cause_id, reservation_id, req
     target = db.execute('SELECT * FROM direct_control_targets WHERE account=? AND cause_id=? AND reservation_id=?', (account, cause_id, reservation_id)).fetchone()
     row = db.execute('SELECT * FROM direct_journal_commands WHERE account=? AND reservation_id=?', (account, reservation_id)).fetchone()
     if (meta is None or meta[0] != journal_id or cause is None or target is None or row is None
-            or cause['mode'] != 'DRAIN' or cause['active'] != 1 or cause['generation'] != generation
+            or cause['mode'] not in _TARGET_MODES or cause['active'] != 1 or cause['generation'] != generation
             or target['state'] != 'UNKNOWN' or row['status'] != 'SENT'
             or (target['strategy'], target['request_key']) != (row['strategy'], row['request_key'])
             or (cause['scope_kind'] == 'strategy' and cause['scope_value'] != row['strategy'])
+            or (cause['scope_kind'] == 'instrument'
+                and not _names_instrument(cause['scope_value'], json.loads(row['payload_json'])))
             or row['native_identity_json'] is None):
         _deny()
     keys = [r[0] for r in db.execute('SELECT strong_key FROM direct_journal_strong_keys WHERE account=? AND reservation_id=? ORDER BY strong_key', (account, reservation_id))]
@@ -103,7 +106,7 @@ def verify_control_cancel_integrity(db, account, journal_id, capacity):
             source = b.get('source') if type(b) is dict else None
             if (type(b) is not dict or set(b) != fields or type(b['schema_version']) is not int or b['schema_version'] != 1
                     or type(b['cause_version']) is not int or b['cause_version'] != 1
-                    or b['scope_kind'] not in ('account', 'strategy')
+                    or b['scope_kind'] not in ('account', 'strategy', 'instrument')
                     or (b['scope_kind'] == 'account' and b['scope_value'] != '')
                     or (b['scope_kind'] == 'strategy' and b['scope_value'] != b['strategy'])
                     or type(b['strong_keys']) is not list or not b['strong_keys']
@@ -122,12 +125,16 @@ def verify_control_cancel_integrity(db, account, journal_id, capacity):
                 _text(value)
             if source['kind'] == 'lease':
                 _text(source['event_id'])
+            if b['scope_kind'] == 'instrument':
+                _instrument_scope(b['scope_value'])
             cause = db.execute('SELECT * FROM direct_control_causes WHERE account=? AND cause_id=?', (account, b['cause_id'])).fetchone()
             target = db.execute('SELECT * FROM direct_control_targets WHERE account=? AND cause_id=? AND reservation_id=?', (account, b['cause_id'], b['reservation_id'])).fetchone()
             cmd = db.execute('SELECT * FROM direct_journal_commands WHERE account=? AND reservation_id=?', (account, b['reservation_id'])).fetchone()
             attempt = db.execute('SELECT * FROM direct_cancel_attempts WHERE account=? AND attempt_id=?', (account, row['attempt_id'])).fetchone()
             keys = [r[0] for r in db.execute('SELECT strong_key FROM direct_journal_strong_keys WHERE account=? AND reservation_id=? ORDER BY strong_key', (account, b['reservation_id']))]
-            if (cause is None or target is None or cmd is None or attempt is None or cause['mode'] != 'DRAIN'
+            if (cause is None or target is None or cmd is None or attempt is None or cause['mode'] not in _TARGET_MODES
+                    or (b['scope_kind'] == 'instrument'
+                        and not _names_instrument(b['scope_value'], json.loads(cmd['payload_json'])))
                     or cause['generation'] != b['generation'] or cause['scope_kind'] != b['scope_kind'] or cause['scope_value'] != b['scope_value']
                     or cause['version'] < b['cause_version'] or (target['strategy'], target['request_key'], target['operation_id']) != (b['strategy'], b['request_key'], b['operation_id'])
                     or (cmd['strategy'], cmd['request_key'], cmd['principal'], cmd['digest'], cmd['native_identity_json']) != (b['strategy'], b['request_key'], b['target_principal'], b['digest'], b['native_identity_json'])

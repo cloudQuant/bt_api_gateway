@@ -41,9 +41,26 @@ def _releaser(value):
 
 
 # An instrument scope names one contract of the account: "<venue>:<native symbol>".
-# Its causes are always FREEZE: every new order on that contract is refused for
-# every strategy, opens and closes alike; cancellation is never a new order.
+# Its causes concern every strategy's orders on that contract and only those:
+# FREEZE and DRAIN refuse every new order on it, opens and closes alike (D63-59);
+# STOP_NEW refuses opens and admits only a close the trusted capacity check proves
+# (G64-01). Cancellation is never a new order.
 _INSTRUMENT_SCOPE = re.compile(r"[A-Za-z0-9]{1,16}:[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+
+# Modes of a stored cause. The first three block new orders in their scope. A
+# CANCEL_ONLY row blocks nothing (G64-04): it is one cancel-only operation of the
+# control port, stored so that it freezes, once, the orders of its scope that may
+# still be working as its cancel targets, exactly as a DRAIN does. It is never
+# released and is not a cause to the cause operations (get, list, resume).
+_BLOCKING_MODES = ('STOP_NEW', 'FREEZE', 'DRAIN')
+_CANCEL_ONLY = 'CANCEL_ONLY'
+_TARGET_MODES = ('DRAIN', _CANCEL_ONLY)
+_CANCEL_SCOPE_PREFIX = 'cancel-scope:'
+
+
+def cancel_scope_cause_id(operation_id):
+    """The stored cause id of one cancel-only operation of the control port."""
+    return _CANCEL_SCOPE_PREFIX + _text(operation_id)
 
 
 def instrument_scope_value(venue, symbol):
@@ -79,7 +96,7 @@ def _text(value):
 
 def verify_controls(db, account, capacity):
     causes = db.execute('SELECT * FROM direct_control_causes').fetchall()
-    targets = db.execute("SELECT t.*,c.strategy AS original_strategy,c.request_key AS original_request_key, f.disposition AS fact_disposition,f.reason AS fact_reason,f.reservation_id AS fact_reservation,f.event_sequence AS fact_sequence,f.fact_json AS evidence_json FROM direct_control_targets t LEFT JOIN direct_journal_commands c ON c.account=t.account AND c.reservation_id=t.reservation_id LEFT JOIN direct_execution_facts f ON f.account=t.account AND f.fact_digest=t.terminal_fact_digest").fetchall()
+    targets = db.execute("SELECT t.*,c.strategy AS original_strategy,c.request_key AS original_request_key,c.payload_json AS original_payload, f.disposition AS fact_disposition,f.reason AS fact_reason,f.reservation_id AS fact_reservation,f.event_sequence AS fact_sequence,f.fact_json AS evidence_json FROM direct_control_targets t LEFT JOIN direct_journal_commands c ON c.account=t.account AND c.reservation_id=t.reservation_id LEFT JOIN direct_execution_facts f ON f.account=t.account AND f.fact_digest=t.terminal_fact_digest").fetchall()
     blocked = db.execute("SELECT b.*,c.strategy AS original_strategy,c.payload_json AS original_payload FROM direct_control_blocked b LEFT JOIN direct_journal_commands c ON c.account=b.account AND c.reservation_id=b.reservation_id").fetchall()
     if len(causes) > capacity or len(targets) > capacity or len(blocked) > capacity:
         raise DirectCommandJournalError('CONTROL_INVALID_DATABASE')
@@ -88,8 +105,10 @@ def verify_controls(db, account, capacity):
     for row in causes:
         try:
             if (row['account'] != account or row['scope_kind'] not in ('account', 'strategy', 'instrument')
-                    or row['mode'] not in ('STOP_NEW', 'FREEZE', 'DRAIN')
-                    or (row['scope_kind'] == 'instrument' and row['mode'] != 'FREEZE')
+                    or row['mode'] not in _BLOCKING_MODES + (_CANCEL_ONLY,)
+                    # A cancel-only operation is never released and is named by its operation.
+                    or (row['mode'] == _CANCEL_ONLY and (row['active'] != 1 or type(row['cause_id']) is not str
+                                                         or not row['cause_id'].startswith(_CANCEL_SCOPE_PREFIX)))
                     or type(row['version']) is not int or row['version'] not in (1, 2)
                     or row['active'] not in (0, 1) or row['version'] != (1 if row['active'] else 2)
                     or (row['active'] == 1 and row['resume_id'] is not None)
@@ -131,6 +150,7 @@ def verify_controls(db, account, capacity):
     for row in blocked:
         cause = indexed.get(row['cause_id'])
         if (row['account'] != account or cause is None or row['original_strategy'] is None
+                or cause['mode'] == _CANCEL_ONLY
                 or (cause['scope_kind'] == 'strategy' and cause['scope_value'] != row['original_strategy'])):
             raise DirectCommandJournalError('CONTROL_INVALID_DATABASE')
         if cause['scope_kind'] == 'instrument':
@@ -143,14 +163,23 @@ def verify_controls(db, account, capacity):
     for row in targets:
         cause = indexed.get(row['cause_id'])
         expected = 'drain:' + hashlib.sha256(json.dumps([row['cause_id'], row['reservation_id']], separators=(',', ':')).encode()).hexdigest()
-        if (row['account'] != account or cause is None or cause['mode'] != 'DRAIN' or row['original_strategy'] is None
+        if (row['account'] != account or cause is None or cause['mode'] not in _TARGET_MODES or row['original_strategy'] is None
                 or (row['original_strategy'], row['original_request_key']) != (row['strategy'], row['request_key']) or row['operation_id'] != expected
                 or row['state'] not in ('PENDING', 'UNKNOWN', 'CANCELLED', 'OBSERVED_TERMINAL')
                 or ((row['state'] == 'OBSERVED_TERMINAL') != (row['terminal_fact_digest'] is not None and row['terminal_sequence'] is not None))
                 or (row['state'] != 'OBSERVED_TERMINAL' and (row['terminal_fact_digest'] is not None or row['terminal_sequence'] is not None))
                 or (not cause['active'] and row['state'] == 'PENDING')
+                or (cause['mode'] == _CANCEL_ONLY and row['state'] == 'CANCELLED')
                 or (cause['scope_kind'] == 'strategy' and cause['scope_value'] != row['strategy'])):
             raise DirectCommandJournalError('CONTROL_INVALID_DATABASE')
+        if cause['scope_kind'] == 'instrument':
+            # A target of a contract cause is an order on that contract (G64-01).
+            try:
+                named = _names_instrument(cause['scope_value'], json.loads(row['original_payload']))
+            except (ValueError, TypeError):
+                named = False
+            if not named:
+                raise DirectCommandJournalError('CONTROL_INVALID_DATABASE')
         if row['state'] == 'OBSERVED_TERMINAL':
             if (row['evidence_json'] is None or row['fact_disposition'] != 'ATTRIBUTED' or row['fact_reason'] != 'MATCHED'
                     or row['fact_reservation'] != row['reservation_id'] or row['fact_sequence'] != row['terminal_sequence']):
@@ -207,18 +236,25 @@ def check_controls(db, account, strategy, payload, *, allow_verified_close=None)
     A close is admitted under STOP_NEW only when the caller's same-transaction
     trusted capacity verifier succeeds. FREEZE and DRAIN always block it. An
     instrument cause blocks every strategy's order on its contract, and only
-    those: orders on other contracts do not see it.
+    those: orders on other contracts do not see it. A contract FREEZE answers
+    CONTROL_FREEZE before anything else, as before G64-01; a contract STOP_NEW or
+    DRAIN counts like an account or strategy cause of that mode. A CANCEL_ONLY
+    operation blocks nothing.
     """
     rows = db.execute(
-        'SELECT cause_id,mode FROM direct_control_causes WHERE account=? AND active=1 '
+        'SELECT cause_id,mode FROM direct_control_causes WHERE account=? AND active=1 AND mode IN (?,?,?) '
         'AND (scope_kind=? OR (scope_kind=? AND scope_value=?)) '
         'ORDER BY CASE mode WHEN ? THEN 0 WHEN ? THEN 0 ELSE 1 END,cause_id',
-        (account, 'account', 'strategy', strategy, 'FREEZE', 'DRAIN'),
+        (account, *_BLOCKING_MODES, 'account', 'strategy', strategy, 'FREEZE', 'DRAIN'),
     ).fetchall()
-    if any(_names_instrument(row['scope_value'], payload) for row in db.execute(
-            "SELECT scope_value FROM direct_control_causes WHERE account=? AND active=1 AND scope_kind='instrument'",
-            (account,))):
+    contract = [row for row in db.execute(
+        "SELECT cause_id,mode,scope_value FROM direct_control_causes WHERE account=? AND active=1 "
+        "AND scope_kind='instrument' AND mode IN (?,?,?) ORDER BY cause_id",
+        (account, *_BLOCKING_MODES)) if _names_instrument(row['scope_value'], payload)]
+    if any(row['mode'] == 'FREEZE' for row in contract):
         raise DirectCommandJournalError('CONTROL_FREEZE')
+    if contract:
+        rows = sorted([*rows, *contract], key=lambda row: (row['mode'] == 'STOP_NEW', row['cause_id']))
     if rows:
         if (all(row['mode'] == 'STOP_NEW' for row in rows) and callable(allow_verified_close)
                 and allow_verified_close() is True):
@@ -250,16 +286,38 @@ class GatewayDirectControl:
             raise DirectCommandJournalError('CONTROL_REENTRANT')
 
     def apply(self, cause_id, mode, *, scope_kind, scope_value='', origin, before_commit=None):
+        """Store one blocking cause; the same cause id again returns the stored row.
+
+        Every mode is accepted on every scope; an instrument scope names one contract
+        (``instrument_scope_value``). The same id with another scope, mode or origin is
+        ``CONTROL_CAUSE_CONFLICT``.
+        """
         self._owned()
+        if mode not in _BLOCKING_MODES:
+            raise DirectCommandJournalError('CONTROL_INVALID_INPUT')
+        return self._store(cause_id, mode, scope_kind, scope_value, origin, before_commit)
+
+    def cancel_scope(self, operation_id, *, scope_kind, scope_value='', origin, before_commit=None):
+        """Store one cancel-only operation of a scope; it blocks nothing (G64-04).
+
+        Freezes, once, the orders of the scope that may still be working as targets,
+        exactly as a DRAIN does; each is cancelled at most once by its original
+        identity (``claim_target``, ``dispatch_claimed_cancel``). Idempotent by
+        operation id; the same id with another scope or origin is
+        ``CONTROL_CAUSE_CONFLICT``. Returns the stored row.
+        """
+        self._owned()
+        return self._store(cancel_scope_cause_id(operation_id), _CANCEL_ONLY, scope_kind, scope_value,
+                           origin, before_commit)
+
+    def _store(self, cause_id, mode, scope_kind, scope_value, origin, before_commit):
         cause_id, origin = _text(cause_id), _text(origin)
-        if mode not in ('STOP_NEW', 'FREEZE', 'DRAIN') or scope_kind not in ('account', 'strategy', 'instrument'):
+        if scope_kind not in ('account', 'strategy', 'instrument'):
             raise DirectCommandJournalError('CONTROL_INVALID_INPUT')
         if scope_kind == 'account':
             if scope_value != '':
                 raise DirectCommandJournalError('CONTROL_INVALID_INPUT')
         elif scope_kind == 'instrument':
-            if mode != 'FREEZE':
-                raise DirectCommandJournalError('CONTROL_INVALID_INPUT')
             scope_value = _instrument_scope(scope_value)
         else:
             scope_value = _text(scope_value)
@@ -284,7 +342,8 @@ class GatewayDirectControl:
                 pending_args.append(scope_value)
             if scope_kind == 'instrument':
                 pending_query = pending_query.replace('SELECT reservation_id', 'SELECT reservation_id,payload_json')
-            pending = db.execute(pending_query, pending_args).fetchall()
+            # A cancel-only operation blocks nothing, not even what is reserved and not yet sent.
+            pending = db.execute(pending_query, pending_args).fetchall() if mode != _CANCEL_ONLY else []
             if scope_kind == 'instrument':
                 # Only what was reserved for this contract; other contracts go on.
                 pending = [row for row in pending if _names_instrument(scope_value, json.loads(row['payload_json']))]
@@ -293,7 +352,7 @@ class GatewayDirectControl:
                 raise DirectCommandJournalError('CONTROL_CAPACITY_EXCEEDED')
             for pending_row in pending:
                 db.execute('INSERT INTO direct_control_blocked VALUES (?, ?, ?)', (j.account_scope, cause_id, pending_row['reservation_id']))
-            if mode == 'DRAIN':
+            if mode in _TARGET_MODES:
                 query = ('SELECT strategy,request_key,reservation_id,native_identity_json,payload_json '
                          'FROM direct_journal_commands WHERE account=? AND status IN (?, ?, ?)')
                 args = [j.account_scope, 'DISPATCHING', 'SENT', 'UNKNOWN']
@@ -310,7 +369,10 @@ class GatewayDirectControl:
                 # UNKNOWN for it as it would for a target. The account comparison and the
                 # return ledger are the checks for that case.
                 targets = [row for row in db.execute(query, args).fetchall()
-                           if _terminal_observation(db, j.account_scope, row) is None]
+                           if _terminal_observation(db, j.account_scope, row) is None
+                           # A contract cause's targets are the orders on that contract (G64-01).
+                           and (scope_kind != 'instrument'
+                                or _names_instrument(scope_value, json.loads(row['payload_json'])))]
                 prior = db.execute('SELECT count(*) FROM direct_control_targets WHERE account=?', (j.account_scope,)).fetchone()[0]
                 if len(targets) + prior > j._max_records:
                     raise DirectCommandJournalError('CONTROL_CAPACITY_EXCEEDED')
@@ -359,7 +421,7 @@ class GatewayDirectControl:
             raise DirectCommandJournalError('CONTROL_RELEASER_REQUIRED')
         with j._transaction() as db:
             row = db.execute('SELECT * FROM direct_control_causes WHERE account=? AND cause_id=?', (j.account_scope, cause_id)).fetchone()
-            if row is None:
+            if row is None or row['mode'] == _CANCEL_ONLY:
                 raise DirectCommandJournalError('CONTROL_NOT_FOUND')
             if row['active'] == 0:
                 if row['version'] == expected_version + 1 and row['resume_id'] == operation_id:
@@ -389,7 +451,7 @@ class GatewayDirectControl:
         self._owned()
         with self._journal._transaction() as db:
             row = db.execute('SELECT * FROM direct_control_causes WHERE account=? AND cause_id=?', (self._journal.account_scope, _text(cause_id))).fetchone()
-            if row is None:
+            if row is None or row['mode'] == _CANCEL_ONLY:
                 raise DirectCommandJournalError('CONTROL_NOT_FOUND')
             return self._record(db, row)
 
@@ -428,16 +490,16 @@ class GatewayDirectControl:
                 with self._journal._transaction() as db:
                     return tuple(self._record(db, row) for row in db.execute(
                         "SELECT * FROM direct_control_causes WHERE account=? AND scope_kind='instrument' "
-                        'AND cause_id>? ORDER BY cause_id LIMIT ?',
-                        (self._journal.account_scope, after, limit)).fetchall())
+                        'AND mode!=? AND cause_id>? ORDER BY cause_id LIMIT ?',
+                        (self._journal.account_scope, _CANCEL_ONLY, after, limit)).fetchall())
             scope_value = _instrument_scope(scope_value)
         else:
             scope_value = _text(scope_value)
         with self._journal._transaction() as db:
             return tuple(self._record(db, row) for row in db.execute(
                 'SELECT * FROM direct_control_causes WHERE account=? AND scope_kind=? AND scope_value=? '
-                'AND cause_id>? ORDER BY cause_id LIMIT ?',
-                (self._journal.account_scope, scope_kind, scope_value, after, limit)).fetchall())
+                'AND mode!=? AND cause_id>? ORDER BY cause_id LIMIT ?',
+                (self._journal.account_scope, scope_kind, scope_value, _CANCEL_ONLY, after, limit)).fetchall())
 
     def resume_status(self, operation_id, *, scope_kind, scope_value=''):
         self._owned()
@@ -467,6 +529,55 @@ class GatewayDirectControl:
                 (self._journal.account_scope, _text(cause_id), _text(operation_id))).fetchone()
             return None if row is None else dict(row)
 
+    def cancel_scope_status(self, operation_id, *, after='', limit=128):
+        """One cancel-only operation and a page of its targets; reads only (G64-04).
+
+        ``None`` when the operation does not exist, else ``(row, targets, counts)``. A
+        target's ``state`` is QUEUED (frozen, not claimed yet), SENT, NOT_SENT (claimed but
+        no cancel went out: no attempt, an attempt never dispatched, or one the provider
+        did not send), UNKNOWN (a cancel may have gone out) or TERMINAL (its latest
+        attributed order return is terminal: an observation, not a provider snapshot).
+        ``cancel`` is the stored status of its cancel attempt. ``counts`` cover all targets.
+        """
+        self._owned()
+        cause_id = cancel_scope_cause_id(operation_id)
+        if (type(after) is not str or (after and _text(after) != after)
+                or type(limit) is not int or not 1 <= limit <= 256):
+            raise DirectCommandJournalError('CONTROL_INVALID_INPUT')
+        j = self._journal
+        with j._transaction() as db:
+            cause = db.execute('SELECT * FROM direct_control_causes WHERE account=? AND cause_id=?',
+                               (j.account_scope, cause_id)).fetchone()
+            if cause is None or cause['mode'] != _CANCEL_ONLY:
+                return None
+            attempts = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                                  "AND name='direct_cancel_attempts'").fetchone() is not None
+            counts = dict.fromkeys(('QUEUED', 'SENT', 'NOT_SENT', 'UNKNOWN', 'TERMINAL'), 0)
+            page = []
+            for target in db.execute('SELECT * FROM direct_control_targets WHERE account=? AND cause_id=? '
+                                     'ORDER BY reservation_id', (j.account_scope, cause_id)).fetchall():
+                command = db.execute('SELECT * FROM direct_journal_commands WHERE account=? AND reservation_id=?',
+                                     (j.account_scope, target['reservation_id'])).fetchone()
+                attempt = None if not attempts else db.execute(
+                    'SELECT status FROM direct_cancel_attempts WHERE account=? AND strategy=? AND operation_id=?',
+                    (j.account_scope, target['strategy'], target['operation_id'])).fetchone()
+                cancel = None if attempt is None else attempt['status']
+                if _terminal_observation(db, j.account_scope, command) is not None:
+                    state = 'TERMINAL'
+                elif target['state'] == 'PENDING':
+                    state = 'QUEUED'
+                elif cancel in (None, 'REQUESTED', 'NOT_SENT'):
+                    # The claim, the attempt and its dispatch all run on this owner thread: a
+                    # claimed target without a dispatched attempt had no cancel go out.
+                    state = 'NOT_SENT'
+                else:
+                    state = 'SENT' if cancel == 'SENT' else 'UNKNOWN'
+                counts[state] += 1
+                if target['reservation_id'] > after and len(page) < limit:
+                    page.append({'reservation_id': target['reservation_id'], 'strategy': target['strategy'],
+                                 'request_key': target['request_key'], 'state': state, 'cancel': cancel})
+            return dict(cause), tuple(page), counts
+
     def reconcile_targets(self, cause_id, *, before_commit=None):
         """Track the latest attributable terminal ORDER fact for frozen targets.
 
@@ -478,7 +589,7 @@ class GatewayDirectControl:
         j = self._journal
         with j._transaction() as db:
             cause = db.execute('SELECT * FROM direct_control_causes WHERE account=? AND cause_id=?', (j.account_scope, cause_id)).fetchone()
-            if cause is None or cause['mode'] != 'DRAIN':
+            if cause is None or cause['mode'] not in _TARGET_MODES:
                 raise DirectCommandJournalError('CONTROL_NOT_FOUND')
             changed = False
             targets = db.execute("SELECT * FROM direct_control_targets WHERE account=? AND cause_id=? AND state!='CANCELLED'", (j.account_scope, cause_id)).fetchall()
@@ -546,7 +657,7 @@ class GatewayDirectControl:
         j = self._journal
         with j._transaction() as db:
             cause = db.execute('SELECT * FROM direct_control_causes WHERE account=? AND cause_id=?', (j.account_scope, cause_id)).fetchone()
-            if cause is None or cause['active'] != 1 or cause['mode'] != 'DRAIN':
+            if cause is None or cause['active'] != 1 or cause['mode'] not in _TARGET_MODES:
                 raise DirectCommandJournalError('CONTROL_INACTIVE')
             row = db.execute('SELECT * FROM direct_control_targets WHERE account=? AND cause_id=? AND reservation_id=?', (j.account_scope, cause_id, reservation_id)).fetchone()
             if row is None:
