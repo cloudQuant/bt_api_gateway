@@ -1,5 +1,6 @@
 """Bounded local HTTP tests; fake runtimes are trusted host test fixtures."""
 import asyncio
+import hashlib
 from types import SimpleNamespace
 
 import httpx
@@ -223,7 +224,11 @@ def test_signed_request_binds_journal_peer_identity_and_content():
             return {'status': 'OBSERVED', 'cause': runtime.records[key]} if key in runtime.records else {'status': 'NOT_FOUND', 'cause_id': key}
         if operation == 'direct.control.apply':
             assert arguments['expected_journal_id'] == runtime.journal
-            runtime.records[arguments['cause_id']] = {'cause_id': arguments['cause_id'], 'mode': arguments['mode']}
+            # Stored the way the Gateway stores it: the caller's scope and its operator origin.
+            runtime.records[arguments['cause_id']] = {
+                'cause_id': arguments['cause_id'], 'mode': arguments['mode'], 'scope_kind': 'strategy',
+                'scope_value': 'strategy-a', 'active': 1, 'version': 1,
+                'origin': 'operator:' + hashlib.sha256(b'["operator-a","actor-a"]').hexdigest()}
             if runtime.lose_reply:
                 raise TimeoutError()
             return {'status': 'OBSERVED', 'cause_id': arguments['cause_id']}

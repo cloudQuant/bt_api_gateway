@@ -40,6 +40,14 @@ def _gateway_ref(value: object) -> bool:
         return False
 
 
+def _operator_origin(principal_ref: str, actor_ref: str) -> str:
+    # The origin the Gateway stores on a cause an operator applied, derived by the
+    # Gateway from the authenticated registration (gateway_direct_service). Used
+    # only to recognise this operator's own cause; it never grants anything.
+    encoded = json.dumps([principal_ref, actor_ref], separators=(',', ':')).encode()
+    return 'operator:' + hashlib.sha256(encoded).hexdigest()
+
+
 def _route_fingerprint(scope: WebScope) -> str:
     # Opaque route identity lets a persisted browser request detect remapping.
     encoded = json.dumps([scope.account_ref, scope.scope_ref, scope.strategy_ref],
@@ -381,7 +389,28 @@ def create_app(*, origin: str, authenticate: Callable[[Request], AuthenticatedWe
             expected = command['operation_id'] if command['mode'] == 'DRAIN_TARGET' else command['request_id']
             if result.get(name) != expected:
                 raise ValueError('INVALID_RESULT')
+        elif (result.get('status') == 'OBSERVED' and command['mode'] != 'DRAIN_TARGET'
+                and not own_record(session, scope_id, command, result)):
+            # The id is taken by another command (another operator's cause, a contract
+            # cause, or a release of another cause). Never report it as this request,
+            # and never send this request under that id.
+            return {'status': 'REQUEST_REJECTED', 'code': 'REQUEST_ID_CONFLICT'}
         return result
+
+    def own_record(session, scope_id, command, result):
+        """Whether an observed record is this request: same id and same content as the Gateway keeps it."""
+        if command['mode'] == 'RESUME':
+            return (result.get('cause_id') == command['cause_id']
+                    and result.get('operation_id') == command['request_id']
+                    and result.get('version') == command['expected_version'] + 1
+                    and result.get('active') is False)
+        scope, = [s for s in session.scopes if s.scope_id == scope_id]
+        cause = result.get('cause')
+        expected = {'cause_id': command['request_id'], 'mode': command['mode'],
+                    'scope_kind': 'account' if scope.strategy_ref is None else 'strategy',
+                    'scope_value': '' if scope.strategy_ref is None else scope.strategy_ref,
+                    'origin': _operator_origin(session.principal_ref, session.actor_ref)}
+        return isinstance(cause, Mapping) and all(cause.get(k) == v for k, v in expected.items())
 
     @app.post('/api/v1/scopes/{scope_id}/requests/prepare')
     def prepare_request(request: Request, scope_id: str, command: _Prepare):
