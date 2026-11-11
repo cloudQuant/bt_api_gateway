@@ -112,3 +112,20 @@ def test_a_drain_that_does_not_fit_is_still_refused(setup):
     control.apply("first", "DRAIN", scope_kind="account", origin="operator")
     with pytest.raises(DirectCommandJournalError, match="^CONTROL_CAPACITY_EXCEEDED$"):
         control.apply("second", "DRAIN", scope_kind="account", origin="operator")
+
+
+def test_active_drain_causes_are_paged_for_the_owner(setup):
+    journal, control, _, _, _ = setup
+    _order(journal, "one")
+    control.apply("drain-b", "DRAIN", scope_kind="strategy", scope_value="s1", origin="operator")
+    control.apply("drain-a", "DRAIN", scope_kind="account", origin="system:lease")
+    control.apply("stop", "STOP_NEW", scope_kind="account", origin="operator")       # not a DRAIN
+    control.apply("drain-c", "DRAIN", scope_kind="account", origin="operator")
+    control.resume("drain-c", expected_version=1, operation_id="resume-c")           # not active any more
+    assert [row["cause_id"] for row in control.active_drain_causes()] == ["drain-a", "drain-b"]
+    assert [row["cause_id"] for row in control.active_drain_causes(limit=1)] == ["drain-a"]
+    assert [row["cause_id"] for row in control.active_drain_causes(after="drain-a")] == ["drain-b"]
+    assert control.active_drain_causes(after="drain-b") == ()
+    for bad in ({"limit": 0}, {"limit": 257}, {"limit": True}, {"after": 1}, {"after": " x"}):
+        with pytest.raises(DirectCommandJournalError, match="^CONTROL_INVALID_INPUT$"):
+            control.active_drain_causes(**bad)

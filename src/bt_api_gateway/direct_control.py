@@ -335,6 +335,17 @@ class GatewayDirectControl:
                 "SELECT * FROM direct_control_causes WHERE account=? AND origin=? AND active=1 ORDER BY cause_id",
                 (self._journal.account_scope, origin)))
 
+    def active_drain_causes(self, *, after='', limit=64):
+        """Owner-only page of the account's active DRAIN causes, whoever applied them."""
+        self._owned()
+        if (type(after) is not str or (after and _text(after) != after)
+                or type(limit) is not int or not 1 <= limit <= 256):
+            raise DirectCommandJournalError('CONTROL_INVALID_INPUT')
+        with self._journal._transaction() as db:
+            return tuple(dict(row) for row in db.execute(
+                "SELECT * FROM direct_control_causes WHERE account=? AND mode='DRAIN' AND active=1 "
+                "AND cause_id>? ORDER BY cause_id LIMIT ?", (self._journal.account_scope, after, limit)))
+
     def list_causes(self, *, scope_kind, scope_value='', after='', limit=128):
         """Read a bounded page for the caller's already-authorized exact scope."""
         self._owned()
