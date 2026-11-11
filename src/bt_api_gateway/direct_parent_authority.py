@@ -313,21 +313,29 @@ def verify_parent_authority_integrity(db, account, capacity):
 
 
 class GatewayParentAuthority:
-    """Uses the existing account journal transaction, account guard and ACL fence."""
+    """Uses the existing account journal transaction, account guard and ACL fence.
+
+    ``same_day_only`` (off by default) limits parents to their creation trading
+    day: a parent allowing further days is refused at registration and no child
+    is admitted on another day. A composition that has not delivered cross-day
+    parents (D63-56) sets it.
+    """
 
     def __init__(self, journal, guard, *, now_ns, trading_day, rollover_recheck=None, risk_recheck=None,
-                 transfer_completed=None, target_recheck=None):
+                 transfer_completed=None, target_recheck=None, same_day_only=False):
         if (type(guard) is not LocalAccountSessionGuard or not callable(now_ns)
                 or not callable(trading_day) or (rollover_recheck is not None and not callable(rollover_recheck))
                 or (risk_recheck is not None and not callable(risk_recheck))
                 or (transfer_completed is not None and not callable(transfer_completed))
-                or (target_recheck is not None and not callable(target_recheck))):
+                or (target_recheck is not None and not callable(target_recheck))
+                or type(same_day_only) is not bool):
             _error("INVALID_AUTHORITY")
         self._journal, self._guard = journal, guard
         self._now_ns, self._trading_day = now_ns, trading_day
         self._rollover_recheck, self._risk_recheck = rollover_recheck, risk_recheck
         self._transfer_completed = transfer_completed
         self._target_recheck = target_recheck
+        self._same_day_only = same_day_only
         self._guard_check()
 
     def _guard_check(self):
@@ -381,6 +389,8 @@ class GatewayParentAuthority:
         spec = _spec(spec)
         if spec["account_scope"] != self._journal.account_scope:
             _error("INVALID_PARENT")
+        if self._same_day_only and spec["allowed_trading_days"] != [spec["creation_trading_day"]]:
+            _error("CROSS_DAY_UNAVAILABLE")
         encoded = canonical_gateway_payload(spec)
         digest = _sha(encoded)
         with self._access(principal, actor_ref, fence, recheck) as db:
@@ -546,7 +556,9 @@ class GatewayParentAuthority:
             spec = json.loads(row["spec_json"])
             now, day = self._now_ns(), self._trading_day()
             if (type(now) is not int or now < 0 or now >= spec["expires_at_ns"] or not _day(day)
-                    or day not in spec["allowed_trading_days"] or command.account_scope != self._journal.account_scope
+                    or day not in spec["allowed_trading_days"]
+                    or (self._same_day_only and day != spec["creation_trading_day"])
+                    or command.account_scope != self._journal.account_scope
                     or command.execution_domain_ref != spec["execution_domain_ref"]
                     or command.instrument.to_dict() != spec["instrument"]):
                 return False

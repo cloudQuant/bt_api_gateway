@@ -15,6 +15,18 @@ sent. If a covered writer is mid-change the claim is BUSY: no marker is written,
 the command stays RESERVED and the owner may retry after serving other work.
 The marker transaction still rechecks authority and may refuse. Without a
 claim port every new dispatch is refused.
+
+A child order of an Execution parent (a delegated command with ``parent_ref``)
+takes the same path. Its registered parent is read twice: during the claim
+validation, in a read-only journal snapshot taken after the Registry fence and
+the market recheck (the order every dispatch already uses: Registry -> market
+-> journal), and again inside the marker transaction, atomically with the
+DISPATCHING write. Neither read runs under a provider lock, and the native
+fence stays a lock-free age check, so no journal access ever happens under the
+provider's session lock. A parent frozen, expired or no longer current before
+the marker commit stops the dispatch before anything is sent; parent changes
+are written on the owner thread, which is busy with this dispatch until the
+native call returns.
 """
 
 from __future__ import annotations
@@ -72,6 +84,20 @@ def _request_scope(
         raise
     else:
         scope.__exit__(None, None, None)
+
+
+@contextmanager
+def _read_only_snapshot(journal: GatewayDirectCommandJournal) -> Iterator[Any]:
+    """One read-only snapshot of the bound journal for a check that never writes.
+
+    ``query_only`` makes any write attempt fail (the check then refuses), so no
+    journal change port is involved; closing the connection ends the read
+    transaction. The control recheck that follows asserts the journal anchor.
+    """
+    with journal._connection() as db:
+        db.execute("PRAGMA query_only = ON")
+        db.execute("BEGIN")
+        yield db
 
 
 @dataclass(frozen=True)
@@ -258,13 +284,9 @@ class GatewayDirectDispatcher:
                     or cmd.request_key != request_key or cmd.actor_principal != principal
                     or cmd.payload_digest != digest):
                 raise DirectDispatchError("INVALID_DELEGATION")
-            # A parent recheck requires the journal.  The native provider can
-            # invoke its last recheck while holding its trading-session lock;
-            # acquiring the journal there would invert the journal -> session
-            # lock order used by admission.  Until there is a bounded owner
-            # fence spanning that boundary, do not write a dispatch marker.
-            if market_gate is not None and cmd.parent_ref is not None:
-                raise DirectDispatchError("PARENT_NATIVE_FENCE_UNAVAILABLE")
+            # A parent's child is checked against its registered parent in the
+            # claim validation (read-only snapshot) and in the marker
+            # transaction; the provider's native fence never reads the journal.
         self._owned()
         if self._active:
             raise DirectDispatchError("DISPATCH_REENTRANT")
@@ -443,9 +465,13 @@ class _CommitPort:
         same order as ``commit``; no provider I/O. ``horizon_ns`` requires
         time-limited market evidence to stay valid for the claim window. All
         locks are released before the claim port returns and the native call.
+        The market lock is released before any journal read; a parent's child
+        reads its parent in its own read-only snapshot at that point.
         """
         if type(horizon_ns) is not int or horizon_ns < 0:
             raise DirectDispatchError('INVALID_CLAIM_HORIZON')
+        permit = self._delegation_permit
+        parent_child = permit is not None and permit.command.parent_ref is not None
         # Entering the request fence performs its own authority check; a
         # yielded recheck is invoked again around the remaining checks.
         with _request_scope(self._request_fence, self._record) as recheck:
@@ -453,18 +479,30 @@ class _CommitPort:
             self._owner._admitted(self._record)
             if recheck is not None:
                 recheck()
-            if self._delegation_permit is not None:
+            if permit is not None:
                 if (self._market_gate is not None and self._market_gate.matches_delegation(
-                        self._market_permit, self._delegation_permit) is not True):
+                        self._market_permit, permit) is not True):
                     raise DirectDispatchError('INVALID_DELEGATION')
-                if self._delegation_permit.command.parent_ref is not None:
-                    raise DirectDispatchError('PARENT_NATIVE_FENCE_UNAVAILABLE')
-                # Non-parent grants do not require a journal-backed authority
-                # check. Registry is held by the request scope.
-                self._delegation_permit.recheck(None)
+                if not parent_child:
+                    # Non-parent grants do not require a journal-backed authority
+                    # check. Registry is held by the request scope.
+                    permit.recheck(None)
             if self._market_gate is not None:
                 self._market_gate.native_recheck(self._market_permit, self._record,
                                                  horizon_ns=horizon_ns)
+            if parent_child:
+                from .direct_delegation import GatewayDelegationDenied
+
+                # Grant, Registry, instrument and the registered parent (present,
+                # ACTIVE, not expired, current trading day, quantity left) in one
+                # read-only snapshot. A journal writer that commits while this
+                # runs makes the claim stale, so the claim never rests on an
+                # older parent state; the marker transaction checks it again.
+                try:
+                    with _read_only_snapshot(self._owner._journal) as db:
+                        permit.recheck(db)
+                except GatewayDelegationDenied:
+                    raise DirectDispatchError('DELEGATION_DENIED') from None
             row = self._record
             try:
                 self._owner._journal.recheck_dispatch_controls(
