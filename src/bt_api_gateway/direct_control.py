@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+from collections.abc import Mapping
 
 from .direct_command_journal import DirectCommandJournalError
 from .session_guard import LocalAccountSessionGuard
@@ -18,6 +20,37 @@ _CONTROL_DDL = {
 }
 
 
+# An instrument scope names one contract of the account: "<venue>:<native symbol>".
+# Its causes are always FREEZE: every new order on that contract is refused for
+# every strategy, opens and closes alike; cancellation is never a new order.
+_INSTRUMENT_SCOPE = re.compile(r"[A-Za-z0-9]{1,16}:[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+
+
+def instrument_scope_value(venue, symbol):
+    """The scope value of one contract; invalid parts are refused, never normalised."""
+    if type(venue) is not str or type(symbol) is not str or _INSTRUMENT_SCOPE.fullmatch(venue + ':' + symbol) is None:
+        raise DirectCommandJournalError('CONTROL_INVALID_INPUT')
+    return venue + ':' + symbol
+
+
+def _instrument_scope(value):
+    if type(value) is not str or _INSTRUMENT_SCOPE.fullmatch(value) is None:
+        raise DirectCommandJournalError('CONTROL_INVALID_INPUT')
+    return value
+
+
+def _names_instrument(scope_value, payload):
+    """Whether an order payload is for the contract of an instrument scope.
+
+    A payload without a venue is matched by its symbol alone: an order that does
+    not say where it trades is not let through a block on that symbol.
+    """
+    if not isinstance(payload, Mapping):
+        return True
+    venue, symbol = scope_value.split(':', 1)
+    return payload.get('symbol') == symbol and payload.get('exchange_id') in (None, '', venue)
+
+
 def _text(value):
     if type(value) is not str or not value or value != value.strip() or len(value) > 512:
         raise DirectCommandJournalError('CONTROL_INVALID_INPUT')
@@ -27,15 +60,16 @@ def _text(value):
 def verify_controls(db, account, capacity):
     causes = db.execute('SELECT * FROM direct_control_causes').fetchall()
     targets = db.execute("SELECT t.*,c.strategy AS original_strategy,c.request_key AS original_request_key, f.disposition AS fact_disposition,f.reason AS fact_reason,f.reservation_id AS fact_reservation,f.event_sequence AS fact_sequence,f.fact_json AS evidence_json FROM direct_control_targets t LEFT JOIN direct_journal_commands c ON c.account=t.account AND c.reservation_id=t.reservation_id LEFT JOIN direct_execution_facts f ON f.account=t.account AND f.fact_digest=t.terminal_fact_digest").fetchall()
-    blocked = db.execute("SELECT b.*,c.strategy AS original_strategy FROM direct_control_blocked b LEFT JOIN direct_journal_commands c ON c.account=b.account AND c.reservation_id=b.reservation_id").fetchall()
+    blocked = db.execute("SELECT b.*,c.strategy AS original_strategy,c.payload_json AS original_payload FROM direct_control_blocked b LEFT JOIN direct_journal_commands c ON c.account=b.account AND c.reservation_id=b.reservation_id").fetchall()
     if len(causes) > capacity or len(targets) > capacity or len(blocked) > capacity:
         raise DirectCommandJournalError('CONTROL_INVALID_DATABASE')
     indexed = {}
     resume_ids = set()
     for row in causes:
         try:
-            if (row['account'] != account or row['scope_kind'] not in ('account', 'strategy')
+            if (row['account'] != account or row['scope_kind'] not in ('account', 'strategy', 'instrument')
                     or row['mode'] not in ('STOP_NEW', 'FREEZE', 'DRAIN')
+                    or (row['scope_kind'] == 'instrument' and row['mode'] != 'FREEZE')
                     or type(row['version']) is not int or row['version'] not in (1, 2)
                     or row['active'] not in (0, 1) or row['version'] != (1 if row['active'] else 2)
                     or (row['active'] == 1 and row['resume_id'] is not None)
@@ -47,6 +81,8 @@ def verify_controls(db, account, capacity):
                 raise ValueError
             if row['scope_kind'] == 'strategy':
                 _text(row['scope_value'])
+            if row['scope_kind'] == 'instrument':
+                _instrument_scope(row['scope_value'])
             if row['resume_id'] is not None:
                 _text(row['resume_id'])
                 if row['resume_id'] in resume_ids:
@@ -60,6 +96,13 @@ def verify_controls(db, account, capacity):
         if (row['account'] != account or cause is None or row['original_strategy'] is None
                 or (cause['scope_kind'] == 'strategy' and cause['scope_value'] != row['original_strategy'])):
             raise DirectCommandJournalError('CONTROL_INVALID_DATABASE')
+        if cause['scope_kind'] == 'instrument':
+            try:
+                named = _names_instrument(cause['scope_value'], json.loads(row['original_payload']))
+            except (ValueError, TypeError):
+                named = False
+            if not named:
+                raise DirectCommandJournalError('CONTROL_INVALID_DATABASE')
     for row in targets:
         cause = indexed.get(row['cause_id'])
         expected = 'drain:' + hashlib.sha256(json.dumps([row['cause_id'], row['reservation_id']], separators=(',', ':')).encode()).hexdigest()
@@ -90,7 +133,9 @@ def check_controls(db, account, strategy, payload, *, allow_verified_close=None)
     """Check the same write transaction used for reserve/begin_dispatch.
 
     A close is admitted under STOP_NEW only when the caller's same-transaction
-    trusted capacity verifier succeeds. FREEZE and DRAIN always block it.
+    trusted capacity verifier succeeds. FREEZE and DRAIN always block it. An
+    instrument cause blocks every strategy's order on its contract, and only
+    those: orders on other contracts do not see it.
     """
     rows = db.execute(
         'SELECT cause_id,mode FROM direct_control_causes WHERE account=? AND active=1 '
@@ -98,6 +143,10 @@ def check_controls(db, account, strategy, payload, *, allow_verified_close=None)
         'ORDER BY CASE mode WHEN ? THEN 0 WHEN ? THEN 0 ELSE 1 END,cause_id',
         (account, 'account', 'strategy', strategy, 'FREEZE', 'DRAIN'),
     ).fetchall()
+    if any(_names_instrument(row['scope_value'], payload) for row in db.execute(
+            "SELECT scope_value FROM direct_control_causes WHERE account=? AND active=1 AND scope_kind='instrument'",
+            (account,))):
+        raise DirectCommandJournalError('CONTROL_FREEZE')
     if rows:
         if (all(row['mode'] == 'STOP_NEW' for row in rows) and callable(allow_verified_close)
                 and allow_verified_close() is True):
@@ -131,11 +180,15 @@ class GatewayDirectControl:
     def apply(self, cause_id, mode, *, scope_kind, scope_value='', origin, before_commit=None):
         self._owned()
         cause_id, origin = _text(cause_id), _text(origin)
-        if mode not in ('STOP_NEW', 'FREEZE', 'DRAIN') or scope_kind not in ('account', 'strategy'):
+        if mode not in ('STOP_NEW', 'FREEZE', 'DRAIN') or scope_kind not in ('account', 'strategy', 'instrument'):
             raise DirectCommandJournalError('CONTROL_INVALID_INPUT')
         if scope_kind == 'account':
             if scope_value != '':
                 raise DirectCommandJournalError('CONTROL_INVALID_INPUT')
+        elif scope_kind == 'instrument':
+            if mode != 'FREEZE':
+                raise DirectCommandJournalError('CONTROL_INVALID_INPUT')
+            scope_value = _instrument_scope(scope_value)
         else:
             scope_value = _text(scope_value)
         j = self._journal
@@ -157,7 +210,12 @@ class GatewayDirectControl:
             if scope_kind == 'strategy':
                 pending_query += ' AND strategy=?'
                 pending_args.append(scope_value)
+            if scope_kind == 'instrument':
+                pending_query = pending_query.replace('SELECT reservation_id', 'SELECT reservation_id,payload_json')
             pending = db.execute(pending_query, pending_args).fetchall()
+            if scope_kind == 'instrument':
+                # Only what was reserved for this contract; other contracts go on.
+                pending = [row for row in pending if _names_instrument(scope_value, json.loads(row['payload_json']))]
             total_blocked = db.execute('SELECT count(*) FROM direct_control_blocked WHERE account=?', (j.account_scope,)).fetchone()[0]
             if total_blocked + len(pending) > j._max_records:
                 raise DirectCommandJournalError('CONTROL_CAPACITY_EXCEEDED')
@@ -235,12 +293,21 @@ class GatewayDirectControl:
     def list_causes(self, *, scope_kind, scope_value='', after='', limit=128):
         """Read a bounded page for the caller's already-authorized exact scope."""
         self._owned()
-        if (scope_kind not in ('account', 'strategy') or type(after) is not str
+        if (scope_kind not in ('account', 'strategy', 'instrument') or type(after) is not str
                 or (after and _text(after) != after) or type(limit) is not int or not 1 <= limit <= 256):
             raise DirectCommandJournalError('CONTROL_INVALID_INPUT')
         if scope_kind == 'account':
             if scope_value != '':
                 raise DirectCommandJournalError('CONTROL_INVALID_INPUT')
+        elif scope_kind == 'instrument':
+            if scope_value == '':
+                # Every contract of the account, for a caller authorised for the whole account.
+                with self._journal._transaction() as db:
+                    return tuple(dict(row) for row in db.execute(
+                        "SELECT * FROM direct_control_causes WHERE account=? AND scope_kind='instrument' "
+                        'AND cause_id>? ORDER BY cause_id LIMIT ?',
+                        (self._journal.account_scope, after, limit)))
+            scope_value = _instrument_scope(scope_value)
         else:
             scope_value = _text(scope_value)
         with self._journal._transaction() as db:
@@ -252,11 +319,19 @@ class GatewayDirectControl:
     def resume_status(self, operation_id, *, scope_kind, scope_value=''):
         self._owned()
         operation_id = _text(operation_id)
-        if scope_kind not in ('account', 'strategy') or (scope_kind == 'account' and scope_value != ''):
+        if (scope_kind not in ('account', 'strategy', 'instrument')
+                or (scope_kind == 'account' and scope_value != '')):
             raise DirectCommandJournalError('CONTROL_INVALID_INPUT')
         if scope_kind == 'strategy':
             scope_value = _text(scope_value)
+        if scope_kind == 'instrument' and scope_value != '':
+            scope_value = _instrument_scope(scope_value)
         with self._journal._transaction() as db:
+            if scope_kind == 'instrument' and scope_value == '':
+                # Any contract of the account, for a caller authorised for the whole account.
+                row = db.execute("SELECT * FROM direct_control_causes WHERE account=? AND scope_kind='instrument' "
+                                 'AND resume_id=?', (self._journal.account_scope, operation_id)).fetchone()
+                return None if row is None else dict(row)
             row = db.execute('SELECT * FROM direct_control_causes WHERE account=? AND scope_kind=? '
                              'AND scope_value=? AND resume_id=?',
                              (self._journal.account_scope, scope_kind, scope_value, operation_id)).fetchone()
