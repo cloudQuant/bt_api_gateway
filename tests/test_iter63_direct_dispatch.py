@@ -886,3 +886,26 @@ def test_unrepresentable_extra_identity_field_rejects_before_commit_and_send(set
     observed = journal.get("s", "one", "principal")
     assert observed.status == "RESERVED" and observed.native_identity_json is None
     assert observed.strong_identity_keys == () and sent == []
+
+
+def test_a_native_place_that_raises_before_the_marker_says_why_in_the_log(setup, caplog):
+    """I63-E135 diagnosis: the reason was swallowed; only PRE_DISPATCH_FAILED remained."""
+    import logging
+
+    journal, guard = setup
+    row = reserve(journal)
+
+    class ProviderRefusal(RuntimeError):
+        code = "QUOTE_TOO_OLD"
+
+    def native(payload, port, scope):
+        raise ProviderRefusal("quote older than the dispatch bound")
+
+    with caplog.at_level(logging.WARNING, logger="bt_api_gateway.direct_dispatch"):
+        with pytest.raises(DirectDispatchError, match="PRE_DISPATCH_FAILED"):
+            invoke(build(journal, guard, native), row)
+    lines = [record.getMessage() for record in caplog.records
+             if record.name == "bt_api_gateway.direct_dispatch"]
+    assert lines == ["Native place attempt raised ProviderRefusal code=QUOTE_TOO_OLD: "
+                     "quote older than the dispatch bound"]
+    assert journal.get("s", "one", "principal").status == "RESERVED"

@@ -3086,9 +3086,54 @@ class GatewayDirectCommandJournal:
             row["release_expected_version"],
         )
 
+    # -- throttled history checks (I63-E135) ------------------------------
+    #
+    # ``_transaction`` verifies the anchor and the exact DDL every time. The
+    # remaining checks walk whole tables; at schema 14 the account fact stream
+    # alone cost 105 ms on a journal with 256 facts, in every transaction.
+    # By default nothing changes: they run in every transaction. A trusted
+    # owner may set an interval. Then they run when the journal is opened,
+    # whenever the database files differ from what this object left behind
+    # (another connection or process wrote), and at least once per interval;
+    # in between, transactions of this object rely on the last full check.
+    # A fault introduced by this object's own writes is therefore reported at
+    # the next full check, not at the next transaction.
+    _deep_interval = 0.0
+    _deep_trusted: tuple | None = None
+    _deep_next_at = 0.0
+    _deep_clock = staticmethod(time.monotonic)
+
+    def set_deep_verification_interval(self, seconds: float) -> None:
+        """Run the whole-table integrity checks at most this often (0: every transaction)."""
+        if type(seconds) not in (int, float) or not math.isfinite(seconds) or not 0 <= seconds <= 3600:
+            raise DirectCommandJournalError("INVALID_INPUT")
+        self._deep_interval = float(seconds)
+        self._deep_trusted = None  # the next transaction checks in full
+
+    def _storage_fingerprint(self) -> tuple:
+        result = []
+        path = self._identity.path
+        for candidate in (path, path.with_name(path.name + "-wal")):
+            try:
+                info = os.stat(candidate)
+                result.append((info.st_ino, info.st_size, info.st_mtime_ns))
+            except FileNotFoundError:
+                result.append(None)
+        return tuple(result)
+
+    def _deep_state_stack(self) -> list:
+        local = self.__dict__.get("_deep_local")
+        if local is None:
+            local = self.__dict__.setdefault("_deep_local", threading.local())
+        if not hasattr(local, "stack"):
+            local.stack = []
+        return local.stack
+
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
         self._identity.verify()
+        throttled = self._deep_interval > 0
+        state = {"before": self._storage_fingerprint() if throttled else None, "verified": False}
         try:
             db = sqlite3.connect(
                 self._identity.path.as_uri() + "?mode=rw",
@@ -3098,6 +3143,8 @@ class GatewayDirectCommandJournal:
             )
         except sqlite3.OperationalError as exc:
             raise DirectCommandJournalError("DATABASE_UNAVAILABLE") from exc
+        stack = self._deep_state_stack()
+        stack.append(state)
         try:
             db.row_factory = sqlite3.Row
             self._identity.verify()
@@ -3106,6 +3153,12 @@ class GatewayDirectCommandJournal:
             yield db
         finally:
             db.close()
+            stack.remove(state)
+            if throttled:
+                # Only a connection that started from a checked state leaves a
+                # trusted one; its own writes and the checkpoint on close are
+                # part of what it leaves behind.
+                self._deep_trusted = self._storage_fingerprint() if state["verified"] else None
 
     @staticmethod
     def _commit(db: sqlite3.Connection) -> None:
@@ -3186,46 +3239,66 @@ class GatewayDirectCommandJournal:
             self._assert_anchor(db)
             if self._schema_version >= 4:
                 self._verify_exact_ddl(db, self._schema_version)
-            if self._schema_version >= 10:
-                from .direct_control import verify_controls
-                verify_controls(db, self._account, self._max_records)
-            if self._schema_version >= 11:
-                from .strategy_position_ledger import _verify_strategy_ledger_integrity
-                _verify_strategy_ledger_integrity(db, self._account)
-            if self._schema_version >= 12:
-                from .direct_delegation import verify_delegated_integrity
-                from .external_position_ledger import verify_external_integrity
-                from .account_observer import verify_account_observers
-                verify_delegated_integrity(db, self._account, self._max_records)
-                verify_external_integrity(db, self._account)
-                verify_account_observers(db, self._account)
-            if self._schema_version >= 13:
-                from .direct_parent_authority import verify_parent_authority_integrity
-                verify_parent_authority_integrity(db, self._account, self._max_records)
-            if self._schema_version >= 14:
-                from .account_observation_journal import verify_account_fact_stream
-                from .strategy_financial_ledger import verify_strategy_financial_integrity
-                verify_account_fact_stream(db, self._account, self._journal_id)
-                verify_strategy_financial_integrity(db, self._account)
-            if self._schema_version >= 15:
-                from .delegate_actor_stream import verify_actor_stream
-                verify_actor_stream(db, self._account, self._journal_id, self._max_records)
-            if self._schema_version >= 16:
-                from .direct_strategy_origin import verify_strategy_origins
-                verify_strategy_origins(db, self._account, self._journal_id)
-            if self._schema_version >= 17:
-                from .direct_control_cancel import verify_control_cancel_integrity
-                verify_control_cancel_integrity(db, self._account, self._journal_id, self._max_records)
-            if self._schema_version >= 18:
-                from .account_fact_consumer_ownership import verify_account_fact_consumer_owners
-                from .account_fact_compaction import verify_account_fact_compaction
-                verify_account_fact_consumer_owners(db, self._account)
-                verify_account_fact_compaction(db, self._account, self._journal_id)
-            if self._schema_version >= 19:
-                from .account_event_consumer_ownership import verify_account_event_consumer_owners
-                verify_account_event_consumer_owners(db, self._account)
+            self._verify_history_if_due(db)
             yield db
 
+    def _verify_history_if_due(self, db: sqlite3.Connection) -> None:
+        stack = self._deep_state_stack()
+        state = stack[-1] if stack else None
+        throttled = self._deep_interval > 0 and state is not None and state["before"] is not None
+        if (throttled and self._deep_trusted is not None and state["before"] == self._deep_trusted
+                and self._deep_clock() < self._deep_next_at):
+            state["verified"] = True
+            return
+        started = self._deep_clock()
+        self._verify_history(db)
+        if throttled:
+            finished = self._deep_clock()
+            # On a long history one full check is slow: never spend more than
+            # about a twentieth of the owner's time on them.
+            self._deep_next_at = finished + max(self._deep_interval, 20.0 * (finished - started))
+            state["verified"] = True
+
+    def _verify_history(self, db: sqlite3.Connection) -> None:
+        """The whole-table checks of one transaction, by schema version."""
+        if self._schema_version >= 10:
+            from .direct_control import verify_controls
+            verify_controls(db, self._account, self._max_records)
+        if self._schema_version >= 11:
+            from .strategy_position_ledger import _verify_strategy_ledger_integrity
+            _verify_strategy_ledger_integrity(db, self._account)
+        if self._schema_version >= 12:
+            from .direct_delegation import verify_delegated_integrity
+            from .external_position_ledger import verify_external_integrity
+            from .account_observer import verify_account_observers
+            verify_delegated_integrity(db, self._account, self._max_records)
+            verify_external_integrity(db, self._account)
+            verify_account_observers(db, self._account)
+        if self._schema_version >= 13:
+            from .direct_parent_authority import verify_parent_authority_integrity
+            verify_parent_authority_integrity(db, self._account, self._max_records)
+        if self._schema_version >= 14:
+            from .account_observation_journal import verify_account_fact_stream
+            from .strategy_financial_ledger import verify_strategy_financial_integrity
+            verify_account_fact_stream(db, self._account, self._journal_id)
+            verify_strategy_financial_integrity(db, self._account)
+        if self._schema_version >= 15:
+            from .delegate_actor_stream import verify_actor_stream
+            verify_actor_stream(db, self._account, self._journal_id, self._max_records)
+        if self._schema_version >= 16:
+            from .direct_strategy_origin import verify_strategy_origins
+            verify_strategy_origins(db, self._account, self._journal_id)
+        if self._schema_version >= 17:
+            from .direct_control_cancel import verify_control_cancel_integrity
+            verify_control_cancel_integrity(db, self._account, self._journal_id, self._max_records)
+        if self._schema_version >= 18:
+            from .account_fact_consumer_ownership import verify_account_fact_consumer_owners
+            from .account_fact_compaction import verify_account_fact_compaction
+            verify_account_fact_consumer_owners(db, self._account)
+            verify_account_fact_compaction(db, self._account, self._journal_id)
+        if self._schema_version >= 19:
+            from .account_event_consumer_ownership import verify_account_event_consumer_owners
+            verify_account_event_consumer_owners(db, self._account)
 
 _RECONCILIATION_BLOCKING_STATUSES = (
     ("commands", "direct_journal_commands", ("DISPATCHING", "UNKNOWN")),

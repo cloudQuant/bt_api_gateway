@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
@@ -39,6 +40,8 @@ from .direct_command_journal import (
     _json,
 )
 from .session_guard import LocalAccountSessionGuard
+
+_LOG = logging.getLogger(__name__)
 
 
 class DirectDispatchError(RuntimeError):
@@ -310,7 +313,13 @@ class GatewayDirectDispatcher:
             port.claim_before_marker()
             try:
                 outcome = self._native_place(payload, port, self._journal.account_scope)
-            except Exception:
+            except Exception as error:
+                # The attempt is classified below from the journal state alone.
+                # Say why the provider path raised: without this line a failure
+                # before the dispatch marker is only ever seen as PRE_DISPATCH_FAILED.
+                _LOG.warning("Native place attempt raised %s%s: %s", type(error).__name__,
+                             "" if getattr(error, "code", None) is None else f" code={error.code}",
+                             str(error)[:160])
                 outcome = None
             finally:
                 port.close()
